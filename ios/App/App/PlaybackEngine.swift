@@ -199,7 +199,12 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
             let task = session.downloadTask(with: stream.url); tasks[task.taskIdentifier] = track; progress[track.id] = 0; task.resume()
         } catch { progress[track.id] = nil }
     }
-    func cancel(_ track: Track) { tasks.first(where: { $0.value.id == track.id }).map { session.getAllTasks { $0.first(where: { $0.taskIdentifier == $0.taskIdentifier })?.cancel() } }; progress[track.id] = nil }
+    func cancel(_ track: Track) {
+        guard let taskID = tasks.first(where: { $0.value.id == track.id })?.key else { return }
+        session.getAllTasks { tasks in tasks.first(where: { $0.taskIdentifier == taskID })?.cancel() }
+        tasks[taskID] = nil
+        progress[track.id] = nil
+    }
     func prefetchArtwork(for track: Track) async throws { guard let url = track.artworkURL else { return }; _ = try await URLSession.shared.data(from: url) }
     nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         Task { @MainActor in
