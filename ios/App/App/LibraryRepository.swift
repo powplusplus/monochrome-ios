@@ -264,19 +264,20 @@ final class LegacyMigrationBridge: NSObject, WKNavigationDelegate {
         out.favorites=await read('favorites_tracks');out.history=await read('history_tracks');out.playlists=await read('user_playlists')}catch{}
         return JSON.stringify(out)
         """
-        webView.callAsyncJavaScript(script, arguments: [:], in: nil, contentWorld: .page) { [weak self] result in
-            guard let self else { return }
-            defer { self.webView = nil; self.completion = nil }
-            let value: Any
-            switch result {
-            case .success(let output): value = output
-            case .failure(let error): self.completion?(.failure(error)); return
+        Task { @MainActor [weak self, weak webView] in
+            guard let self, let webView else { return }
+            do {
+                let value = try await webView.callAsyncJavaScript(script, arguments: [:], in: nil, contentWorld: .page)
+                guard let string = value as? String, let data = string.data(using: .utf8),
+                      let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    throw ServiceError.malformed("legacy store")
+                }
+                self.completion?(.success(LegacySnapshot(favorites: dict["favorites"] as? [[String: Any]] ?? [], history: dict["history"] as? [[String: Any]] ?? [], playlists: dict["playlists"] as? [[String: Any]] ?? [], settings: dict["settings"] as? [String: Any] ?? [:])))
+            } catch {
+                self.completion?(.failure(error))
             }
-            guard let string = value as? String, let data = string.data(using: .utf8),
-                  let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                self.completion?(.failure(ServiceError.malformed("legacy store"))); return
-            }
-            self.completion?(.success(LegacySnapshot(favorites: dict["favorites"] as? [[String: Any]] ?? [], history: dict["history"] as? [[String: Any]] ?? [], playlists: dict["playlists"] as? [[String: Any]] ?? [], settings: dict["settings"] as? [String: Any] ?? [:])))
+            self.webView = nil
+            self.completion = nil
         }
     }
 

@@ -15,7 +15,8 @@ concurrency:
 jobs:
   test-and-build:
     name: Test native app and package IPA
-    runs-on: macos-15
+    # Liquid Glass APIs require the iOS 26 SDK supplied by the Tahoe image.
+    runs-on: macos-26
     timeout-minutes: 45
 
     steps:
