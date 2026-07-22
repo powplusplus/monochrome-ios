@@ -2894,34 +2894,6 @@ export class LosslessAPI {
             }
         }
 
-        try {
-            const streamingInstances = await this.settings?.getInstances?.('streaming');
-            if (streamingInstances?.length) {
-                const lookup = await this.getTrack(id, actualQuality, { adaptive: false });
-                const streamUrl =
-                    lookup?.originalTrackUrl ||
-                    (lookup?.info?.manifest ? this.extractStreamUrlFromManifest(lookup.info.manifest) : null);
-
-                if (streamUrl) {
-                    const result = {
-                        url: streamUrl,
-                        rgInfo: lookup.info
-                            ? {
-                                  trackReplayGain: lookup.info.trackReplayGain || lookup.info.replayGain,
-                                  trackPeakAmplitude: lookup.info.trackPeakAmplitude || lookup.info.peakAmplitude,
-                                  albumReplayGain: lookup.info.albumReplayGain,
-                                  albumPeakAmplitude: lookup.info.albumPeakAmplitude,
-                              }
-                            : null,
-                    };
-                    this.streamCache.set(cacheKey, result);
-                    return result;
-                }
-            }
-        } catch (error) {
-            console.warn(`HiFi streaming fallback failed for track ${id}:`, error);
-        }
-
         notifyAudioSourceMissing();
         throw new Error(
             track?.isrc

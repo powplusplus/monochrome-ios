@@ -15,84 +15,9 @@ final class NativeBridgeViewController: CAPBridgeViewController {
             const nativeAmazonWorkerVersion = '2026-06-23-flac-hls-v8';
             const serviceWorkers = navigator.serviceWorker;
 
-            const installNativeStreamResolver = (api) => {
-                if (!api?.getTrack || !api?.getStreamUrl || api.__monochromeNativeStreamResolver) return;
-
-                const originalGetStreamUrl = api.getStreamUrl.bind(api);
-                Object.defineProperty(api, '__monochromeNativeStreamResolver', { value: true });
-
-                api.getStreamUrl = async (id, quality = 'LOSSLESS') => {
-                    try {
-                        const lookup = await api.getTrack(id, quality, { adaptive: false });
-                        const streamUrl =
-                            lookup?.originalTrackUrl ||
-                            (lookup?.info?.manifest ? api.extractStreamUrlFromManifest(lookup.info.manifest) : null);
-
-                        if (streamUrl) {
-                            console.log('[Native Stream Resolver] Using direct HiFi stream', { id, quality });
-                            return {
-                                url: streamUrl,
-                                rgInfo: lookup.info
-                                    ? {
-                                          trackReplayGain: lookup.info.trackReplayGain || lookup.info.replayGain,
-                                          trackPeakAmplitude: lookup.info.trackPeakAmplitude || lookup.info.peakAmplitude,
-                                          albumReplayGain: lookup.info.albumReplayGain,
-                                          albumPeakAmplitude: lookup.info.albumPeakAmplitude
-                                      }
-                                    : null
-                            };
-                        }
-                    } catch (error) {
-                        console.warn('[Native Stream Resolver] Direct HiFi lookup failed; using provider fallback', error);
-                    }
-
-                    return originalGetStreamUrl(id, quality);
-                };
-            };
-
-            // The production bundle keeps its API classes module-private. Capture the
-            // LosslessAPI instance when MusicAPI assigns it during application startup.
-            const inheritedTidalAPIDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, 'tidalAPI');
-            if (!inheritedTidalAPIDescriptor) {
-                Object.defineProperty(Object.prototype, 'tidalAPI', {
-                    configurable: true,
-                    set(value) {
-                        Object.defineProperty(this, 'tidalAPI', {
-                            configurable: true,
-                            enumerable: true,
-                            writable: true,
-                            value
-                        });
-                        delete Object.prototype.tidalAPI;
-                        installNativeStreamResolver(value);
-                    }
-                });
-            }
-
             if (serviceWorkers && window.isSecureContext) {
-                const getRegistrations = serviceWorkers.getRegistrations.bind(serviceWorkers);
-
-                // The web app removes root-scope PWA registrations in a native shell.
-                // Keep that cleanup from racing the decryption-only replacement below.
-                serviceWorkers.getRegistrations = async () => {
-                    const registrations = await getRegistrations();
-                    const rootScope = new URL('/', window.location.origin).href;
-                    return registrations.filter((registration) => registration.scope !== rootScope);
-                };
-
-                window.__MONOCHROME_NATIVE_AMAZON_SW__ = (async () => {
+                const installAmazonWorker = async () => {
                     try {
-                        const registrations = await getRegistrations();
-                        await Promise.all(registrations.map((registration) => {
-                            const worker = registration.active || registration.waiting || registration.installing;
-                            if (worker?.scriptURL) {
-                                try {
-                                    if (new URL(worker.scriptURL).pathname === nativeAmazonWorkerPath) return false;
-                                } catch {}
-                            }
-                            return registration.unregister();
-                        }));
-
                         const workerURL = `${nativeAmazonWorkerPath}?amazon-sw=${nativeAmazonWorkerVersion}`;
                         const registration = await serviceWorkers.register(workerURL, {
                             scope: '/',
@@ -108,18 +33,16 @@ final class NativeBridgeViewController: CAPBridgeViewController {
                         console.warn('[Amazon SW Decrypter] Native worker registration failed', error);
                         return null;
                     }
-                })();
-            }
+                };
 
-            const originalArrayFrom = Array.from;
-            let bypassedPlayerImageGate = false;
-            Array.from = function(value, ...argumentsList) {
-                if (!bypassedPlayerImageGate && value === document.images) {
-                    bypassedPlayerImageGate = true;
-                    return [];
-                }
-                return originalArrayFrom.call(Array, value, ...argumentsList);
-            };
+                // The remote app unregisters PWA workers during startup. Register after
+                // that cleanup without modifying browser APIs that Turnstile validates.
+                window.addEventListener('load', () => {
+                    setTimeout(installAmazonWorker, 0);
+                    setTimeout(installAmazonWorker, 2000);
+                    setTimeout(installAmazonWorker, 5000);
+                }, { once: true });
+            }
 
             const installNativeStyle = () => {
                 document.documentElement.classList.add('monochrome-native-ios');
