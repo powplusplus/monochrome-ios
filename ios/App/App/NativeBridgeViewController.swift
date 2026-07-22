@@ -15,6 +15,60 @@ final class NativeBridgeViewController: CAPBridgeViewController {
             const nativeAmazonWorkerVersion = '2026-06-23-flac-hls-v8';
             const serviceWorkers = navigator.serviceWorker;
 
+            const installNativeStreamResolver = (api) => {
+                if (!api?.getTrack || !api?.getStreamUrl || api.__monochromeNativeStreamResolver) return;
+
+                const originalGetStreamUrl = api.getStreamUrl.bind(api);
+                Object.defineProperty(api, '__monochromeNativeStreamResolver', { value: true });
+
+                api.getStreamUrl = async (id, quality = 'LOSSLESS') => {
+                    try {
+                        const lookup = await api.getTrack(id, quality, { adaptive: false });
+                        const streamUrl =
+                            lookup?.originalTrackUrl ||
+                            (lookup?.info?.manifest ? api.extractStreamUrlFromManifest(lookup.info.manifest) : null);
+
+                        if (streamUrl) {
+                            console.log('[Native Stream Resolver] Using direct HiFi stream', { id, quality });
+                            return {
+                                url: streamUrl,
+                                rgInfo: lookup.info
+                                    ? {
+                                          trackReplayGain: lookup.info.trackReplayGain || lookup.info.replayGain,
+                                          trackPeakAmplitude: lookup.info.trackPeakAmplitude || lookup.info.peakAmplitude,
+                                          albumReplayGain: lookup.info.albumReplayGain,
+                                          albumPeakAmplitude: lookup.info.albumPeakAmplitude
+                                      }
+                                    : null
+                            };
+                        }
+                    } catch (error) {
+                        console.warn('[Native Stream Resolver] Direct HiFi lookup failed; using provider fallback', error);
+                    }
+
+                    return originalGetStreamUrl(id, quality);
+                };
+            };
+
+            // The production bundle keeps its API classes module-private. Capture the
+            // LosslessAPI instance when MusicAPI assigns it during application startup.
+            const inheritedTidalAPIDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, 'tidalAPI');
+            if (!inheritedTidalAPIDescriptor) {
+                Object.defineProperty(Object.prototype, 'tidalAPI', {
+                    configurable: true,
+                    set(value) {
+                        Object.defineProperty(this, 'tidalAPI', {
+                            configurable: true,
+                            enumerable: true,
+                            writable: true,
+                            value
+                        });
+                        delete Object.prototype.tidalAPI;
+                        installNativeStreamResolver(value);
+                    }
+                });
+            }
+
             if (serviceWorkers && window.isSecureContext) {
                 const getRegistrations = serviceWorkers.getRegistrations.bind(serviceWorkers);
 
