@@ -29,7 +29,9 @@ jobs:
         id: simulator
         run: |
           set -euo pipefail
-          runtime="$(xcrun simctl list runtimes -j | jq -r '.runtimes[] | select(.isAvailable == true and (.identifier | contains("iOS"))) | .identifier' | tail -1)"
+          sdk_version="$(xcrun --sdk iphonesimulator --show-sdk-version)"
+          runtime="$(xcrun simctl list runtimes -j | jq -r --arg sdk "$sdk_version" '.runtimes[] | select(.isAvailable == true and .version == $sdk and (.identifier | contains("iOS"))) | .identifier' | head -1)"
+          test -n "$runtime"
           udid="$(xcrun simctl create 'Monochrome iPhone 12' com.apple.CoreSimulator.SimDeviceType.iPhone-12 "$runtime")"
           echo "udid=$udid" >> "$GITHUB_OUTPUT"
           xcrun simctl boot "$udid"
