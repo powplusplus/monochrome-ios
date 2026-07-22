@@ -5,14 +5,14 @@ import WebKit
 struct RootView: View {
     var body: some View {
         Group {
-            if #available(iOS 26.0, *) { ModernRootShell() }
+            if #available(iOS 26.1, *) { ModernRootShell() }
             else { CompatibleRootShell() }
         }
         .tint(.pink)
     }
 }
 
-@available(iOS 26.0, *)
+@available(iOS 26.1, *)
 private struct ModernRootShell: View {
     @EnvironmentObject private var playback: PlaybackEngine
     @State private var selection: AppTab = .home
