@@ -178,50 +178,56 @@ final class MusicService {
     }
 
     /// AVPlayer doesn't accept MPEG-DASH directly. HiFi's fixed manifests are
-    /// static fragmented-MP4 timelines, so expose the same signed fragments as
-    /// a short local HLS playlist that AVFoundation can consume natively.
+    /// static fragmented-MP4 timelines, so join the initialization fragment and
+    /// media fragments into one local fragmented MP4 that AVFoundation can open
+    /// without waiting on a synthetic local HLS playlist.
     private func playableURL(from manifestURL: URL) async throws -> URL {
         let (data, response) = try await session.data(from: manifestURL)
         try validate(response)
         guard let xml = String(data: data, encoding: .utf8) else { throw ServiceError.malformed("stream manifest") }
-        if xml.contains("#EXTM3U") {
-            let target = FileManager.default.temporaryDirectory.appendingPathComponent("monochrome-\(UUID().uuidString).m3u8")
-            try data.write(to: target, options: .atomic)
-            return target
-        }
+        if xml.contains("#EXTM3U") { return manifestURL }
         guard let initialization = attribute("initialization", in: xml),
               let media = attribute("media", in: xml),
-              let timescaleText = attribute("timescale", in: xml),
-              let timescale = Double(timescaleText), timescale > 0 else {
+              attribute("timescale", in: xml) != nil else {
             throw ServiceError.malformed("DASH audio timeline")
         }
         let startNumber = Int(attribute("startNumber", in: xml) ?? "1") ?? 1
         let segmentPattern = #"<S\s+([^>]+)/?>"#
         let regex = try NSRegularExpression(pattern: segmentPattern)
         let nsRange = NSRange(xml.startIndex..., in: xml)
-        var durations: [Double] = []
+        var segmentCount = 0
         for match in regex.matches(in: xml, range: nsRange) {
             guard let range = Range(match.range(at: 1), in: xml) else { continue }
             let attributes = String(xml[range])
-            guard let raw = attribute("d", in: attributes), let ticks = Double(raw) else { continue }
+            guard attribute("d", in: attributes) != nil else { continue }
             let repeats = max(0, Int(attribute("r", in: attributes) ?? "0") ?? 0)
-            durations.append(contentsOf: Array(repeating: ticks / timescale, count: repeats + 1))
+            segmentCount += repeats + 1
         }
-        guard !durations.isEmpty else { throw ServiceError.malformed("DASH segment timeline") }
-        let initURL = xmlDecoded(initialization)
+        guard segmentCount > 0 else { throw ServiceError.malformed("DASH segment timeline") }
+        guard let initURL = URL(string: xmlDecoded(initialization), relativeTo: manifestURL)?.absoluteURL else {
+            throw ServiceError.malformed("DASH initialization URL")
+        }
         let mediaTemplate = xmlDecoded(media)
-        let targetDuration = Int(ceil(durations.max() ?? 6))
-        let resolvedInitURL = URL(string: initURL, relativeTo: manifestURL)?.absoluteURL.absoluteString ?? initURL
-        var playlist = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:\(targetDuration)\n#EXT-X-MEDIA-SEQUENCE:\(startNumber)\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"\(resolvedInitURL)\"\n"
-        for (offset, duration) in durations.enumerated() {
-            playlist += String(format: "#EXTINF:%.6f,\n", duration)
+        var combined = try await fragmentData(from: initURL)
+        for offset in 0..<segmentCount {
             let segment = mediaTemplate.replacingOccurrences(of: "$Number$", with: String(startNumber + offset))
-            playlist += (URL(string: segment, relativeTo: manifestURL)?.absoluteURL.absoluteString ?? segment) + "\n"
+            guard let segmentURL = URL(string: segment, relativeTo: manifestURL)?.absoluteURL else {
+                throw ServiceError.malformed("DASH media URL")
+            }
+            combined.append(try await fragmentData(from: segmentURL))
         }
-        playlist += "#EXT-X-ENDLIST\n"
-        let target = FileManager.default.temporaryDirectory.appendingPathComponent("monochrome-\(UUID().uuidString).m3u8")
-        try Data(playlist.utf8).write(to: target, options: .atomic)
+        let target = FileManager.default.temporaryDirectory.appendingPathComponent("monochrome-\(UUID().uuidString).m4a")
+        try combined.write(to: target, options: .atomic)
         return target
+    }
+
+    private func fragmentData(from url: URL) async throws -> Data {
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        request.setValue("audio/mp4", forHTTPHeaderField: "Accept")
+        let (data, response) = try await session.data(for: request)
+        try validate(response)
+        guard !data.isEmpty else { throw ServiceError.malformed("empty audio fragment") }
+        return data
     }
 
     private func attribute(_ name: String, in text: String) -> String? {

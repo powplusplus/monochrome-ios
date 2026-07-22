@@ -492,6 +492,7 @@ struct NowPlayingView: View {
     @State private var showQueue = false
     var body: some View {
         GeometryReader { geometry in
+            let artworkSize = min(geometry.size.width - 48, min(geometry.size.height * 0.43, 380))
             ZStack {
                 Color.black.ignoresSafeArea()
                 ArtworkView(url: playback.currentTrack?.artworkURL)
@@ -502,35 +503,36 @@ struct NowPlayingView: View {
                     .scaleEffect(1.3)
                     .ignoresSafeArea()
                 LinearGradient(colors: [.black.opacity(0.18), .black.opacity(0.72)], startPoint: .top, endPoint: .bottom).ignoresSafeArea()
-                if geometry.size.width > geometry.size.height {
-                    HStack(spacing: 42) { artwork.frame(maxWidth: 360); controls.frame(maxWidth: 460) }.padding(.horizontal, max(28, geometry.safeAreaInsets.leading + 12)).padding(.vertical, 20)
-                } else {
-                    VStack(spacing: 0) {
-                        HStack {
-                            Button { dismiss() } label: {
-                                Image(systemName: "chevron.down")
-                                    .font(.headline)
-                                    .frame(width: 40, height: 40)
-                                    .background(.thinMaterial, in: Circle())
-                            }
-                            .accessibilityLabel("Close player")
-                            Spacer()
-                            Text("NOW PLAYING")
-                                .font(.caption2.weight(.semibold))
-                                .tracking(1.2)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Color.clear.frame(width: 40, height: 40)
+                VStack(spacing: 0) {
+                    HStack {
+                        Button { dismiss() } label: {
+                            Image(systemName: "chevron.down")
+                                .font(.headline)
+                                .frame(width: 40, height: 40)
+                                .background(.thinMaterial, in: Circle())
                         }
-                        .padding(.horizontal, 18)
-                        .padding(.top, 8)
-                        artwork
-                            .frame(width: min(geometry.size.width - 56, 390), height: min(geometry.size.width - 56, 390))
-                            .padding(.top, 24)
-                        Spacer(minLength: 26)
-                        controls
-                            .padding(.horizontal, 28)
-                            .padding(.bottom, max(18, geometry.safeAreaInsets.bottom))
+                        .accessibilityLabel("Close player")
+                        Spacer()
+                        Text("NOW PLAYING")
+                            .font(.caption2.weight(.semibold))
+                            .tracking(1.2)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Color.clear.frame(width: 40, height: 40)
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.top, 8)
+                    ScrollView(.vertical, showsIndicators: false) {
+                        VStack(spacing: 28) {
+                            artwork
+                                .frame(width: artworkSize, height: artworkSize)
+                                .padding(.top, 18)
+                            controls
+                        }
+                        .frame(maxWidth: 520)
+                        .padding(.horizontal, 28)
+                        .padding(.bottom, max(18, geometry.safeAreaInsets.bottom))
+                        .frame(maxWidth: .infinity)
                     }
                 }
             }
