@@ -11,6 +11,7 @@ final class MusicService {
         "https://wolf.qqdl.site", "https://maus.qqdl.site", "https://vogel.qqdl.site", "https://hund.qqdl.site"
     ]
     private let streamInstances = [
+        "https://eu-central.monochrome.tf", "https://us-west.monochrome.tf",
         "https://arran.monochrome.tf", "https://triton.squid.wtf", "https://wolf.qqdl.site",
         "https://maus.qqdl.site", "https://vogel.qqdl.site", "https://hund.qqdl.site", "https://hifi.p1nkhamster.com"
     ]
@@ -19,19 +20,24 @@ final class MusicService {
     init(session: URLSession = .shared) { self.session = session }
 
     func search(_ query: String) async throws -> SearchResults {
-        let object = try await json(path: "/search/?q=\(query.urlQueryEncoded)")
-        let root = ModelMapper.unwrap(object)
-        let dict = root as? [String: Any] ?? [:]
+        // The combined `?q=` route is not supported by every HiFi instance. The
+        // web client already treats the scoped routes as the compatibility
+        // contract, so native search does the same.
+        async let trackObject = scopedSearch(path: "/search/?s=\(query.urlQueryEncoded)")
+        async let albumObject = scopedSearch(path: "/search/?al=\(query.urlQueryEncoded)")
+        async let artistObject = scopedSearch(path: "/search/?a=\(query.urlQueryEncoded)")
+        async let playlistObject = scopedSearch(path: "/search/?p=\(query.urlQueryEncoded)")
+        let objects = await (trackObject, albumObject, artistObject, playlistObject)
         var results = SearchResults()
-        results.tracks = ModelMapper.array(dict["tracks"] as Any, keys: ["items"]).compactMap(ModelMapper.track)
-        results.albums = ModelMapper.array(dict["albums"] as Any, keys: ["items"]).compactMap(ModelMapper.album)
-        results.artists = ModelMapper.array(dict["artists"] as Any, keys: ["items"]).map { ModelMapper.artist($0) }
-        results.playlists = ModelMapper.array(dict["playlists"] as Any, keys: ["items"]).compactMap { item in
+        results.tracks = sectionItems(in: objects.0, named: "tracks").compactMap(ModelMapper.track)
+        results.albums = sectionItems(in: objects.1, named: "albums").compactMap(ModelMapper.album)
+        results.artists = sectionItems(in: objects.2, named: "artists").map { ModelMapper.artist($0) }
+        results.playlists = sectionItems(in: objects.3, named: "playlists").compactMap { item in
             guard let id = ModelMapper.string(item, ["id", "uuid"]), let title = ModelMapper.string(item, ["title", "name"]) else { return nil }
             return Playlist(id: id, title: title, description: ModelMapper.string(item, ["description"]), cover: ModelMapper.string(item, ["squareImage", "cover", "image"]), creator: nil, tracks: [])
         }
-        if results.tracks.isEmpty && results.albums.isEmpty {
-            results.tracks = ModelMapper.array(root, keys: ["items"]).compactMap(ModelMapper.track)
+        guard !results.tracks.isEmpty || !results.albums.isEmpty || !results.artists.isEmpty || !results.playlists.isEmpty else {
+            throw ServiceError.unavailable("No search provider returned results. Please try again.")
         }
         return results
     }
@@ -44,12 +50,24 @@ final class MusicService {
         return ModelMapper.array(object, keys: ["albums", "items"]).compactMap(ModelMapper.album)
     }
 
-    func album(id: String) async throws -> Album {
-        let object = try await json(path: "/album/?id=\(id.urlQueryEncoded)")
-        let root = ModelMapper.unwrap(object)
-        if let dict = root as? [String: Any], let album = ModelMapper.album(dict) { return album }
-        if let dict = ModelMapper.array(root).first, let album = ModelMapper.album(dict) { return album }
-        throw ServiceError.malformed("album")
+    func album(id: String, fallback: Album? = nil) async throws -> Album {
+        let encodedID = id.urlQueryEncoded
+        for path in ["/album/?id=\(encodedID)", "/album/?id=\(encodedID)&offset=0&limit=500"] {
+            if let object = try? await json(path: path, cacheable: false), let album = mappedAlbum(from: object) { return album }
+        }
+
+        // Curated entries can outlive a provider catalog ID. Resolve the same
+        // title/artist to its current ID instead of opening a dead album page.
+        if let fallback {
+            let object = await scopedSearch(path: "/search/?al=\(fallback.title.urlQueryEncoded)")
+            let candidates = sectionItems(in: object, named: "albums").compactMap(ModelMapper.album)
+            let match = candidates.first {
+                $0.title.caseInsensitiveCompare(fallback.title) == .orderedSame &&
+                $0.artist.name.caseInsensitiveCompare(fallback.artist.name) == .orderedSame
+            } ?? candidates.first { $0.title.caseInsensitiveCompare(fallback.title) == .orderedSame }
+            if let match, match.id != id { return try await album(id: match.id) }
+        }
+        throw ServiceError.unavailable("This album is no longer available from the configured providers.")
     }
 
     func recommendations(for trackID: String) async throws -> [Track] {
@@ -63,10 +81,12 @@ final class MusicService {
         var query = "id=\(track.playbackID.urlQueryEncoded)&quality=\(quality)&adaptive=false"
         formats.forEach { query += "&formats=\($0)" }
         let object = try await json(path: "/trackManifests/?\(query)", streaming: true, cacheable: false)
-        guard let manifest = findValue(named: "manifest", in: object) as? String,
-              let url = extractURL(fromManifest: manifest) else {
-            throw ServiceError.unavailable("No playable stream was returned by the configured providers.")
-        }
+        let url: URL
+        if let manifest = findValue(named: "manifest", in: object) as? String,
+           let extracted = extractURL(fromManifest: manifest) { url = extracted }
+        else if let uri = findValue(named: "uri", in: object) as? String,
+                let manifestURL = URL(string: uri) { url = try await playableURL(from: manifestURL) }
+        else { throw ServiceError.unavailable("No playable stream was returned by the configured providers.") }
         let gain = (findValue(named: "replayGain", in: object) as? NSNumber)?.doubleValue
         let peak = (findValue(named: "peakAmplitude", in: object) as? NSNumber)?.doubleValue
         return StreamResponse(url: url, provider: track.provider, quality: quality, replayGain: gain, peak: peak)
@@ -90,6 +110,39 @@ final class MusicService {
             } catch { latestError = error }
         }
         throw latestError
+    }
+
+    private func scopedSearch(path: String) async -> Any? { try? await json(path: path, cacheable: false) }
+
+    private func sectionItems(in object: Any?, named section: String) -> [[String: Any]] {
+        guard let object else { return [] }
+        let root = (object as? [String: Any])?["data"] ?? object
+        if let dict = root as? [String: Any] {
+            if let value = dict[section] { return itemArray(value) }
+            if dict["items"] != nil { return itemArray(dict) }
+            for value in dict.values {
+                let nested = sectionItems(in: value, named: section)
+                if !nested.isEmpty { return nested }
+            }
+        }
+        return itemArray(root)
+    }
+
+    private func itemArray(_ value: Any) -> [[String: Any]] {
+        let unwrapped = (value as? [String: Any])?["items"] ?? value
+        guard let values = unwrapped as? [Any] else { return [] }
+        return values.compactMap { entry in
+            guard let dict = entry as? [String: Any] else { return nil }
+            return (dict["item"] ?? dict["track"] ?? dict["value"]) as? [String: Any] ?? dict
+        }
+    }
+
+    private func mappedAlbum(from object: Any) -> Album? {
+        let root = (object as? [String: Any])?["data"] ?? object
+        guard let dict = root as? [String: Any], var album = ModelMapper.album(dict) else { return nil }
+        let tracks = itemArray(dict).compactMap(ModelMapper.track)
+        if !tracks.isEmpty { album.tracks = tracks }
+        return album
     }
 
     private func validate(_ response: URLResponse) throws {
@@ -119,6 +172,63 @@ final class MusicService {
               let match = regex.firstMatch(in: decoded, range: NSRange(decoded.startIndex..., in: decoded)),
               let range = Range(match.range, in: decoded) else { return nil }
         return URL(string: String(decoded[range]))
+    }
+
+    /// AVPlayer doesn't accept MPEG-DASH directly. HiFi's fixed manifests are
+    /// static fragmented-MP4 timelines, so expose the same signed fragments as
+    /// a short local HLS playlist that AVFoundation can consume natively.
+    private func playableURL(from manifestURL: URL) async throws -> URL {
+        let (data, response) = try await session.data(from: manifestURL)
+        try validate(response)
+        guard let xml = String(data: data, encoding: .utf8) else { throw ServiceError.malformed("stream manifest") }
+        if xml.contains("#EXTM3U") {
+            let target = FileManager.default.temporaryDirectory.appendingPathComponent("monochrome-\(UUID().uuidString).m3u8")
+            try data.write(to: target, options: .atomic)
+            return target
+        }
+        guard let initialization = attribute("initialization", in: xml),
+              let media = attribute("media", in: xml),
+              let timescaleText = attribute("timescale", in: xml),
+              let timescale = Double(timescaleText), timescale > 0 else {
+            throw ServiceError.malformed("DASH audio timeline")
+        }
+        let startNumber = Int(attribute("startNumber", in: xml) ?? "1") ?? 1
+        let segmentPattern = #"<S\s+([^>]+)/?>"#
+        let regex = try NSRegularExpression(pattern: segmentPattern)
+        let nsRange = NSRange(xml.startIndex..., in: xml)
+        var durations: [Double] = []
+        for match in regex.matches(in: xml, range: nsRange) {
+            guard let range = Range(match.range(at: 1), in: xml) else { continue }
+            let attributes = String(xml[range])
+            guard let raw = attribute("d", in: attributes), let ticks = Double(raw) else { continue }
+            let repeats = max(0, Int(attribute("r", in: attributes) ?? "0") ?? 0)
+            durations.append(contentsOf: Array(repeating: ticks / timescale, count: repeats + 1))
+        }
+        guard !durations.isEmpty else { throw ServiceError.malformed("DASH segment timeline") }
+        let initURL = xmlDecoded(initialization)
+        let mediaTemplate = xmlDecoded(media)
+        let targetDuration = Int(ceil(durations.max() ?? 6))
+        var playlist = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:\(targetDuration)\n#EXT-X-MEDIA-SEQUENCE:\(startNumber)\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"\(initURL)\"\n"
+        for (offset, duration) in durations.enumerated() {
+            playlist += String(format: "#EXTINF:%.6f,\n", duration)
+            playlist += mediaTemplate.replacingOccurrences(of: "$Number$", with: String(startNumber + offset)) + "\n"
+        }
+        playlist += "#EXT-X-ENDLIST\n"
+        let target = FileManager.default.temporaryDirectory.appendingPathComponent("monochrome-\(UUID().uuidString).m3u8")
+        try Data(playlist.utf8).write(to: target, options: .atomic)
+        return target
+    }
+
+    private func attribute(_ name: String, in text: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: "\\b\(NSRegularExpression.escapedPattern(for: name))=['\\\"]([^'\\\"]+)['\\\"]"),
+              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let range = Range(match.range(at: 1), in: text) else { return nil }
+        return String(text[range])
+    }
+
+    private func xmlDecoded(_ value: String) -> String {
+        value.replacingOccurrences(of: "&amp;", with: "&")
+             .replacingOccurrences(of: "&quot;", with: "\"")
     }
 }
 

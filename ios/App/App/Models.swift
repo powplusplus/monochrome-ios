@@ -187,6 +187,7 @@ enum ModelMapper {
     }
 
     static func track(_ dict: [String: Any]) -> Track? {
+        if let nested = (dict["item"] ?? dict["track"] ?? dict["value"]) as? [String: Any] { return track(nested) }
         guard let id = string(dict, ["id", "trackId", "uuid"]), let title = string(dict, ["title", "name"]) else { return nil }
         let artistValue = dict["artist"] ?? dict["artists"] ?? dict["artistName"]
         var album: AlbumSummary?
@@ -206,6 +207,7 @@ enum ModelMapper {
     }
 
     static func album(_ dict: [String: Any]) -> Album? {
+        if let nested = (dict["item"] ?? dict["album"] ?? dict["value"]) as? [String: Any] { return album(nested) }
         guard let id = string(dict, ["id", "uuid"]), let title = string(dict, ["title", "name"]) else { return nil }
         let tracks = array(dict["tracks"] as Any, keys: ["items"]).compactMap(track)
         return Album(id: id, title: title, artist: artist(dict["artist"] ?? dict["artists"]),

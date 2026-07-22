@@ -10,8 +10,10 @@ final class LibraryRepository: ObservableObject {
     @Published private(set) var history: [Track] = []
     @Published private(set) var playlists: [Playlist] = []
     @Published private(set) var migrationState: MigrationState = .notStarted
+    @Published private(set) var cloudSyncState: CloudSyncState = .idle
 
     enum MigrationState: Equatable { case notStarted, running, complete, failed(String) }
+    enum CloudSyncState: Equatable { case idle, syncing, complete, failed(String) }
 
     private let container: NSPersistentContainer
     private let encoder = JSONEncoder()
@@ -63,6 +65,7 @@ final class LibraryRepository: ObservableObject {
         playlists.insert(playlist, at: 0)
         upsert(playlist, key: playlist.id, kind: "playlist")
         save()
+        scheduleCloudUpload()
     }
 
     func add(_ track: Track, to playlistID: String) {
@@ -70,6 +73,7 @@ final class LibraryRepository: ObservableObject {
         if !playlists[index].tracks.contains(where: { $0.id == track.id }) { playlists[index].tracks.append(track) }
         upsert(playlists[index], key: playlistID, kind: "playlist")
         save()
+        scheduleCloudUpload()
     }
 
     func removeFavorite(at offsets: IndexSet) {
@@ -105,6 +109,37 @@ final class LibraryRepository: ObservableObject {
         }
     }
 
+    func syncWithCloud() async {
+        guard let token = Keychain.read("bearer") else { cloudSyncState = .idle; return }
+        guard cloudSyncState != .syncing else { return }
+        cloudSyncState = .syncing
+        do {
+            var request = URLRequest(url: URL(string: "https://auth.monochrome.tf/api/sync")!)
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                throw ServiceError.authenticationRequired
+            }
+            let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+            let remote = recordMap(root["userPlaylists"] ?? root["user_playlists"])
+            for (key, value) in remote {
+                guard let title = ModelMapper.string(value, ["name", "title"]) else { continue }
+                let id = ModelMapper.string(value, ["id", "uuid"]) ?? key
+                let tracks = ModelMapper.array(value["tracks"] as Any, keys: ["items"]).compactMap(ModelMapper.track)
+                let playlist = Playlist(id: id, title: title, description: ModelMapper.string(value, ["description"]),
+                                        cover: ModelMapper.string(value, ["cover", "image"]), creator: "You", tracks: tracks)
+                upsert(playlist, key: id, kind: "playlist")
+            }
+            try container.viewContext.save()
+            load()
+            try await uploadPlaylists(token: token)
+            cloudSyncState = .complete
+        } catch {
+            cloudSyncState = .failed(error.localizedDescription)
+        }
+    }
+
     private func load() {
         let request = NSFetchRequest<NSManagedObject>(entityName: "LibraryRecord")
         request.sortDescriptors = [NSSortDescriptor(key: "updatedAt", ascending: false)]
@@ -134,6 +169,54 @@ final class LibraryRepository: ObservableObject {
     }
 
     private func save() { try? container.viewContext.save() }
+
+    private func scheduleCloudUpload() {
+        guard Keychain.read("bearer") != nil else { return }
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard let self, let token = Keychain.read("bearer") else { return }
+            do { try await self.uploadPlaylists(token: token); self.cloudSyncState = .complete }
+            catch { self.cloudSyncState = .failed(error.localizedDescription) }
+        }
+    }
+
+    private func uploadPlaylists(token: String) async throws {
+        var records: [String: Any] = [:]
+        for playlist in playlists {
+            let trackData = try encoder.encode(playlist.tracks)
+            let tracks = try JSONSerialization.jsonObject(with: trackData)
+            records[playlist.id] = [
+                "id": playlist.id, "name": playlist.title, "title": playlist.title,
+                "description": playlist.description ?? "", "cover": (playlist.cover as Any?) ?? NSNull(),
+                "tracks": tracks, "numberOfTracks": playlist.tracks.count,
+                "updatedAt": Int(Date().timeIntervalSince1970 * 1000)
+            ]
+        }
+        var request = URLRequest(url: URL(string: "https://auth.monochrome.tf/api/sync")!)
+        request.httpMethod = "PATCH"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["userPlaylists": records])
+        let (_, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw ServiceError.authenticationRequired
+        }
+    }
+
+    private func recordMap(_ value: Any?) -> [String: [String: Any]] {
+        var decoded = value
+        if let text = value as? String, let data = text.data(using: .utf8) {
+            decoded = try? JSONSerialization.jsonObject(with: data)
+        }
+        if let map = decoded as? [String: [String: Any]] { return map }
+        if let list = decoded as? [[String: Any]] {
+            return Dictionary(uniqueKeysWithValues: list.compactMap { item in
+                guard let id = ModelMapper.string(item, ["id", "uuid"]) else { return nil }
+                return (id, item)
+            })
+        }
+        return [:]
+    }
 
     private func importSnapshot(_ snapshot: LegacySnapshot) throws {
         for object in snapshot.favorites {
@@ -174,17 +257,21 @@ final class LegacyMigrationBridge: NSObject, WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         let script = """
-        (async()=>{const out={favorites:[],history:[],playlists:[],settings:{}};
+        const out={favorites:[],history:[],playlists:[],settings:{}};
         try{for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i),v=localStorage.getItem(k);try{out.settings[k]=JSON.parse(v)}catch{out.settings[k]=v}}}catch{}
         try{const db=await new Promise((ok,no)=>{const r=indexedDB.open('MonochromeDB');r.onsuccess=()=>ok(r.result);r.onerror=()=>no(r.error)});
         const read=(n)=>new Promise(ok=>{if(!db.objectStoreNames.contains(n))return ok([]);const r=db.transaction(n).objectStore(n).getAll();r.onsuccess=()=>ok(r.result||[]);r.onerror=()=>ok([])});
         out.favorites=await read('favorites_tracks');out.history=await read('history_tracks');out.playlists=await read('user_playlists')}catch{}
-        return JSON.stringify(out)})()
+        return JSON.stringify(out)
         """
-        webView.evaluateJavaScript(script) { [weak self] value, error in
+        webView.callAsyncJavaScript(script, arguments: [:], in: nil, contentWorld: .page) { [weak self] result in
             guard let self else { return }
             defer { self.webView = nil; self.completion = nil }
-            if let error { self.completion?(.failure(error)); return }
+            let value: Any
+            switch result {
+            case .success(let output): value = output
+            case .failure(let error): self.completion?(.failure(error)); return
+            }
             guard let string = value as? String, let data = string.data(using: .utf8),
                   let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 self.completion?(.failure(ServiceError.malformed("legacy store"))); return

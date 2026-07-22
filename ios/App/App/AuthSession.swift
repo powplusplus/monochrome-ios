@@ -26,6 +26,7 @@ final class AuthSession: NSObject, ObservableObject, ASWebAuthenticationPresenta
             let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             guard let secret = object?["secret"] as? String ?? object?["token"] as? String else { throw ServiceError.malformed("session token") }
             try Keychain.write(secret, account: "bearer"); isSignedIn = true
+            await LibraryRepository.shared.syncWithCloud()
         } catch { errorMessage = error.localizedDescription }
     }
 
@@ -94,7 +95,7 @@ final class AuthSession: NSObject, ObservableObject, ASWebAuthenticationPresenta
             try Keychain.write(secret, account: "bearer")
             isSignedIn = true
             errorMessage = nil
-            Task { await loadProfile() }
+            Task { await loadProfile(); await LibraryRepository.shared.syncWithCloud() }
         } catch { errorMessage = error.localizedDescription }
     }
 

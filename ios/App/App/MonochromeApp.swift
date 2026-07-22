@@ -18,7 +18,10 @@ struct MonochromeApp: App {
                 .environmentObject(downloads)
                 .environmentObject(parties)
                 .onOpenURL { auth.handle($0) }
-                .task { library.migrateLegacyIfNeeded() }
+                .task {
+                    library.migrateLegacyIfNeeded()
+                    if auth.isSignedIn { await library.syncWithCloud() }
+                }
         }
     }
 }

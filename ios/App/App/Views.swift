@@ -1,49 +1,65 @@
 import SwiftUI
 import AVKit
+import WebKit
 
 struct RootView: View {
+    var body: some View {
+        Group {
+            if #available(iOS 26.0, *) { ModernRootShell() }
+            else { CompatibleRootShell() }
+        }
+        .tint(.pink)
+    }
+}
+
+@available(iOS 26.0, *)
+private struct ModernRootShell: View {
     @EnvironmentObject private var playback: PlaybackEngine
     @State private var selection: AppTab = .home
     @State private var showPlayer = false
 
     var body: some View {
-        GeometryReader { geometry in
-            ZStack(alignment: .bottom) {
-                MonochromeBackground()
-
-                Group {
-                    switch selection {
-                    case .home: HomeView()
-                    case .library: LibraryView()
-                    case .search: SearchView()
-                    case .settings: SettingsView()
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .safeAreaInset(edge: .bottom) {
-                    Color.clear.frame(height: playback.currentTrack == nil ? 70 : 128)
-                }
-
-                VStack(spacing: 8) {
-                    Spacer()
-                    if playback.currentTrack != nil {
-                        MiniPlayer(showPlayer: $showPlayer)
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
-                    }
-                    LiquidTabBar(selection: $selection)
-                }
-                .padding(.horizontal, geometry.size.width > geometry.size.height ? 28 : 12)
-                .padding(.bottom, max(8, geometry.safeAreaInsets.bottom))
-            }
-            .ignoresSafeArea(.keyboard, edges: .bottom)
+        TabView(selection: $selection) {
+            Tab("Home", systemImage: "house.fill", value: .home) { HomeView() }
+            Tab("Library", systemImage: "music.note.list", value: .library) { LibraryView() }
+            Tab("Search", systemImage: "magnifyingglass", value: .search) { SearchView() }
+            Tab("All Features", systemImage: "square.grid.2x2.fill", value: .features) { FullFeatureView() }
+            Tab("Settings", systemImage: "gearshape.fill", value: .settings) { SettingsView() }
+        }
+        .tabBarMinimizeBehavior(.onScrollDown)
+        .tabViewBottomAccessory(isEnabled: playback.currentTrack != nil) {
+            MiniPlayer(showPlayer: $showPlayer).padding(.horizontal, 8)
         }
         .sheet(isPresented: $showPlayer) { NowPlayingView() }
-        .animation(.easeOut(duration: 0.22), value: playback.currentTrack?.id)
+    }
+}
+
+private struct CompatibleRootShell: View {
+    @EnvironmentObject private var playback: PlaybackEngine
+    @State private var selection: AppTab = .home
+    @State private var showPlayer = false
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            TabView(selection: $selection) {
+                HomeView().tabItem { Label("Home", systemImage: "house.fill") }.tag(AppTab.home)
+                LibraryView().tabItem { Label("Library", systemImage: "music.note.list") }.tag(AppTab.library)
+                SearchView().tabItem { Label("Search", systemImage: "magnifyingglass") }.tag(AppTab.search)
+                FullFeatureView().tabItem { Label("All Features", systemImage: "square.grid.2x2.fill") }.tag(AppTab.features)
+                SettingsView().tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(AppTab.settings)
+            }
+            if playback.currentTrack != nil {
+                MiniPlayer(showPlayer: $showPlayer)
+                    .padding(.horizontal, 8).padding(.bottom, 50)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .sheet(isPresented: $showPlayer) { NowPlayingView() }
     }
 }
 
 enum AppTab: String, CaseIterable, Identifiable {
-    case home, library, search, settings
+    case home, library, search, features, settings
 
     var id: String { rawValue }
     var title: String { rawValue.capitalized }
@@ -52,6 +68,7 @@ enum AppTab: String, CaseIterable, Identifiable {
         case .home: return "house.fill"
         case .library: return "music.note.list"
         case .search: return "magnifyingglass"
+        case .features: return "square.grid.2x2.fill"
         case .settings: return "gearshape.fill"
         }
     }
@@ -76,29 +93,18 @@ struct LiquidGlassShape: ViewModifier {
     var cornerRadius: CGFloat = 24
     var strong = false
 
-    func body(content: Content) -> some View {
-        content
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .background(
-                LinearGradient(
-                    colors: [Color.white.opacity(strong ? 0.16 : 0.10), Color.white.opacity(0.025)],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                ),
+    @ViewBuilder func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content.glassEffect(
+                .regular.tint(strong ? Color.white.opacity(0.08) : nil).interactive(),
                 in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(
-                        LinearGradient(
-                            colors: [Color.white.opacity(0.30), Color.white.opacity(0.07), Color.white.opacity(0.15)],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        lineWidth: 0.8
-                    )
-            )
-            .shadow(color: .black.opacity(strong ? 0.42 : 0.26), radius: strong ? 24 : 14, y: 9)
+        } else {
+            content
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 0.8))
+                .shadow(color: .black.opacity(strong ? 0.42 : 0.26), radius: strong ? 24 : 14, y: 9)
+        }
     }
 }
 
@@ -144,6 +150,50 @@ struct LiquidTabBar: View {
     }
 }
 
+/// Keeps the complete Monochrome client available while native screens are
+/// progressively enhanced. Visualizers, podcasts, listening parties, imports,
+/// playlist folders, profiles, lyrics, EQ/AutoEQ and the advanced settings all
+/// remain reachable instead of being discarded by the Apple-native shell.
+struct FullFeatureView: View {
+    var body: some View {
+        NavigationView {
+            MonochromeWebView()
+                .ignoresSafeArea(.container, edges: .bottom)
+                .navigationTitle("All Features")
+                .navigationBarTitleDisplayMode(.inline)
+        }
+        .navigationViewStyle(.stack)
+    }
+}
+
+private struct MonochromeWebView: UIViewRepresentable {
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        configuration.allowsInlineMediaPlayback = true
+        configuration.mediaTypesRequiringUserActionForPlayback = []
+        let view = WKWebView(frame: .zero, configuration: configuration)
+        view.navigationDelegate = context.coordinator
+        view.uiDelegate = context.coordinator
+        view.allowsBackForwardNavigationGestures = true
+        view.scrollView.contentInsetAdjustmentBehavior = .automatic
+        view.load(URLRequest(url: URL(string: "https://monochrome.tf/")!, cachePolicy: .returnCacheDataElseLoad))
+        return view
+    }
+
+    func updateUIView(_ view: WKWebView, context: Context) {}
+
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+        func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                     for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+            if let url = navigationAction.request.url { webView.load(URLRequest(url: url)) }
+            return nil
+        }
+    }
+}
+
 struct HomeView: View {
     @EnvironmentObject private var library: LibraryRepository
     @State private var picks: [Album] = []
@@ -163,9 +213,6 @@ struct HomeView: View {
                                 }
                             }.padding(.horizontal)
                         }
-                    }
-                    MediaSection(title: "Made for listening") {
-                        FeatureCard(icon: "waveform", title: "Lossless, without the wait", subtitle: "Playback starts as soon as a provider resolves. Everything else loads in the background.")
                     }
                 }.padding(.vertical, 18).padding(.bottom, 100)
             }
@@ -205,6 +252,14 @@ struct SearchView: View {
                         if !results.tracks.isEmpty { Section("Songs") { ForEach(results.tracks) { TrackRow(track: $0, context: results.tracks) } } }
                         if !results.albums.isEmpty { Section("Albums") { ForEach(results.albums) { album in NavigationLink(destination: AlbumDetailView(albumID: album.id, initial: album)) { AlbumListRow(album: album) } } } }
                         if !results.artists.isEmpty { Section("Artists") { ForEach(results.artists) { artist in Label(artist.name, systemImage: "person.crop.circle") } } }
+                        if !results.playlists.isEmpty { Section("Playlists") { ForEach(results.playlists) { playlist in Label(playlist.title, systemImage: "music.note.list") } } }
+                        if results.tracks.isEmpty && results.albums.isEmpty && results.artists.isEmpty && results.playlists.isEmpty {
+                            VStack(spacing: 8) {
+                                Image(systemName: "magnifyingglass").font(.title).foregroundColor(.secondary)
+                                Text("No Results").font(.headline)
+                                Text("Try a different artist, album, song, or playlist.").font(.subheadline).foregroundColor(.secondary)
+                            }.frame(maxWidth: .infinity).padding(.vertical, 40)
+                        }
                     }.listStyle(.insetGrouped)
                 }
             }
@@ -212,15 +267,26 @@ struct SearchView: View {
             .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Artists, albums, songs")
             .onSubmit(of: .search) { Task { await search() } }
             .onChange(of: query) { value in if value.isEmpty { results = SearchResults() } }
+            .task(id: query) {
+                guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                guard !Task.isCancelled else { return }
+                await search()
+            }
             .alert("Search failed", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) { Button("OK", role: .cancel) {} } message: { Text(message ?? "") }
         }.navigationViewStyle(.stack)
     }
 
     private func search() async {
-        guard !query.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        let requestedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !requestedQuery.isEmpty else { return }
         searching = true
-        do { results = try await MusicService.shared.search(query) } catch { message = error.localizedDescription }
-        searching = false
+        do {
+            let response = try await MusicService.shared.search(requestedQuery)
+            guard requestedQuery == query.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+            results = response
+        } catch { message = error.localizedDescription }
+        if requestedQuery == query.trimmingCharacters(in: .whitespacesAndNewlines) { searching = false }
     }
 }
 
@@ -276,16 +342,30 @@ struct SettingsView: View {
                 }
                 Section("Services") { NavigationLink("Scrobbling", destination: ScrobblingSettingsView()); NavigationLink("Provider order", destination: ProviderSettingsView()) }
                 Section("Data") {
+                    HStack { Text("Cloud playlists"); Spacer(); cloudSyncLabel }
+                    if auth.isSignedIn {
+                        Button("Sync playlists now") { Task { await library.syncWithCloud() } }
+                            .disabled(library.cloudSyncState == .syncing)
+                    }
                     HStack { Text("Legacy migration"); Spacer(); migrationLabel }
                     Button("Retry legacy migration") { library.migrateLegacyIfNeeded(force: true) }.disabled(library.migrationState == .running)
                 }
-                Section { Text("Native SwiftUI · iOS 15+").foregroundColor(.secondary) } footer: { Text("Application screens never load monochrome.tf in a WebView. WebKit is used only for the one-time legacy import and isolated authentication challenges.") }
+                Section { Text("Native SwiftUI · iOS 15+").foregroundColor(.secondary) } footer: { Text("Core listening uses native SwiftUI. All Features securely opens the complete Monochrome client so advanced tools remain available during the native transition.") }
             }.navigationTitle("Settings")
         }.navigationViewStyle(.stack).preferredColorScheme(darkAppearance ? .dark : nil)
     }
 
     @ViewBuilder private var migrationLabel: some View {
         switch library.migrationState { case .notStarted: Text("Pending").foregroundColor(.secondary); case .running: ProgressView(); case .complete: Text("Complete").foregroundColor(.green); case .failed: Text("Needs attention").foregroundColor(.orange) }
+    }
+
+    @ViewBuilder private var cloudSyncLabel: some View {
+        switch library.cloudSyncState {
+        case .idle: Text(auth.isSignedIn ? "Ready" : "Sign in").foregroundColor(.secondary)
+        case .syncing: ProgressView()
+        case .complete: Text("Synced").foregroundColor(.green)
+        case .failed: Text("Retry").foregroundColor(.orange)
+        }
     }
 }
 
@@ -295,6 +375,7 @@ struct AlbumDetailView: View {
     @EnvironmentObject private var playback: PlaybackEngine
     @State private var album: Album
     @State private var loading = false
+    @State private var message: String?
 
     init(albumID: String, initial: Album) { self.albumID = albumID; self.initial = initial; _album = State(initialValue: initial) }
     var body: some View {
@@ -306,7 +387,16 @@ struct AlbumDetailView: View {
             }.padding(.bottom, 90)
         }
         .navigationTitle(album.title).navigationBarTitleDisplayMode(.inline)
-        .task { guard album.tracks.isEmpty else { return }; loading = true; if let loaded = try? await MusicService.shared.album(id: albumID) { album = loaded }; loading = false }
+        .alert("Album unavailable", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: { Text(message ?? "") }
+        .task {
+            guard album.tracks.isEmpty else { return }
+            loading = true
+            do { album = try await MusicService.shared.album(id: albumID, fallback: initial) }
+            catch { message = error.localizedDescription }
+            loading = false
+        }
     }
     private var trackList: some View {
         LazyVStack(spacing: 0) {
