@@ -22,6 +22,15 @@ final class AppTests: XCTestCase {
     }
 
     @MainActor
+    func testOAuthURLDecodesProductionResponseShapes() throws {
+        let direct = AuthSession.oauthURL(from: ["url": "https://accounts.google.com/o/oauth2/auth"])
+        let nested = AuthSession.oauthURL(from: ["data": ["redirectURL": "https://github.com/login/oauth/authorize"]])
+        XCTAssertEqual(direct?.host, "accounts.google.com")
+        XCTAssertEqual(nested?.host, "github.com")
+        XCTAssertNil(AuthSession.oauthURL(from: ["url": "monochrome://auth-callback?secret=unsafe-to-open-here"]))
+    }
+
+    @MainActor
     func testLibraryPersistsFavoritesInMemory() {
         let repository = LibraryRepository(inMemory: true)
         let track = Track(id: "tidal:1", title: "Song", artist: Artist(id: "1", name: "Artist"))
