@@ -5449,7 +5449,7 @@ input:checked + .slider::before {
 
 #download-notifications {
     position: fixed;
-    bottom: calc(max(env(safe-area-inset-bottom), 0px) + 12px);
+    bottom: calc(max(env(safe-area-inset-bottom), 0px) + var(--player-bar-height-desktop) + 30px);
     right: 20px;
     z-index: 20000;
     max-width: 350px;
@@ -7277,7 +7277,7 @@ img[src=''] {
     }
 
     #download-notifications {
-        bottom: calc(max(env(safe-area-inset-bottom), 0px) + 10px);
+        bottom: calc(max(env(safe-area-inset-bottom), 0px) + var(--player-bar-height-mobile) + 30px);
         right: 10px;
         left: 10px;
         max-width: none;
@@ -7820,20 +7820,21 @@ body:has(#fullscreen-cover-overlay:not([style*='display: none'])) .now-playing-b
     left: 2% !important;
 }
 
-/* iPhone settings navigation: retain readable tap targets instead of squeezing or wrapping labels. */
+/* iPhone settings navigation: a compact, readable strip that does not clip the fourth tab. */
 @media (max-width: 430px) {
     .settings-tabs {
         display: flex !important;
         flex-wrap: nowrap !important;
-        gap: 0.45rem !important;
+        gap: 0.25rem !important;
         max-width: 100% !important;
-        margin: 0 -0.25rem var(--spacing-lg) !important;
-        padding: 0.25rem !important;
+        margin: 0 0 var(--spacing-lg) !important;
+        padding: 0 0.2rem !important;
         overflow-x: auto !important;
         overflow-y: hidden !important;
-        border: 1px solid color-mix(in srgb, var(--border) 72%, transparent) !important;
-        border-radius: 14px !important;
-        background: color-mix(in srgb, var(--card) 78%, transparent) !important;
+        border: 0 !important;
+        border-bottom: 1px solid var(--border) !important;
+        border-radius: 0 !important;
+        background: transparent !important;
         -webkit-overflow-scrolling: touch;
         scrollbar-width: none;
         scroll-snap-type: x proximity;
@@ -7846,20 +7847,21 @@ body:has(#fullscreen-cover-overlay:not([style*='display: none'])) .now-playing-b
     .settings-tab {
         flex: 0 0 auto !important;
         min-width: max-content !important;
-        min-height: 40px !important;
-        padding: 0.6rem 0.85rem !important;
+        min-height: 38px !important;
+        padding: 0.5rem 0.55rem !important;
         border: 0 !important;
-        border-radius: 11px !important;
+        border-bottom: 2px solid transparent !important;
+        border-radius: 0 !important;
         white-space: nowrap !important;
-        font-size: 0.9rem !important;
+        font-size: 0.8rem !important;
         scroll-snap-align: start;
     }
 
     .settings-tab.active {
-        border: 0 !important;
-        color: var(--primary-foreground) !important;
-        background: var(--primary) !important;
-        box-shadow: 0 3px 12px rgb(0 0 0 / 18%);
+        border-bottom-color: var(--highlight) !important;
+        color: var(--foreground) !important;
+        background: transparent !important;
+        box-shadow: none !important;
     }
 
     .theme-picker {
@@ -7942,8 +7944,8 @@ body:has(#fullscreen-cover-overlay:not([style*='display: none'])) .now-playing-b
         bottom: calc(58px + env(safe-area-inset-bottom)) !important;
         height: var(--player-bar-height-mobile);
         grid-template: 'track controls' 1fr / minmax(0, 1fr) auto;
-        gap: 8px;
-        padding: 7px 8px;
+        gap: 6px;
+        padding: 7px 10px;
         border-radius: 14px;
         background-color: color-mix(in srgb, var(--card) 94%, transparent);
         box-shadow: 0 8px 30px rgb(0 0 0 / 0.38);
@@ -7951,6 +7953,8 @@ body:has(#fullscreen-cover-overlay:not([style*='display: none'])) .now-playing-b
 
     .now-playing-bar .track-info {
         grid-area: track;
+        gap: 10px;
+        overflow: hidden;
     }
 
     .now-playing-bar .track-info .cover {
@@ -7983,20 +7987,26 @@ body:has(#fullscreen-cover-overlay:not([style*='display: none'])) .now-playing-b
     }
 
     .now-playing-bar .player-controls .buttons {
-        gap: 2px;
+        gap: 0;
         padding: 0;
     }
 
     .now-playing-bar .player-controls .buttons button {
-        width: 40px;
-        height: 44px;
-        min-width: 40px;
-        min-height: 44px;
+        width: 36px;
+        height: 40px;
+        min-width: 36px;
+        min-height: 40px;
     }
 
     .now-playing-bar .player-controls .buttons .play-pause-btn {
-        width: 44px;
-        height: 44px;
+        width: 40px;
+        height: 40px;
+        min-width: 40px;
+        min-height: 40px;
+    }
+
+    #download-notifications {
+        bottom: calc(env(safe-area-inset-bottom) + 142px);
     }
 
     .ios-tab-bar {

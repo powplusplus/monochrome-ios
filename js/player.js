@@ -1022,7 +1022,6 @@ export class Player {
     }
 
     async playTrackFromQueue(startTime = 0, recursiveCount = 0, isRetry = false, options = {}) {
-        await this.shakaReady;
         const { preserveGestureToken = false } = options;
         if (!isRetry) {
             this.isFallbackRetry = false;
@@ -1065,18 +1064,12 @@ export class Player {
         });
 
         if (this.shouldFetchMoreArtistPopularTracks(currentQueue)) {
-            if (shouldPreserveGestureToken) {
-                void this.fetchMoreArtistPopularTracksForPlayback(currentQueue).catch(console.error);
-            } else {
-                await this.fetchMoreArtistPopularTracksForPlayback(currentQueue);
-            }
+            void this.fetchMoreArtistPopularTracksForPlayback(currentQueue).catch(console.error);
         }
 
-        if (shouldPreserveGestureToken) {
-            void this.saveQueueState().catch(console.error);
-        } else {
-            await this.saveQueueState();
-        }
+        // Neither queue persistence nor radio backfill is required to begin audio. Keeping both
+        // off the playback critical path avoids several seconds of silence on slower iPhones.
+        void this.saveQueueState().catch(console.error);
 
         this.currentTrack = track;
         this.addToRecentlyPlayed(track.id);
@@ -1351,6 +1344,7 @@ export class Player {
                 if (streamUrl.includes('.m3u8') || streamUrl.includes('application/vnd.apple.mpegurl')) {
                     await this.setupHlsVideo(activeElement, streamUrl, null);
                 } else if (streamUrl.startsWith('blob:') || streamUrl.includes('.mpd')) {
+                    await this.shakaReady;
                     await this.shakaPlayer.attach(activeElement);
 
                     const loadTarget =
@@ -1460,6 +1454,9 @@ export class Player {
                         (streamUrl.startsWith('blob:') && resolvedStreamInfo.playbackType !== 'direct'));
 
                 if (shouldUseShaka) {
+                    // Direct audio does not need the relatively large Shaka module. Only wait for
+                    // it when this particular stream requires DASH/CENC playback.
+                    await this.shakaReady;
                     // It's likely a DASH manifest URL
                     if (this.shakaPlayer.getMediaElement() !== activeElement) {
                         await this.shakaPlayer.attach(activeElement);

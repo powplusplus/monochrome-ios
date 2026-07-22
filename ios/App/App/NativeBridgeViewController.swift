@@ -50,10 +50,10 @@ final class NativeBridgeViewController: CAPBridgeViewController {
                 style.id = 'monochrome-native-ios-style';
                 style.textContent = `
                     @media (max-width: 430px) {
-                        :root { --player-bar-height-mobile: 68px !important; }
+                        :root { --player-bar-height-mobile: 64px !important; }
                         html { background: #000; }
                         body { overscroll-behavior-y: none; }
-                        .main-content { padding: 0 16px calc(92px + env(safe-area-inset-bottom)) !important; }
+                        .main-content { padding: 0 16px calc(148px + env(safe-area-inset-bottom)) !important; }
                         .main-header {
                             position: sticky !important;
                             top: 0 !important;
@@ -83,19 +83,57 @@ final class NativeBridgeViewController: CAPBridgeViewController {
                             grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
                             gap: 16px 12px !important;
                         }
+                        .settings-tabs {
+                            display: flex !important;
+                            flex-wrap: nowrap !important;
+                            gap: .25rem !important;
+                            max-width: 100% !important;
+                            margin: 0 0 var(--spacing-lg) !important;
+                            padding: 0 .2rem !important;
+                            overflow-x: auto !important;
+                            overflow-y: hidden !important;
+                            border: 0 !important;
+                            border-bottom: 1px solid var(--border) !important;
+                            border-radius: 0 !important;
+                            background: transparent !important;
+                            -webkit-overflow-scrolling: touch;
+                            scrollbar-width: none;
+                        }
+                        .settings-tabs::-webkit-scrollbar { display: none; }
+                        .settings-tab {
+                            flex: 0 0 auto !important;
+                            min-width: max-content !important;
+                            min-height: 38px !important;
+                            padding: .5rem .55rem !important;
+                            border: 0 !important;
+                            border-bottom: 2px solid transparent !important;
+                            border-radius: 0 !important;
+                            white-space: nowrap !important;
+                            font-size: .8rem !important;
+                        }
+                        .settings-tab.active {
+                            border-bottom-color: var(--highlight) !important;
+                            color: var(--foreground) !important;
+                            background: transparent !important;
+                            box-shadow: none !important;
+                        }
                         .now-playing-bar {
                             width: calc(100% - 16px) !important;
                             left: 8px !important;
-                            bottom: calc(8px + env(safe-area-inset-bottom)) !important;
-                            height: 68px !important;
+                            bottom: calc(58px + env(safe-area-inset-bottom)) !important;
+                            height: 64px !important;
                             grid-template: 'track controls' 1fr / minmax(0, 1fr) auto !important;
-                            gap: 8px !important;
-                            padding: 9px 8px !important;
-                            border-radius: 15px !important;
+                            gap: 6px !important;
+                            padding: 7px 10px !important;
+                            border-radius: 14px !important;
                             background-color: color-mix(in srgb, var(--card) 94%, transparent) !important;
                             box-shadow: 0 8px 30px rgb(0 0 0 / 38%) !important;
                         }
-                        .now-playing-bar .track-info { grid-area: track !important; }
+                        .now-playing-bar .track-info {
+                            grid-area: track !important;
+                            gap: 10px !important;
+                            overflow: hidden !important;
+                        }
                         .now-playing-bar .track-info .cover {
                             width: 48px !important;
                             height: 48px !important;
@@ -116,16 +154,33 @@ final class NativeBridgeViewController: CAPBridgeViewController {
                             width: auto !important;
                             padding: 0 !important;
                         }
-                        .now-playing-bar .player-controls .buttons { gap: 2px !important; padding: 0 !important; }
+                        .now-playing-bar .player-controls .buttons { gap: 0 !important; padding: 0 !important; }
                         .now-playing-bar .player-controls .buttons button {
-                            width: 40px !important;
-                            height: 48px !important;
-                            min-width: 40px !important;
-                            min-height: 48px !important;
+                            width: 36px !important;
+                            height: 40px !important;
+                            min-width: 36px !important;
+                            min-height: 40px !important;
                         }
                         .now-playing-bar .player-controls .buttons .play-pause-btn {
-                            width: 44px !important;
-                            height: 48px !important;
+                            width: 40px !important;
+                            height: 40px !important;
+                            min-width: 40px !important;
+                            min-height: 40px !important;
+                        }
+                        .now-playing-bar .play-pause-btn:empty::before {
+                            content: '';
+                            width: 0;
+                            height: 0;
+                            margin-left: 2px;
+                            border-top: 6px solid transparent;
+                            border-bottom: 6px solid transparent;
+                            border-left: 9px solid currentcolor;
+                        }
+                        #download-notifications {
+                            right: 10px !important;
+                            bottom: calc(env(safe-area-inset-bottom) + 142px) !important;
+                            left: 10px !important;
+                            max-width: none !important;
                         }
                     }
                 `;
