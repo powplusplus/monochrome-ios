@@ -28,9 +28,9 @@ private struct ModernRootShell: View {
         }
         .tabBarMinimizeBehavior(.onScrollDown)
         .tabViewBottomAccessory(isEnabled: playback.currentTrack != nil) {
-            MiniPlayer(showPlayer: $showPlayer).padding(.horizontal, 8)
+            MiniPlayer(showPlayer: $showPlayer, usesSystemBackground: true)
         }
-        .sheet(isPresented: $showPlayer) { NowPlayingView() }
+        .fullScreenCover(isPresented: $showPlayer) { NowPlayingView() }
     }
 }
 
@@ -54,7 +54,7 @@ private struct CompatibleRootShell: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
-        .sheet(isPresented: $showPlayer) { NowPlayingView() }
+        .fullScreenCover(isPresented: $showPlayer) { NowPlayingView() }
     }
 }
 
@@ -445,6 +445,7 @@ struct TrackRow: View {
 
 struct MiniPlayer: View {
     @Binding var showPlayer: Bool
+    var usesSystemBackground = false
     @EnvironmentObject private var playback: PlaybackEngine
     var body: some View {
         HStack(spacing: 8) {
@@ -455,7 +456,7 @@ struct MiniPlayer: View {
                         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                     VStack(alignment: .leading, spacing: 2) {
                         Text(playback.currentTrack?.title ?? "").lineLimit(1).font(.subheadline.weight(.semibold))
-                        Text(playback.currentTrack?.artist.name ?? "").lineLimit(1).font(.caption).foregroundColor(.white.opacity(0.55))
+                        Text(playback.currentTrack?.artist.name ?? "").lineLimit(1).font(.caption).foregroundColor(.secondary)
                     }
                     Spacer(minLength: 0)
                 }.contentShape(Rectangle())
@@ -464,13 +465,28 @@ struct MiniPlayer: View {
             else { Button { playback.playPause() } label: { Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill").font(.title3).frame(width: 38, height: 38) }.buttonStyle(.plain).accessibilityLabel(playback.isPlaying ? "Pause" : "Play") }
             Button { playback.next() } label: { Image(systemName: "forward.fill").frame(width: 34, height: 38) }.buttonStyle(.plain).accessibilityLabel("Next track")
         }
-        .foregroundColor(.white)
+        .foregroundStyle(.primary)
         .padding(7)
-        .liquidGlass(cornerRadius: 22, strong: true)
+        .modifier(MiniPlayerBackground(usesSystemBackground: usesSystemBackground))
+    }
+}
+
+private struct MiniPlayerBackground: ViewModifier {
+    let usesSystemBackground: Bool
+
+    @ViewBuilder func body(content: Content) -> some View {
+        if usesSystemBackground {
+            // tabViewBottomAccessory already supplies system glass. A nested
+            // glassEffect is what creates the dark diagonal shading.
+            content
+        } else {
+            content.liquidGlass(cornerRadius: 22, strong: true)
+        }
     }
 }
 
 struct NowPlayingView: View {
+    @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var playback: PlaybackEngine
     @EnvironmentObject private var library: LibraryRepository
     @State private var showQueue = false
@@ -480,21 +496,47 @@ struct NowPlayingView: View {
                 Color.black.ignoresSafeArea()
                 ArtworkView(url: playback.currentTrack?.artworkURL)
                     .scaledToFill()
-                    .blur(radius: 76)
-                    .saturation(1.35)
-                    .opacity(0.42)
-                    .scaleEffect(1.22)
+                    .blur(radius: 90)
+                    .saturation(1.1)
+                    .opacity(0.24)
+                    .scaleEffect(1.3)
                     .ignoresSafeArea()
-                LinearGradient(colors: [.black.opacity(0.04), .black.opacity(0.48)], startPoint: .top, endPoint: .bottom).ignoresSafeArea()
+                LinearGradient(colors: [.black.opacity(0.18), .black.opacity(0.72)], startPoint: .top, endPoint: .bottom).ignoresSafeArea()
                 if geometry.size.width > geometry.size.height {
-                    HStack(spacing: 42) { artwork.frame(maxWidth: 360); controls.liquidGlass(cornerRadius: 30, strong: true).frame(maxWidth: 460) }.padding(.horizontal, max(28, geometry.safeAreaInsets.leading + 12)).padding(.vertical, 20)
+                    HStack(spacing: 42) { artwork.frame(maxWidth: 360); controls.frame(maxWidth: 460) }.padding(.horizontal, max(28, geometry.safeAreaInsets.leading + 12)).padding(.vertical, 20)
                 } else {
-                    VStack(spacing: 0) { Capsule().fill(Color.white.opacity(0.42)).frame(width: 38, height: 5).padding(.top, 10); artwork.frame(width: min(geometry.size.width - 64, 390), height: min(geometry.size.width - 64, 390)).padding(.top, 28); Spacer(minLength: 20); controls.liquidGlass(cornerRadius: 30, strong: true).padding(.horizontal, 14).padding(.bottom, max(14, geometry.safeAreaInsets.bottom)) }
+                    VStack(spacing: 0) {
+                        HStack {
+                            Button { dismiss() } label: {
+                                Image(systemName: "chevron.down")
+                                    .font(.headline)
+                                    .frame(width: 40, height: 40)
+                                    .background(.thinMaterial, in: Circle())
+                            }
+                            .accessibilityLabel("Close player")
+                            Spacer()
+                            Text("NOW PLAYING")
+                                .font(.caption2.weight(.semibold))
+                                .tracking(1.2)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Color.clear.frame(width: 40, height: 40)
+                        }
+                        .padding(.horizontal, 18)
+                        .padding(.top, 8)
+                        artwork
+                            .frame(width: min(geometry.size.width - 56, 390), height: min(geometry.size.width - 56, 390))
+                            .padding(.top, 24)
+                        Spacer(minLength: 26)
+                        controls
+                            .padding(.horizontal, 28)
+                            .padding(.bottom, max(18, geometry.safeAreaInsets.bottom))
+                    }
                 }
             }
         }.preferredColorScheme(.dark).sheet(isPresented: $showQueue) { QueueView() }
     }
-    private var artwork: some View { ArtworkView(url: playback.currentTrack?.artworkURL).aspectRatio(1, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous)).overlay(RoundedRectangle(cornerRadius: 28).stroke(Color.white.opacity(0.14), lineWidth: 0.8)).shadow(color: .black.opacity(0.46), radius: 34, y: 18) }
+    private var artwork: some View { ArtworkView(url: playback.currentTrack?.artworkURL).aspectRatio(1, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous)).overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.10), lineWidth: 0.5)).shadow(color: .black.opacity(0.42), radius: 28, y: 16) }
     private var controls: some View {
         VStack(spacing: 20) {
             HStack { VStack(alignment: .leading, spacing: 4) { Text(playback.currentTrack?.title ?? "Not Playing").font(.title3.bold()).lineLimit(1); Text(playback.currentTrack?.artist.name ?? "").foregroundColor(.secondary).lineLimit(1) }; Spacer(); Button { if let track = playback.currentTrack { library.toggleFavorite(track) } } label: { Image(systemName: playback.currentTrack.map(library.isFavorite) == true ? "heart.fill" : "heart").font(.title2).foregroundColor(.pink) } }

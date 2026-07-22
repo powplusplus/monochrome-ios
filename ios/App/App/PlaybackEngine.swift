@@ -23,6 +23,7 @@ final class PlaybackEngine: ObservableObject {
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
     private var loadTask: Task<Void, Never>?
+    private var itemStatusObservation: NSKeyValueObservation?
 
     var currentTrack: Track? {
         guard let currentIndex, queue.indices.contains(currentIndex) else { return nil }
@@ -131,8 +132,26 @@ final class PlaybackEngine: ObservableObject {
                 guard !Task.isCancelled else { return }
                 let item = AVPlayerItem(url: stream.url)
                 item.audioTimePitchAlgorithm = .timeDomain
+                itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+                    Task { @MainActor in
+                        guard let self, self.player.currentItem === item else { return }
+                        switch item.status {
+                        case .readyToPlay:
+                            self.isLoading = false
+                        case .failed:
+                            self.player.pause()
+                            self.isLoading = false
+                            self.isPlaying = false
+                            self.errorMessage = item.error?.localizedDescription ?? "This song could not be played."
+                        case .unknown:
+                            break
+                        @unknown default:
+                            break
+                        }
+                    }
+                }
                 player.removeAllItems(); player.insert(item, after: nil)
-                elapsed = 0; duration = track.duration; isLoading = false
+                elapsed = 0; duration = track.duration
                 if autoplay { resume() }
                 LibraryRepository.shared.recordPlayback(track)
                 ScrobblingCoordinator.shared.nowPlaying(track)

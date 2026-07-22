@@ -75,9 +75,12 @@ final class MusicService {
         return ModelMapper.array(object, keys: ["tracks", "items"]).compactMap(ModelMapper.track)
     }
 
-    func resolveStream(for track: Track, quality: String = "LOSSLESS") async throws -> StreamResponse {
+    func resolveStream(for track: Track, quality: String = "HIGH") async throws -> StreamResponse {
         if let url = track.streamURL { return StreamResponse(url: url, provider: track.provider, quality: quality, replayGain: nil, peak: nil) }
-        let formats = quality == "HI_RES_LOSSLESS" ? ["FLAC", "MQA", "AACLC"] : ["FLAC", "AACLC"]
+        // AVFoundation does not reliably play TIDAL's fragmented-MP4 FLAC
+        // representation when it is exposed through a local HLS wrapper. Ask
+        // for AAC-LC explicitly; this is iOS's native hardware-decoded path.
+        let formats = ["AACLC"]
         var query = "id=\(track.playbackID.urlQueryEncoded)&quality=\(quality)&adaptive=false"
         formats.forEach { query += "&formats=\($0)" }
         let object = try await json(path: "/trackManifests/?\(query)", streaming: true, cacheable: false)
@@ -208,10 +211,12 @@ final class MusicService {
         let initURL = xmlDecoded(initialization)
         let mediaTemplate = xmlDecoded(media)
         let targetDuration = Int(ceil(durations.max() ?? 6))
-        var playlist = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:\(targetDuration)\n#EXT-X-MEDIA-SEQUENCE:\(startNumber)\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"\(initURL)\"\n"
+        let resolvedInitURL = URL(string: initURL, relativeTo: manifestURL)?.absoluteURL.absoluteString ?? initURL
+        var playlist = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:\(targetDuration)\n#EXT-X-MEDIA-SEQUENCE:\(startNumber)\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"\(resolvedInitURL)\"\n"
         for (offset, duration) in durations.enumerated() {
             playlist += String(format: "#EXTINF:%.6f,\n", duration)
-            playlist += mediaTemplate.replacingOccurrences(of: "$Number$", with: String(startNumber + offset)) + "\n"
+            let segment = mediaTemplate.replacingOccurrences(of: "$Number$", with: String(startNumber + offset))
+            playlist += (URL(string: segment, relativeTo: manifestURL)?.absoluteURL.absoluteString ?? segment) + "\n"
         }
         playlist += "#EXT-X-ENDLIST\n"
         let target = FileManager.default.temporaryDirectory.appendingPathComponent("monochrome-\(UUID().uuidString).m3u8")
