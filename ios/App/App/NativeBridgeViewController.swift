@@ -7,8 +7,7 @@ import WebKit
 final class NativeBridgeViewController: CAPBridgeViewController {
     override func webView(with frame: CGRect, configuration: WKWebViewConfiguration) -> WKWebView {
         configuration.limitsNavigationsToAppBoundDomains = true
-        let bundledStylesheet = Self.loadBundledStylesheet()
-        let bundledStylesheetLiteral = Self.javascriptStringLiteral(bundledStylesheet)
+        configuration.applicationNameForUserAgent = "Version/18.0 Mobile/15E148 Safari/604.1"
         let source = #"""
         (() => {
             const nativeAmazonWorkerPath = '/sw-amazon.js';
@@ -49,7 +48,7 @@ final class NativeBridgeViewController: CAPBridgeViewController {
                 if (document.getElementById('monochrome-native-ios-style')) return;
                 const style = document.createElement('style');
                 style.id = 'monochrome-native-ios-style';
-                style.textContent = \#(bundledStylesheetLiteral) + `
+                style.textContent = `
                     @media (max-width: 430px) {
                         :root { --player-bar-height-mobile: 68px !important; }
                         html { background: #000; }
@@ -212,28 +211,4 @@ final class NativeBridgeViewController: CAPBridgeViewController {
         return super.webView(with: frame, configuration: configuration)
     }
 
-    private static func loadBundledStylesheet() -> String {
-        guard let assetsURL = Bundle.main.resourceURL?
-            .appendingPathComponent("public", isDirectory: true)
-            .appendingPathComponent("assets", isDirectory: true),
-              let files = try? FileManager.default.contentsOfDirectory(
-                  at: assetsURL,
-                  includingPropertiesForKeys: nil
-              ),
-              let stylesheetURL = files.first(where: {
-                  $0.pathExtension == "css" && $0.lastPathComponent.hasPrefix("index-")
-              }),
-              let stylesheet = try? String(contentsOf: stylesheetURL, encoding: .utf8) else {
-            return ""
-        }
-        return stylesheet
-    }
-
-    private static func javascriptStringLiteral(_ value: String) -> String {
-        guard let data = try? JSONEncoder().encode(value),
-              let literal = String(data: data, encoding: .utf8) else {
-            return "\"\""
-        }
-        return literal
-    }
 }
