@@ -4,6 +4,9 @@ const config: CapacitorConfig = {
     appId: 'tf.monochrome.music',
     appName: 'Monochrome Music',
     webDir: 'dist',
+    ios: {
+        limitsNavigationsToAppBoundDomains: true,
+    },
     server: {
         url: 'https://monochrome.tf',
         allowNavigation: [

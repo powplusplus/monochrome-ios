@@ -378,12 +378,22 @@ function hideOfflineNotification() {
     }
 }
 
-async function disablePwaForAuthGate() {
+async function disablePwaForAuthGate({ preserveWorkerPath = null } = {}) {
     if (!('serviceWorker' in navigator)) return;
 
     try {
         const registrations = await navigator.serviceWorker.getRegistrations();
-        await Promise.all(registrations.map((registration) => registration.unregister()));
+        await Promise.all(
+            registrations.map((registration) => {
+                const worker = registration.active || registration.waiting || registration.installing;
+                if (preserveWorkerPath && worker?.scriptURL) {
+                    try {
+                        if (new URL(worker.scriptURL).pathname === preserveWorkerPath) return Promise.resolve(false);
+                    } catch {}
+                }
+                return registration.unregister();
+            })
+        );
     } catch (error) {
         console.warn('Failed to unregister service workers:', error);
     }
@@ -408,13 +418,15 @@ async function clearDevPwaRuntimeCaches() {
     }
 }
 
-function getAmazonDecrypterServiceWorkerUrl() {
+function getAmazonDecrypterServiceWorkerUrl({ dedicated = false } = {}) {
+    if (dedicated) return `/sw-amazon.js?amazon-sw=${AMAZON_DECRYPTER_SW_VERSION}`;
+
     const baseUrl =
         import.meta.env.DEV && isSafari ? '/sw-amazon.js' : import.meta.env.DEV ? '/dev-dist/sw.js' : '/sw.js';
     return `${baseUrl}?amazon-sw=${AMAZON_DECRYPTER_SW_VERSION}`;
 }
 
-async function registerAmazonDecrypterServiceWorkerFallback() {
+async function registerAmazonDecrypterServiceWorkerFallback({ dedicated = false } = {}) {
     const diagnostic = {
         origin: window.location.origin,
         protocol: window.location.protocol,
@@ -437,7 +449,7 @@ async function registerAmazonDecrypterServiceWorkerFallback() {
         return null;
     }
 
-    const swUrl = getAmazonDecrypterServiceWorkerUrl();
+    const swUrl = getAmazonDecrypterServiceWorkerUrl({ dedicated });
 
     try {
         const registration = await navigator.serviceWorker.register(swUrl, {
@@ -2728,8 +2740,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch {}
 
     if (isNativeApp) {
-        console.log('[Amazon SW Decrypter] PWA disabled for native app shell');
-        await disablePwaForAuthGate().catch(console.error);
+        console.log('[Amazon SW Decrypter] Using dedicated worker for native app shell');
+        await disablePwaForAuthGate({ preserveWorkerPath: '/sw-amazon.js' }).catch(console.error);
+        await registerAmazonDecrypterServiceWorkerFallback({ dedicated: true });
     } else if (window.__AUTH_GATE__) {
         console.log('[Amazon SW Decrypter] PWA disabled for auth gate');
         await disablePwaForAuthGate().catch(console.error);

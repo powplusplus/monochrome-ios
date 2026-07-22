@@ -6,10 +6,57 @@ import WebKit
 /// before the web application starts executing.
 final class NativeBridgeViewController: CAPBridgeViewController {
     override func webView(with frame: CGRect, configuration: WKWebViewConfiguration) -> WKWebView {
+        configuration.limitsNavigationsToAppBoundDomains = true
         let bundledStylesheet = Self.loadBundledStylesheet()
         let bundledStylesheetLiteral = Self.javascriptStringLiteral(bundledStylesheet)
         let source = #"""
         (() => {
+            const nativeAmazonWorkerPath = '/sw-amazon.js';
+            const nativeAmazonWorkerVersion = '2026-06-23-flac-hls-v8';
+            const serviceWorkers = navigator.serviceWorker;
+
+            if (serviceWorkers && window.isSecureContext) {
+                const getRegistrations = serviceWorkers.getRegistrations.bind(serviceWorkers);
+
+                // The web app removes root-scope PWA registrations in a native shell.
+                // Keep that cleanup from racing the decryption-only replacement below.
+                serviceWorkers.getRegistrations = async () => {
+                    const registrations = await getRegistrations();
+                    const rootScope = new URL('/', window.location.origin).href;
+                    return registrations.filter((registration) => registration.scope !== rootScope);
+                };
+
+                window.__MONOCHROME_NATIVE_AMAZON_SW__ = (async () => {
+                    try {
+                        const registrations = await getRegistrations();
+                        await Promise.all(registrations.map((registration) => {
+                            const worker = registration.active || registration.waiting || registration.installing;
+                            if (worker?.scriptURL) {
+                                try {
+                                    if (new URL(worker.scriptURL).pathname === nativeAmazonWorkerPath) return false;
+                                } catch {}
+                            }
+                            return registration.unregister();
+                        }));
+
+                        const workerURL = `${nativeAmazonWorkerPath}?amazon-sw=${nativeAmazonWorkerVersion}`;
+                        const registration = await serviceWorkers.register(workerURL, {
+                            scope: '/',
+                            updateViaCache: 'none'
+                        });
+                        await registration.update().catch(() => {});
+                        console.log('[Amazon SW Decrypter] Native worker ready', {
+                            scope: registration.scope,
+                            controlled: !!serviceWorkers.controller
+                        });
+                        return registration;
+                    } catch (error) {
+                        console.warn('[Amazon SW Decrypter] Native worker registration failed', error);
+                        return null;
+                    }
+                })();
+            }
+
             const originalArrayFrom = Array.from;
             let bypassedPlayerImageGate = false;
             Array.from = function(value, ...argumentsList) {
@@ -25,7 +72,7 @@ final class NativeBridgeViewController: CAPBridgeViewController {
                 if (document.getElementById('monochrome-native-ios-style')) return;
                 const style = document.createElement('style');
                 style.id = 'monochrome-native-ios-style';
-                style.textContent = #(bundledStylesheetLiteral) + `
+                style.textContent = \#(bundledStylesheetLiteral) + `
                     @media (max-width: 430px) {
                         :root { --player-bar-height-mobile: 68px !important; }
                         html { background: #000; }
