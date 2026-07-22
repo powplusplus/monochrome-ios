@@ -22,8 +22,8 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+      - name: Display active Xcode
+        run: xcodebuild -version
 
       - name: Create iPhone 12 simulator
         id: simulator
