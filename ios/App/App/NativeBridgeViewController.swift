@@ -109,40 +109,76 @@ final class NativeBridgeViewController: CAPBridgeViewController {
                 (document.head || document.documentElement).appendChild(style);
             };
 
+            const applyAppleMusicTheme = () => {
+                localStorage.setItem('monochrome-theme', 'apple-music');
+                document.documentElement.setAttribute('data-theme', 'apple-music');
+                document.querySelectorAll('#theme-picker .theme-option').forEach((item) => {
+                    item.classList.toggle('active', item.dataset.theme === 'apple-music');
+                });
+                document.getElementById('custom-theme-editor')?.classList.remove('show');
+                window.dispatchEvent(new CustomEvent('theme-changed', { detail: { theme: 'apple-music' } }));
+            };
+
             const installAppleMusicOption = () => {
                 const picker = document.getElementById('theme-picker');
-                if (!picker || picker.querySelector('[data-theme="apple-music"]')) return;
+                if (!picker) return;
 
-                const option = document.createElement('div');
-                option.className = 'theme-option';
-                option.dataset.theme = 'apple-music';
-                option.textContent = 'Apple Music';
+                let option = picker.querySelector('[data-theme="apple-music"]');
+                if (!option) {
+                    option = document.createElement('div');
+                    option.className = 'theme-option apple-music-theme-option';
+                    option.dataset.theme = 'apple-music';
+                    option.setAttribute('role', 'button');
+                    option.setAttribute('tabindex', '0');
+                    option.textContent = 'Apple Music';
 
-                const darkOption = picker.querySelector('[data-theme="dark"]');
-                if (darkOption) darkOption.insertAdjacentElement('afterend', option);
-                else picker.appendChild(option);
-
-                if (localStorage.getItem('monochrome-theme') === 'apple-music') {
-                    picker.querySelectorAll('.theme-option').forEach((item) => item.classList.remove('active'));
-                    option.classList.add('active');
-                    document.documentElement.setAttribute('data-theme', 'apple-music');
+                    const systemOption = picker.querySelector('[data-theme="system"]');
+                    if (systemOption) systemOption.insertAdjacentElement('afterend', option);
+                    else picker.prepend(option);
                 }
 
-                option.addEventListener('click', () => {
-                    picker.querySelectorAll('.theme-option').forEach((item) => item.classList.remove('active'));
-                    option.classList.add('active');
-                    document.getElementById('custom-theme-editor')?.classList.remove('show');
-                    localStorage.setItem('monochrome-theme', 'apple-music');
+                if (option.dataset.nativeAppleMusicBound !== 'true') {
+                    option.dataset.nativeAppleMusicBound = 'true';
+                    option.addEventListener('click', applyAppleMusicTheme);
+                    option.addEventListener('keydown', (event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                            event.preventDefault();
+                            applyAppleMusicTheme();
+                        }
+                    });
+                }
+
+                if (localStorage.getItem('monochrome-theme') === 'apple-music') {
                     document.documentElement.setAttribute('data-theme', 'apple-music');
-                    window.dispatchEvent(new CustomEvent('theme-changed', { detail: { theme: 'apple-music' } }));
-                });
+                    picker.querySelectorAll('.theme-option').forEach((item) => {
+                        item.classList.toggle('active', item === option);
+                    });
+                }
             };
 
             installNativeStyle();
-            document.addEventListener('DOMContentLoaded', () => {
+            const syncNativeUI = () => {
                 installNativeStyle();
                 installAppleMusicOption();
-            }, { once: true });
+            };
+
+            let syncQueued = false;
+            const queueNativeUISync = () => {
+                if (syncQueued) return;
+                syncQueued = true;
+                requestAnimationFrame(() => {
+                    syncQueued = false;
+                    syncNativeUI();
+                });
+            };
+
+            document.addEventListener('DOMContentLoaded', syncNativeUI);
+            window.addEventListener('popstate', queueNativeUISync);
+            window.addEventListener('hashchange', queueNativeUISync);
+            new MutationObserver(queueNativeUISync).observe(document.documentElement, {
+                childList: true,
+                subtree: true
+            });
         })();
         """#
 
