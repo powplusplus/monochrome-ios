@@ -1,21 +1,20 @@
-name: Build iOS IPA
+name: Build native iOS IPA
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: ios-ipa-${{ github.ref }}
+  group: native-ios-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build unsigned IPA
+  test-and-build:
+    name: Test native app and package IPA
     runs-on: macos-15
     timeout-minutes: 45
 
@@ -23,21 +22,31 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
 
-      - name: Install dependencies
-        run: npm install --no-audit --no-fund
+      - name: Create iPhone 12 simulator
+        id: simulator
+        run: |
+          set -euo pipefail
+          runtime="$(xcrun simctl list runtimes -j | jq -r '.runtimes[] | select(.isAvailable == true and (.identifier | contains("iOS"))) | .identifier' | tail -1)"
+          udid="$(xcrun simctl create 'Monochrome iPhone 12' com.apple.CoreSimulator.SimDeviceType.iPhone-12 "$runtime")"
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b
 
-      - name: Build web assets
-        run: npm run build
+      - name: Run simulator tests first
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -project ios/App/App.xcodeproj \
+            -scheme App \
+            -configuration Debug \
+            -destination 'platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}' \
+            -derivedDataPath build/DerivedData-Simulator \
+            CODE_SIGNING_ALLOWED=NO
 
-      - name: Sync Capacitor iOS project
-        run: npx cap sync ios
-
-      - name: Build iPhone application
+      - name: Build arm64 iPhone application
         run: |
           set -euo pipefail
           xcodebuild \
@@ -45,26 +54,34 @@ jobs:
             -scheme App \
             -configuration Release \
             -sdk iphoneos \
-            -derivedDataPath build/DerivedData \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData-Device \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_IDENTITY='' \
             build
 
-      - name: Package IPA
+      - name: Package unsigned IPA and metadata
         run: |
           set -euo pipefail
-          app_path="build/DerivedData/Build/Products/Release-iphoneos/App.app"
+          app_path='build/DerivedData-Device/Build/Products/Release-iphoneos/App.app'
           test -d "$app_path"
           mkdir -p build/Payload
           cp -R "$app_path" build/Payload/Monochrome.app
+          ditto -c -k --sequesterRsrc --keepParent build/Payload build/Monochrome-native-unsigned.ipa
           cd build
-          ditto -c -k --sequesterRsrc --keepParent Payload Monochrome-iOS-12.ipa
+          shasum -a 256 Monochrome-native-unsigned.ipa > Monochrome-native-unsigned.ipa.sha256
+          printf 'commit=%s\nminimum_ios=15.0\narchitecture=arm64\nnative_root=SwiftUI\n' "$GITHUB_SHA" > build-metadata.txt
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Monochrome-iOS-12-unsigned
-          path: build/Monochrome-iOS-12.ipa
+          name: Monochrome-native-${{ github.sha }}
+          path: |
+            build/Monochrome-native-unsigned.ipa
+            build/Monochrome-native-unsigned.ipa.sha256
+            build/build-metadata.txt
           if-no-files-found: error
           retention-days: 30

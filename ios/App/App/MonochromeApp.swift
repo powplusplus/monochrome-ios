@@ -1,0 +1,24 @@
+import SwiftUI
+
+@main
+struct MonochromeApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @StateObject private var playback = PlaybackEngine.shared
+    @StateObject private var library = LibraryRepository.shared
+    @StateObject private var auth = AuthSession.shared
+    @StateObject private var downloads = DownloadManager.shared
+    @StateObject private var parties = PartyService.shared
+
+    var body: some Scene {
+        WindowGroup {
+            RootView()
+                .environmentObject(playback)
+                .environmentObject(library)
+                .environmentObject(auth)
+                .environmentObject(downloads)
+                .environmentObject(parties)
+                .onOpenURL { auth.handle($0) }
+                .task { library.migrateLegacyIfNeeded() }
+        }
+    }
+}
