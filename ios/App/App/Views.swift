@@ -3,28 +3,144 @@ import AVKit
 
 struct RootView: View {
     @EnvironmentObject private var playback: PlaybackEngine
-    @State private var selection = 0
+    @State private var selection: AppTab = .home
     @State private var showPlayer = false
 
     var body: some View {
         GeometryReader { geometry in
             ZStack(alignment: .bottom) {
-                TabView(selection: $selection) {
-                    HomeView().tabItem { Label("Home", systemImage: "house.fill") }.tag(0)
-                    LibraryView().tabItem { Label("Library", systemImage: "music.note.list") }.tag(1)
-                    SearchView().tabItem { Label("Search", systemImage: "magnifyingglass") }.tag(2)
-                    SettingsView().tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(3)
-                }.accentColor(.pink)
-                if playback.currentTrack != nil {
-                    MiniPlayer(showPlayer: $showPlayer)
-                        .padding(.horizontal, 8)
-                        .padding(.bottom, geometry.safeAreaInsets.bottom + (geometry.size.width > geometry.size.height ? 36 : 50))
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                MonochromeBackground()
+
+                Group {
+                    switch selection {
+                    case .home: HomeView()
+                    case .library: LibraryView()
+                    case .search: SearchView()
+                    case .settings: SettingsView()
+                    }
                 }
-            }.ignoresSafeArea(.keyboard, edges: .bottom)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .safeAreaInset(edge: .bottom) {
+                    Color.clear.frame(height: playback.currentTrack == nil ? 70 : 128)
+                }
+
+                VStack(spacing: 8) {
+                    Spacer()
+                    if playback.currentTrack != nil {
+                        MiniPlayer(showPlayer: $showPlayer)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                    LiquidTabBar(selection: $selection)
+                }
+                .padding(.horizontal, geometry.size.width > geometry.size.height ? 28 : 12)
+                .padding(.bottom, max(8, geometry.safeAreaInsets.bottom))
+            }
+            .ignoresSafeArea(.keyboard, edges: .bottom)
         }
         .sheet(isPresented: $showPlayer) { NowPlayingView() }
         .animation(.easeOut(duration: 0.22), value: playback.currentTrack?.id)
+    }
+}
+
+enum AppTab: String, CaseIterable, Identifiable {
+    case home, library, search, settings
+
+    var id: String { rawValue }
+    var title: String { rawValue.capitalized }
+    var symbol: String {
+        switch self {
+        case .home: return "house.fill"
+        case .library: return "music.note.list"
+        case .search: return "magnifyingglass"
+        case .settings: return "gearshape.fill"
+        }
+    }
+}
+
+struct MonochromeBackground: View {
+    var body: some View {
+        ZStack {
+            Color.black
+            RadialGradient(
+                colors: [Color.white.opacity(0.10), Color.clear],
+                center: UnitPoint(x: 0.5, y: -0.1),
+                startRadius: 0,
+                endRadius: 430
+            )
+        }
+        .ignoresSafeArea()
+    }
+}
+
+struct LiquidGlassShape: ViewModifier {
+    var cornerRadius: CGFloat = 24
+    var strong = false
+
+    func body(content: Content) -> some View {
+        content
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .background(
+                LinearGradient(
+                    colors: [Color.white.opacity(strong ? 0.16 : 0.10), Color.white.opacity(0.025)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(
+                        LinearGradient(
+                            colors: [Color.white.opacity(0.30), Color.white.opacity(0.07), Color.white.opacity(0.15)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 0.8
+                    )
+            )
+            .shadow(color: .black.opacity(strong ? 0.42 : 0.26), radius: strong ? 24 : 14, y: 9)
+    }
+}
+
+extension View {
+    func liquidGlass(cornerRadius: CGFloat = 24, strong: Bool = false) -> some View {
+        modifier(LiquidGlassShape(cornerRadius: cornerRadius, strong: strong))
+    }
+}
+
+struct LiquidTabBar: View {
+    @Binding var selection: AppTab
+    @Namespace private var selectionAnimation
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(AppTab.allCases) { tab in
+                Button {
+                    withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) { selection = tab }
+                } label: {
+                    VStack(spacing: 2) {
+                        Image(systemName: tab.symbol).font(.system(size: 18, weight: .semibold))
+                        Text(tab.title).font(.system(size: 10, weight: .semibold, design: .rounded))
+                    }
+                    .foregroundColor(selection == tab ? .white : .white.opacity(0.53))
+                    .frame(maxWidth: .infinity, minHeight: 48)
+                    .background {
+                        if selection == tab {
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .fill(Color.white.opacity(0.13))
+                                .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.12)))
+                                .matchedGeometryEffect(id: "active-tab", in: selectionAnimation)
+                        }
+                    }
+                    .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(tab.title)
+                .accessibilityAddTraits(selection == tab ? .isSelected : [])
+            }
+        }
+        .padding(6)
+        .liquidGlass(cornerRadius: 25, strong: true)
     }
 }
 
@@ -241,16 +357,26 @@ struct MiniPlayer: View {
     @Binding var showPlayer: Bool
     @EnvironmentObject private var playback: PlaybackEngine
     var body: some View {
-        Button { showPlayer = true } label: {
-            HStack(spacing: 11) {
-                ArtworkView(url: playback.currentTrack?.artworkURL).frame(width: 48, height: 48).clipShape(RoundedRectangle(cornerRadius: 7))
-                VStack(alignment: .leading, spacing: 2) { Text(playback.currentTrack?.title ?? "").lineLimit(1).font(.subheadline.weight(.semibold)); Text(playback.currentTrack?.artist.name ?? "").lineLimit(1).font(.caption).foregroundColor(.secondary) }
-                Spacer()
-                if playback.isLoading { ProgressView().frame(width: 38, height: 38) }
-                else { Button { playback.playPause() } label: { Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill").font(.title3).frame(width: 38, height: 38) }.buttonStyle(.plain).accessibilityLabel(playback.isPlaying ? "Pause" : "Play") }
-                Button { playback.next() } label: { Image(systemName: "forward.fill").frame(width: 34, height: 38) }.buttonStyle(.plain).accessibilityLabel("Next track")
-            }.padding(7).background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous)).overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.12))).shadow(color: .black.opacity(0.18), radius: 8, y: 3)
-        }.buttonStyle(.plain)
+        HStack(spacing: 8) {
+            Button { showPlayer = true } label: {
+                HStack(spacing: 11) {
+                    ArtworkView(url: playback.currentTrack?.artworkURL)
+                        .frame(width: 48, height: 48)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(playback.currentTrack?.title ?? "").lineLimit(1).font(.subheadline.weight(.semibold))
+                        Text(playback.currentTrack?.artist.name ?? "").lineLimit(1).font(.caption).foregroundColor(.white.opacity(0.55))
+                    }
+                    Spacer(minLength: 0)
+                }.contentShape(Rectangle())
+            }.buttonStyle(.plain)
+            if playback.isLoading { ProgressView().tint(.white).frame(width: 38, height: 38) }
+            else { Button { playback.playPause() } label: { Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill").font(.title3).frame(width: 38, height: 38) }.buttonStyle(.plain).accessibilityLabel(playback.isPlaying ? "Pause" : "Play") }
+            Button { playback.next() } label: { Image(systemName: "forward.fill").frame(width: 34, height: 38) }.buttonStyle(.plain).accessibilityLabel("Next track")
+        }
+        .foregroundColor(.white)
+        .padding(7)
+        .liquidGlass(cornerRadius: 22, strong: true)
     }
 }
 
@@ -261,16 +387,24 @@ struct NowPlayingView: View {
     var body: some View {
         GeometryReader { geometry in
             ZStack {
-                ArtworkView(url: playback.currentTrack?.artworkURL).scaledToFill().blur(radius: 55).opacity(0.28).ignoresSafeArea()
+                Color.black.ignoresSafeArea()
+                ArtworkView(url: playback.currentTrack?.artworkURL)
+                    .scaledToFill()
+                    .blur(radius: 76)
+                    .saturation(1.35)
+                    .opacity(0.42)
+                    .scaleEffect(1.22)
+                    .ignoresSafeArea()
+                LinearGradient(colors: [.black.opacity(0.04), .black.opacity(0.48)], startPoint: .top, endPoint: .bottom).ignoresSafeArea()
                 if geometry.size.width > geometry.size.height {
-                    HStack(spacing: 42) { artwork.frame(maxWidth: 360); controls }.padding(.horizontal, max(28, geometry.safeAreaInsets.leading + 12)).padding(.vertical, 20)
+                    HStack(spacing: 42) { artwork.frame(maxWidth: 360); controls.liquidGlass(cornerRadius: 30, strong: true).frame(maxWidth: 460) }.padding(.horizontal, max(28, geometry.safeAreaInsets.leading + 12)).padding(.vertical, 20)
                 } else {
-                    VStack(spacing: 0) { Capsule().fill(Color.secondary.opacity(0.5)).frame(width: 38, height: 5).padding(.top, 10); artwork.padding(.horizontal, 36).padding(.top, 28); Spacer(minLength: 20); controls.padding(.horizontal, 28).padding(.bottom, max(18, geometry.safeAreaInsets.bottom)) }
+                    VStack(spacing: 0) { Capsule().fill(Color.white.opacity(0.42)).frame(width: 38, height: 5).padding(.top, 10); artwork.frame(width: min(geometry.size.width - 64, 390), height: min(geometry.size.width - 64, 390)).padding(.top, 28); Spacer(minLength: 20); controls.liquidGlass(cornerRadius: 30, strong: true).padding(.horizontal, 14).padding(.bottom, max(14, geometry.safeAreaInsets.bottom)) }
                 }
             }
-        }.sheet(isPresented: $showQueue) { QueueView() }
+        }.preferredColorScheme(.dark).sheet(isPresented: $showQueue) { QueueView() }
     }
-    private var artwork: some View { ArtworkView(url: playback.currentTrack?.artworkURL).aspectRatio(1, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous)).shadow(color: .black.opacity(0.38), radius: 28, y: 14) }
+    private var artwork: some View { ArtworkView(url: playback.currentTrack?.artworkURL).aspectRatio(1, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous)).overlay(RoundedRectangle(cornerRadius: 28).stroke(Color.white.opacity(0.14), lineWidth: 0.8)).shadow(color: .black.opacity(0.46), radius: 34, y: 18) }
     private var controls: some View {
         VStack(spacing: 20) {
             HStack { VStack(alignment: .leading, spacing: 4) { Text(playback.currentTrack?.title ?? "Not Playing").font(.title3.bold()).lineLimit(1); Text(playback.currentTrack?.artist.name ?? "").foregroundColor(.secondary).lineLimit(1) }; Spacer(); Button { if let track = playback.currentTrack { library.toggleFavorite(track) } } label: { Image(systemName: playback.currentTrack.map(library.isFavorite) == true ? "heart.fill" : "heart").font(.title2).foregroundColor(.pink) } }
