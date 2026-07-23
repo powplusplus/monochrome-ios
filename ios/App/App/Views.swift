@@ -1,5 +1,6 @@
 import SwiftUI
 import AVKit
+import UIKit
 
 struct RootView: View {
     var body: some View {
@@ -154,7 +155,7 @@ struct HomeView: View {
 
     var body: some View {
         NavigationView {
-            ScrollView {
+            ScrollView(showsIndicators: false) {
                 LazyVStack(alignment: .leading, spacing: 26) {
                     if !library.history.isEmpty { MediaSection(title: "Jump Back In") { HorizontalTrackShelf(tracks: Array(library.history.prefix(12))) } }
                     MediaSection(title: "Editor’s Picks") {
@@ -332,7 +333,7 @@ struct AlbumDetailView: View {
     init(albumID: String, initial: Album) { self.albumID = albumID; self.initial = initial; _album = State(initialValue: initial) }
     var body: some View {
         GeometryReader { geometry in
-            ScrollView {
+            ScrollView(showsIndicators: false) {
                 if geometry.size.width > geometry.size.height {
                     HStack(alignment: .top, spacing: 32) { AlbumHero(album: album).frame(width: min(geometry.size.width * 0.38, 320)); trackList }.padding()
                 } else { VStack(spacing: 22) { AlbumHero(album: album).padding(.horizontal, 36); trackList }.padding(.vertical) }
@@ -406,6 +407,7 @@ struct MiniPlayer: View {
                     ArtworkView(url: playback.currentTrack?.artworkURL)
                         .frame(width: 48, height: 48)
                         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .compositingGroup()
                     VStack(alignment: .leading, spacing: 2) {
                         Text(playback.currentTrack?.title ?? "").lineLimit(1).font(.subheadline.weight(.semibold))
                         Text(playback.currentTrack?.artist.name ?? "").lineLimit(1).font(.caption).foregroundColor(.secondary)
@@ -448,16 +450,22 @@ struct NowPlayingView: View {
             let landscape = geometry.size.width > geometry.size.height
             ZStack {
                 backdrop
+                    .frame(width: geometry.size.width, height: geometry.size.height)
+                    .clipped()
                 VStack(spacing: 0) {
                     header
+                        .padding(.top, geometry.safeAreaInsets.top)
                     if landscape {
                         landscapeLayout(in: geometry)
                     } else {
                         portraitLayout(in: geometry)
                     }
                 }
+                .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
             }
+            .frame(width: geometry.size.width, height: geometry.size.height)
         }
+        .ignoresSafeArea()
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showQueue) { QueueView() }
     }
@@ -465,20 +473,23 @@ struct NowPlayingView: View {
     private var backdrop: some View {
         ZStack {
             Color.black
-            ArtworkView(url: playback.currentTrack?.artworkURL)
-                .scaledToFill()
-                .blur(radius: 90)
-                .saturation(1.1)
-                .opacity(0.24)
-                .scaleEffect(1.3)
+            // Overlay keeps blurred art from expanding the ZStack (was shifting UI).
+            Color.clear
+                .overlay {
+                    ArtworkView(url: playback.currentTrack?.artworkURL)
+                        .scaledToFill()
+                        .blur(radius: 90)
+                        .saturation(1.1)
+                        .opacity(0.24)
+                        .scaleEffect(1.3)
+                }
+                .clipped()
             LinearGradient(
                 colors: [.black.opacity(0.18), .black.opacity(0.72)],
                 startPoint: .top,
                 endPoint: .bottom
             )
         }
-        .ignoresSafeArea()
-        .clipped()
     }
 
     private var header: some View {
@@ -500,14 +511,16 @@ struct NowPlayingView: View {
         }
         .padding(.horizontal, 18)
         .padding(.top, 8)
+        .padding(.bottom, 4)
     }
 
     private func portraitLayout(in geometry: GeometryProxy) -> some View {
         let sideInset: CGFloat = 28
         let availableWidth = max(0, geometry.size.width - (sideInset * 2))
-        let chromeHeight: CGFloat = 56 + geometry.safeAreaInsets.top
-        let controlsBudget: CGFloat = 300 + max(18, geometry.safeAreaInsets.bottom)
-        let availableHeight = max(0, geometry.size.height - chromeHeight)
+        let chromeHeight: CGFloat = 56
+        let bottomPad = max(18, geometry.safeAreaInsets.bottom)
+        let controlsBudget: CGFloat = 300 + bottomPad
+        let availableHeight = max(0, geometry.size.height - geometry.safeAreaInsets.top - chromeHeight)
         // Shrink art to keep transport visible without scrolling on short phones.
         let artSide = min(availableWidth, min(max(168, availableHeight - controlsBudget), 380))
         let needsScroll = artSide + controlsBudget + 40 > availableHeight
@@ -523,7 +536,7 @@ struct NowPlayingView: View {
                     }
                     .frame(maxWidth: 520)
                     .padding(.horizontal, sideInset)
-                    .padding(.bottom, max(18, geometry.safeAreaInsets.bottom))
+                    .padding(.bottom, bottomPad)
                     .frame(maxWidth: .infinity)
                 }
             } else {
@@ -534,7 +547,7 @@ struct NowPlayingView: View {
                     Spacer(minLength: 20)
                     controls
                         .padding(.horizontal, sideInset)
-                        .padding(.bottom, max(18, geometry.safeAreaInsets.bottom))
+                        .padding(.bottom, bottomPad)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -542,8 +555,9 @@ struct NowPlayingView: View {
     }
 
     private func landscapeLayout(in geometry: GeometryProxy) -> some View {
-        let horizontalPad = max(24, geometry.safeAreaInsets.leading + 12)
-        let usableHeight = max(160, geometry.size.height - 64 - geometry.safeAreaInsets.bottom)
+        let leadingPad = max(24, geometry.safeAreaInsets.leading + 12)
+        let trailingPad = max(24, geometry.safeAreaInsets.trailing + 12)
+        let usableHeight = max(160, geometry.size.height - geometry.safeAreaInsets.top - 64 - geometry.safeAreaInsets.bottom)
         let artSide = min(usableHeight, min(geometry.size.width * 0.38, 320))
 
         return HStack(alignment: .center, spacing: 24) {
@@ -556,8 +570,8 @@ struct NowPlayingView: View {
             }
             .frame(maxHeight: .infinity)
         }
-        .padding(.horizontal, horizontalPad)
-        .padding(.trailing, max(16, geometry.safeAreaInsets.trailing))
+        .padding(.leading, leadingPad)
+        .padding(.trailing, trailingPad)
         .padding(.bottom, max(8, geometry.safeAreaInsets.bottom))
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -763,8 +777,71 @@ struct AlbumListRow: View {
 
 struct ArtworkView: View {
     let url: URL?
-    var body: some View { AsyncImage(url: url) { phase in switch phase { case .success(let image): image.resizable().scaledToFill(); case .failure: placeholder; case .empty: ZStack { placeholder; ProgressView() }; @unknown default: placeholder } }.clipped() }
-    private var placeholder: some View { ZStack { LinearGradient(colors: [.gray.opacity(0.5), .black.opacity(0.65)], startPoint: .topLeading, endPoint: .bottomTrailing); Image(systemName: "music.note").font(.largeTitle).foregroundColor(.white.opacity(0.65)) } }
+    @State private var image: UIImage?
+    @State private var loadFailed = false
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else if loadFailed || url == nil {
+                placeholder
+            } else {
+                ZStack { placeholder; ProgressView() }
+            }
+        }
+        .clipped()
+        .task(id: url) { await load() }
+    }
+
+    private var placeholder: some View {
+        ZStack {
+            LinearGradient(colors: [.gray.opacity(0.5), .black.opacity(0.65)], startPoint: .topLeading, endPoint: .bottomTrailing)
+            Image(systemName: "music.note").font(.largeTitle).foregroundColor(.white.opacity(0.65))
+        }
+    }
+
+    private func load() async {
+        loadFailed = false
+        guard let url else { image = nil; return }
+        if let cached = ArtworkImageCache.shared.image(for: url) {
+            image = cached
+            return
+        }
+        // Keep prior art visible while next URL fetches → no pill flash.
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard !Task.isCancelled else { return }
+            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                loadFailed = true
+                return
+            }
+            guard let decoded = UIImage(data: data) else { loadFailed = true; return }
+            ArtworkImageCache.shared.insert(decoded, for: url)
+            image = decoded
+        } catch {
+            guard !Task.isCancelled else { return }
+            loadFailed = true
+        }
+    }
+}
+
+final class ArtworkImageCache {
+    static let shared = ArtworkImageCache()
+    private let cache = NSCache<NSURL, UIImage>()
+
+    init() {
+        cache.countLimit = 120
+        cache.totalCostLimit = 64 * 1024 * 1024
+    }
+
+    func image(for url: URL) -> UIImage? { cache.object(forKey: url as NSURL) }
+    func insert(_ image: UIImage, for url: URL) {
+        let cost = Int(image.size.width * image.size.height * image.scale * image.scale * 4)
+        cache.setObject(image, forKey: url as NSURL, cost: cost)
+    }
 }
 
 struct FeatureCard: View {

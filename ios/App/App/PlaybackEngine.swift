@@ -32,18 +32,30 @@ final class PlaybackEngine: ObservableObject {
 
     init(musicService: MusicService = .shared) {
         self.musicService = musicService
+        // We advance the catalog queue ourselves. Leaving AVQueuePlayer on .advance
+        // races removeAllItems/insert and can fire stale end notifications.
+        player.actionAtItemEnd = .none
         restoreQueue()
         configureRemoteCommands()
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] time in
             Task { @MainActor in
-                self?.elapsed = max(0, time.seconds.isFinite ? time.seconds : 0)
-                let value = self?.player.currentItem?.duration.seconds ?? 0
-                self?.duration = value.isFinite ? max(0, value) : (self?.currentTrack?.duration ?? 0)
-                self?.updateNowPlaying()
+                guard let self else { return }
+                let seconds = max(0, time.seconds.isFinite ? time.seconds : 0)
+                let value = self.player.currentItem?.duration.seconds ?? 0
+                let nextDuration = value.isFinite ? max(0, value) : (self.currentTrack?.duration ?? 0)
+                // Avoid thrashing SwiftUI (AsyncImage / pill art) on every tick.
+                if abs(self.elapsed - seconds) >= 0.25 { self.elapsed = seconds }
+                if abs(self.duration - nextDuration) >= 0.25 { self.duration = nextDuration }
+                self.updateNowPlaying()
             }
         }
-        endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.itemDidFinish() }
+        endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main) { [weak self] notification in
+            Task { @MainActor in
+                guard let self,
+                      let finished = notification.object as? AVPlayerItem,
+                      finished === self.player.currentItem else { return }
+                self.itemDidFinish()
+            }
         }
     }
 
@@ -166,6 +178,8 @@ final class PlaybackEngine: ObservableObject {
     }
 
     private func itemDidFinish() {
+        // Ignore end events that arrive while a replacement item is mid-load.
+        guard !isLoading else { return }
         if let track = currentTrack { ScrobblingCoordinator.shared.completed(track, listened: max(elapsed, duration)) }
         next()
     }
@@ -224,7 +238,12 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         tasks[taskID] = nil
         progress[track.id] = nil
     }
-    func prefetchArtwork(for track: Track) async throws { guard let url = track.artworkURL else { return }; _ = try await URLSession.shared.data(from: url) }
+    func prefetchArtwork(for track: Track) async throws {
+        guard let url = track.artworkURL else { return }
+        if ArtworkImageCache.shared.image(for: url) != nil { return }
+        let (data, _) = try await URLSession.shared.data(from: url)
+        if let image = UIImage(data: data) { ArtworkImageCache.shared.insert(image, for: url) }
+    }
     nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         Task { @MainActor in
             guard let track = tasks.removeValue(forKey: downloadTask.taskIdentifier) else { return }
