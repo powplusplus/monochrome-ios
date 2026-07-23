@@ -18,6 +18,13 @@ final class PlaybackEngine: ObservableObject {
     @Published var shuffleEnabled = false { didSet { prefetchUpcoming() } }
     @Published var errorMessage: String?
     @Published private(set) var currentStreamQuality: String?
+    /// The track the engine has finished working on — set once its item is ready
+    /// (or has definitively failed), not when the queue index moves. UI that must
+    /// not run ahead of the audio (synced lyrics) keys off this rather than
+    /// `currentTrack`, which flips several network hops earlier.
+    @Published private(set) var loadedTrackID: String?
+    /// `24/96` when the provider reports bit depth and sample rate.
+    @Published private(set) var currentStreamQualityDetail: String?
 
     let player = AVQueuePlayer()
     private let musicService: MusicService
@@ -61,6 +68,10 @@ final class PlaybackEngine: ObservableObject {
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self] time in
             Task { @MainActor in
                 guard let self else { return }
+                // A load in flight owns `elapsed`/`duration`; trailing ticks from the
+                // item being torn down would otherwise repaint the scrubber with the
+                // previous track's position.
+                guard !self.isLoading else { return }
                 let seconds = max(0, time.seconds.isFinite ? time.seconds : 0)
                 let value = self.player.currentItem?.duration.seconds ?? 0
                 let nextDuration = value.isFinite ? max(0, value) : (self.currentTrack?.duration ?? 0)
@@ -197,8 +208,24 @@ final class PlaybackEngine: ObservableObject {
         loadTask?.cancel()
         pendingAutoplay = false
         isLoading = true
+        loadedTrackID = nil
         errorMessage = nil
         currentStreamQuality = nil
+        currentStreamQualityDetail = nil
+        // Retire the outgoing item now. Resolving a stream is several network hops,
+        // and leaving the previous item playing across them left the scrubber running
+        // and the synced lyrics scrolling against audio the rest of the UI had already
+        // replaced with the incoming track.
+        fadeTask?.cancel()
+        itemStatusObservation = nil
+        player.pause()
+        player.removeAllItems()
+        player.volume = 1
+        isPlaying = false
+        elapsed = 0
+        duration = track.duration
+        lastNowPlayingElapsed = -1
+        updateNowPlaying()
         let warm = usePrefetch ? takePrefetch(for: track) : nil
         loadTask = Task {
             do {
@@ -215,6 +242,7 @@ final class PlaybackEngine: ObservableObject {
                 }
                 guard !Task.isCancelled else { return }
                 currentStreamQuality = stream.quality
+                currentStreamQualityDetail = stream.qualityDetail
                 let item = AVPlayerItem(asset: asset)
                 item.audioTimePitchAlgorithm = .timeDomain
                 pendingAutoplay = autoplay
@@ -224,6 +252,7 @@ final class PlaybackEngine: ObservableObject {
                         switch item.status {
                         case .readyToPlay:
                             self.isLoading = false
+                            self.loadedTrackID = track.id
                             if self.pendingAutoplay {
                                 self.pendingAutoplay = false
                                 self.resume()
@@ -238,6 +267,7 @@ final class PlaybackEngine: ObservableObject {
                                 return
                             }
                             self.isLoading = false
+                            self.loadedTrackID = track.id
                             self.isPlaying = false
                             self.errorMessage = item.error?.localizedDescription ?? "This song could not be played."
                         case .unknown:
@@ -257,6 +287,7 @@ final class PlaybackEngine: ObservableObject {
                 // Autoplay waits for `.readyToPlay` so AVPlayer is not raced.
                 if item.status == .readyToPlay {
                     isLoading = false
+                    loadedTrackID = track.id
                     if pendingAutoplay {
                         pendingAutoplay = false
                         resume()
@@ -265,12 +296,16 @@ final class PlaybackEngine: ObservableObject {
                 LibraryRepository.shared.recordPlayback(track)
                 ScrobblingCoordinator.shared.nowPlaying(track)
                 Task { try? await DownloadManager.shared.prefetchArtwork(for: track) }
-                Task { _ = try? await musicService.recommendations(for: track.playbackID) }
+                // Purely a cache warm for the related-tracks shelf. At default priority
+                // it fans out across the instance pool and competes with the audio
+                // download that the user is actually waiting on.
+                Task(priority: .background) { _ = try? await musicService.recommendations(for: track.playbackID) }
                 updateNowPlaying()
                 prefetchUpcoming()
             } catch {
                 guard !Task.isCancelled else { return }
                 pendingAutoplay = false
+                loadedTrackID = track.id
                 isLoading = false; isPlaying = false; errorMessage = error.localizedDescription
             }
         }

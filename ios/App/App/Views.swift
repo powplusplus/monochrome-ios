@@ -29,7 +29,24 @@ private struct ModernRootShell: View {
         .tabViewBottomAccessory(isEnabled: playback.currentTrack != nil) {
             MiniPlayer(showPlayer: $showPlayer, usesSystemBackground: true)
         }
-        .fullScreenCover(isPresented: $showPlayer) { NowPlayingView() }
+        .overlay { NowPlayingOverlay(isPresented: $showPlayer) }
+    }
+}
+
+/// The player rides in the view hierarchy instead of a `fullScreenCover` so the
+/// dismiss drag uncovers the tab UI. A cover is an opaque modal — the presenting
+/// screen is gone while it's up, so sliding its content down only ever exposed
+/// the cover's own black backing.
+private struct NowPlayingOverlay: View {
+    @Binding var isPresented: Bool
+
+    var body: some View {
+        ZStack {
+            if isPresented {
+                NowPlayingView(isPresented: $isPresented)
+                    .transition(.move(edge: .bottom))
+            }
+        }
     }
 }
 
@@ -52,7 +69,7 @@ private struct CompatibleRootShell: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
-        .fullScreenCover(isPresented: $showPlayer) { NowPlayingView() }
+        .overlay { NowPlayingOverlay(isPresented: $showPlayer) }
     }
 }
 
@@ -434,7 +451,11 @@ struct MiniPlayer: View {
     @EnvironmentObject private var playback: PlaybackEngine
     var body: some View {
         HStack(spacing: 8) {
-            Button { showPlayer = true } label: {
+            Button {
+                // Overlay presentation needs the animation supplied here; a
+                // fullScreenCover used to bring its own slide-up.
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.9)) { showPlayer = true }
+            } label: {
                 HStack(spacing: 11) {
                     // 48pt art was taller than the pill's own capsule, so the
                     // corners clipped. Keep it inside the 38pt transport row.
@@ -508,49 +529,51 @@ private struct MiniPlayerBackground: ViewModifier {
 }
 
 struct NowPlayingView: View {
-    @Environment(\.dismiss) private var dismiss
+    @Binding var isPresented: Bool
     @EnvironmentObject private var playback: PlaybackEngine
     @EnvironmentObject private var library: LibraryRepository
     @State private var showQueue = false
     @State private var showLyrics = false
     @State private var lyrics: SyncedLyrics?
     @State private var lyricsLoading = false
+    /// Fetched words waiting for their track's audio to become the one actually playing.
+    @State private var pendingLyrics: (trackID: String, value: SyncedLyrics?)?
     @State private var dismissOffset: CGFloat = 0
     @State private var artDragOffset: CGFloat = 0
 
     var body: some View {
-        ZStack {
-            // Fixed black base so the dismiss drag never reveals a bare gap
-            // behind the shrinking/offset content below.
-            Color.black.ignoresSafeArea()
-            dismissDrivenBody
-        }
+        dismissDrivenBody
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showQueue) { QueueView() }
         .task(id: playback.currentTrack?.id) {
             await loadLyrics()
         }
+        .onChange(of: playback.loadedTrackID) { _, _ in commitPendingLyrics() }
         .animation(.easeInOut(duration: 0.35), value: showLyrics)
     }
 
     private var dismissDrivenBody: some View {
         GeometryReader { geometry in
             let landscape = geometry.size.width > geometry.size.height
+            let topInset = max(geometry.safeAreaInsets.top, Self.keyWindowTopInset)
+            let bottomInset = max(geometry.safeAreaInsets.bottom, Self.keyWindowBottomInset)
             let dismissProgress = min(max(dismissOffset / max(geometry.size.height * 0.42, 1), 0), 1)
             ZStack {
                 backdrop
                     .ignoresSafeArea()
-                // Content stays in system safe area (incl. hotspot / call status bar).
-                // Only backdrop bleeds edge-to-edge.
+                // The reader spans the whole screen so the safe area is applied
+                // exactly once, here. Letting the parent inset the reader *and*
+                // padding by the status-bar height inside it stacked the notch
+                // twice and dropped every row ~59pt down the screen.
                 VStack(spacing: 0) {
                     header
-                        .padding(.top, max(geometry.safeAreaInsets.top, Self.keyWindowTopInset))
+                        .padding(.top, topInset)
                         .contentShape(Rectangle())
                         .gesture(dismissDrag(screenHeight: geometry.size.height))
                     if landscape {
-                        landscapeLayout(in: geometry)
+                        landscapeLayout(in: geometry, topInset: topInset, bottomInset: bottomInset)
                     } else {
-                        portraitLayout(in: geometry)
+                        portraitLayout(in: geometry, topInset: topInset, bottomInset: bottomInset)
                     }
                 }
                 .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
@@ -560,15 +583,26 @@ struct NowPlayingView: View {
             .opacity(1 - dismissProgress * 0.45)
             .simultaneousGesture(dismissDrag(screenHeight: geometry.size.height))
         }
+        .ignoresSafeArea()
     }
 
+    /// Ride the drag out to the bottom edge, then drop the view once it is
+    /// already off screen so removal never flashes.
     private func finishDismiss(screenHeight: CGFloat) {
         withAnimation(.easeOut(duration: 0.2)) {
             dismissOffset = screenHeight
             artDragOffset = 0
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) {
-            dismiss()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            isPresented = false
+            dismissOffset = 0
+        }
+    }
+
+    private func closeFromChrome() {
+        artDragOffset = 0
+        withAnimation(.easeInOut(duration: 0.28)) {
+            isPresented = false
         }
     }
 
@@ -665,7 +699,7 @@ struct NowPlayingView: View {
 
     private var header: some View {
         HStack {
-            Button { dismiss() } label: {
+            Button { closeFromChrome() } label: {
                 Image(systemName: "chevron.down")
                     .font(.headline)
                     .frame(width: 40, height: 40)
@@ -692,27 +726,30 @@ struct NowPlayingView: View {
             .opacity(lyrics == nil && !lyricsLoading ? 0.35 : 1)
         }
         .padding(.horizontal, 18)
-        .padding(.top, 8)
-        .padding(.bottom, 4)
+        .padding(.top, 2)
+        .padding(.bottom, 2)
     }
 
-    private func portraitLayout(in geometry: GeometryProxy) -> some View {
-        let sideInset: CGFloat = 28
+    /// Header row: two 40pt controls plus the 4pt of padding above and below.
+    private static let chromeHeight: CGFloat = 44
+
+    private func portraitLayout(in geometry: GeometryProxy, topInset: CGFloat, bottomInset: CGFloat) -> some View {
+        let sideInset: CGFloat = 24
+        // The home indicator is the only thing that needs clearance down here;
+        // on a button-era phone a token gap is enough.
+        let bottomPad = max(12, bottomInset)
+        let controlsBudget: CGFloat = 292 + bottomPad
         let availableWidth = max(0, geometry.size.width - (sideInset * 2))
-        let chromeHeight: CGFloat = 56
-        let bottomPad = max(18, geometry.safeAreaInsets.bottom)
-        let controlsBudget: CGFloat = 300 + bottomPad
-        let availableHeight = max(0, geometry.size.height - geometry.safeAreaInsets.top - chromeHeight)
+        let availableHeight = max(0, geometry.size.height - topInset - Self.chromeHeight)
         // Shrink art to keep transport visible without scrolling on short phones.
-        let artSide = min(availableWidth, min(max(168, availableHeight - controlsBudget), 380))
-        let needsScroll = artSide + controlsBudget + 40 > availableHeight
+        let artSide = min(availableWidth, min(max(168, availableHeight - controlsBudget), 420))
+        let needsScroll = artSide + controlsBudget + 24 > availableHeight
 
         return Group {
             if showLyrics {
-                VStack(spacing: 12) {
+                VStack(spacing: 8) {
                     artwork
-                        .frame(width: min(96, artSide * 0.28), height: min(96, artSide * 0.28))
-                        .padding(.top, 4)
+                        .frame(width: 64, height: 64)
                     lyricsPane
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     controls
@@ -722,10 +759,10 @@ struct NowPlayingView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if needsScroll {
                 ScrollView(.vertical, showsIndicators: false) {
-                    VStack(spacing: 24) {
+                    VStack(spacing: 18) {
                         artwork
-                            .frame(width: min(artSide, 280), height: min(artSide, 280))
-                            .padding(.top, 12)
+                            .frame(width: min(artSide, 300), height: min(artSide, 300))
+                            .padding(.top, 6)
                         controls
                     }
                     .frame(maxWidth: 520)
@@ -737,8 +774,8 @@ struct NowPlayingView: View {
                 VStack(spacing: 0) {
                     artwork
                         .frame(width: artSide, height: artSide)
-                        .padding(.top, 18)
-                    Spacer(minLength: 20)
+                        .padding(.top, 6)
+                    Spacer(minLength: 12)
                     controls
                         .padding(.horizontal, sideInset)
                         .padding(.bottom, bottomPad)
@@ -748,10 +785,10 @@ struct NowPlayingView: View {
         }
     }
 
-    private func landscapeLayout(in geometry: GeometryProxy) -> some View {
-        let leadingPad = max(24, geometry.safeAreaInsets.leading + 12)
-        let trailingPad = max(24, geometry.safeAreaInsets.trailing + 12)
-        let usableHeight = max(160, geometry.size.height - geometry.safeAreaInsets.top - 64 - geometry.safeAreaInsets.bottom)
+    private func landscapeLayout(in geometry: GeometryProxy, topInset: CGFloat, bottomInset: CGFloat) -> some View {
+        let leadingPad = max(20, geometry.safeAreaInsets.leading + 10)
+        let trailingPad = max(20, geometry.safeAreaInsets.trailing + 10)
+        let usableHeight = max(160, geometry.size.height - topInset - Self.chromeHeight - bottomInset)
         let artSide = min(usableHeight, min(geometry.size.width * 0.38, 320))
 
         return HStack(alignment: .center, spacing: 24) {
@@ -778,7 +815,7 @@ struct NowPlayingView: View {
         }
         .padding(.leading, leadingPad)
         .padding(.trailing, trailingPad)
-        .padding(.bottom, max(8, geometry.safeAreaInsets.bottom))
+        .padding(.bottom, max(8, bottomInset))
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
@@ -794,7 +831,7 @@ struct NowPlayingView: View {
                 activeIndex: lyrics.activeIndex(at: playback.elapsed),
                 onSeek: { playback.seek(to: $0) }
             )
-            .padding(.horizontal, 22)
+            .padding(.horizontal, 20)
         } else {
             Text("No lyrics for this track")
                 .font(.callout)
@@ -803,8 +840,14 @@ struct NowPlayingView: View {
         }
     }
 
+    /// Fetches as soon as the queue index moves — LRCLIB is a separate host, so
+    /// overlapping it with the stream resolve is free — but stages the result
+    /// instead of showing it. `currentTrack` flips several network hops before the
+    /// new audio is playable, and assigning there swapped the pane to the next
+    /// song's words while the previous one was still the loaded track.
     private func loadLyrics() async {
         guard let track = playback.currentTrack else {
+            pendingLyrics = nil
             lyrics = nil
             lyricsLoading = false
             showLyrics = false
@@ -812,15 +855,25 @@ struct NowPlayingView: View {
         }
         lyricsLoading = true
         lyrics = nil
+        pendingLyrics = nil
         let fetched = await MusicService.shared.lyrics(for: track)
         guard playback.currentTrack?.id == track.id else { return }
-        lyrics = fetched
+        pendingLyrics = (track.id, fetched)
+        commitPendingLyrics()
+    }
+
+    private func commitPendingLyrics() {
+        guard let pending = pendingLyrics else { return }
+        // Normally we wait for the engine to settle on this track. A restored queue
+        // that has never been loaded would never settle, so release the staged words
+        // once the engine is plainly idle rather than spinning forever.
+        let settled = pending.trackID == playback.loadedTrackID
+        let idle = playback.loadedTrackID == nil && !playback.isLoading && !playback.isPlaying
+        guard settled || idle else { return }
+        pendingLyrics = nil
+        lyrics = pending.value
         lyricsLoading = false
-        if let fetched, !fetched.isEmpty {
-            showLyrics = true
-        } else {
-            showLyrics = false
-        }
+        showLyrics = !(pending.value?.isEmpty ?? true)
     }
 
     private var artwork: some View {
@@ -878,7 +931,16 @@ struct NowPlayingView: View {
                             .frame(width: 20, height: 12)
                     }
                     Text(resolvedQuality.title.uppercased())
+                    if let detail = playback.currentStreamQualityDetail {
+                        Text(detail)
+                            .foregroundStyle(.secondary)
+                    }
                 }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(
+                    playback.currentStreamQualityDetail.map { "\(resolvedQuality.title), \($0) bit depth over kilohertz" }
+                        ?? resolvedQuality.title
+                )
                 .font(.caption2.weight(.semibold))
                 .kerning(1.0)
                 .foregroundStyle(resolvedQuality == .hiResLossless ? Color(red: 0.85, green: 0.68, blue: 0.24) : .secondary)
@@ -958,9 +1020,16 @@ struct NowPlayingView: View {
         }
     }
 
+    /// What the badge shows: the tier the provider actually handed us, else the
+    /// tier the catalog claims for the track, else the tier we asked for. An
+    /// unmappable token used to blank the badge entirely, which read as the
+    /// feature being missing rather than as one unknown string.
     private var resolvedQuality: PlaybackQuality? {
-        guard let raw = playback.currentStreamQuality else { return nil }
-        return PlaybackQuality(providerToken: raw)
+        guard let track = playback.currentTrack else { return nil }
+        if let raw = playback.currentStreamQuality, let quality = PlaybackQuality(providerToken: raw) {
+            return quality
+        }
+        return track.catalogQuality ?? .stored
     }
 
 
@@ -970,10 +1039,14 @@ struct NowPlayingView: View {
     }
 
     /// GeometryReader can lag behind status-bar expansions (hotspot/call).
-    private static var keyWindowTopInset: CGFloat {
+    private static var keyWindowTopInset: CGFloat { keyWindowInsets.top }
+
+    private static var keyWindowBottomInset: CGFloat { keyWindowInsets.bottom }
+
+    private static var keyWindowInsets: UIEdgeInsets {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         let window = scenes.flatMap(\.windows).first(where: \.isKeyWindow) ?? scenes.flatMap(\.windows).first
-        return window?.safeAreaInsets.top ?? 0
+        return window?.safeAreaInsets ?? .zero
     }
 }
 
@@ -998,7 +1071,7 @@ struct SyncedLyricsView: View {
                         .foregroundStyle(.white.opacity(0.78))
                         .multilineTextAlignment(.leading)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 24)
+                        .padding(.vertical, 12)
                 }
                 .modifier(HiddenScrollIndicators())
             }
@@ -1019,7 +1092,9 @@ struct SyncedLyricsView: View {
                             .id(line.id)
                     }
                 }
-                .padding(.vertical, 36)
+                // Enough slack for the scroll anchor to place the first and last
+                // lines, not enough to read as an empty band at t=0.
+                .padding(.vertical, 18)
             }
             .modifier(HiddenScrollIndicators())
             .onChange(of: activeIndex) { _, index in

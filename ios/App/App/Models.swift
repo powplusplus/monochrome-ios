@@ -17,15 +17,56 @@ enum PlaybackQuality: String, CaseIterable, Identifiable, Codable {
 
     /// Stream responses echo the *provider's* token, not our raw value: Amazon
     /// returns `HD`/`UHD`/`SD_*`, Deezer returns `FLAC`/`MP3_*`, only TIDAL
-    /// returns our own. Map all of them back so the badge resolves everywhere.
+    /// returns our own. Catalog payloads add a third vocabulary again
+    /// (`HIRES_LOSSLESS`, `HIFI_PLUS`, `MQA`, …) via `audioQuality` and
+    /// `mediaMetadata.tags` — web normalises all of them in `QUALITY_TOKENS`
+    /// (js/utils.js), so mirror that table here or the badge silently vanishes.
     init?(providerToken raw: String) {
-        switch raw.trimmingCharacters(in: .whitespaces).uppercased() {
-        case "LOW", "SD_LOW", "MP3_128", "HEAACV1": self = .low
-        case "HIGH", "SD_HIGH", "MP3_320", "AACLC": self = .high
-        case "LOSSLESS", "HD", "FLAC": self = .lossless
-        case "HI_RES_LOSSLESS", "UHD", "FLAC_HIRES": self = .hiResLossless
-        default: return nil
+        // Amazon reports its tier as `HD_44_1_16` / `UHD_96_24`, so match on the
+        // leading token rather than the whole string.
+        let token = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+        let head = token.split(separator: "_").first.map(String.init) ?? token
+
+        switch token {
+        case "LOW", "LOW_QUALITY", "SD_LOW", "MP3_64", "MP3_128", "MP3_MISC", "HEAACV1", "AAC_LOW":
+            self = .low
+        case "HIGH", "HIGH_QUALITY", "NORMAL", "SD", "SD_HIGH", "MP3_320", "AACLC", "AAC", "MP4A":
+            self = .high
+        case "LOSSLESS", "HIFI", "CD", "FLAC", "MP4_RA_FLAC":
+            self = .lossless
+        case "HI_RES_LOSSLESS", "HIRES_LOSSLESS", "HIRESLOSSLESS", "HIFI_PLUS", "HI_RES_FLAC",
+             "HI_RES", "HIRES", "MASTER", "MASTER_QUALITY", "MQA", "FLAC_HIRES", "UHD":
+            self = .hiResLossless
+        default:
+            // Fall back to the Amazon tier prefix (`HD_…`, `UHD_…`, `SD_…`).
+            switch head {
+            case "UHD": self = .hiResLossless
+            case "HD": self = .lossless
+            case "SD": self = .high
+            default: return nil
+            }
         }
+    }
+
+    /// Descending audio fidelity, mirroring web `QUALITY_PRIORITY`.
+    var rank: Int {
+        switch self {
+        case .hiResLossless: return 3
+        case .lossless: return 2
+        case .high: return 1
+        case .low: return 0
+        }
+    }
+
+    /// Best of the given provider tokens, ignoring the ones we cannot map.
+    static func best(ofTokens tokens: [String]) -> PlaybackQuality? {
+        tokens
+            .compactMap(PlaybackQuality.init(providerToken:))
+            .max { $0.rank < $1.rank }
     }
 
     var title: String {
@@ -157,12 +198,15 @@ struct Track: Codable, Identifiable, Hashable {
     var duration: Double
     var explicit: Bool
     var audioQuality: String?
+    /// TIDAL `mediaMetadata.tags` (`LOSSLESS`, `HIRES_LOSSLESS`, `DOLBY_ATMOS`, …).
+    /// Optional so tracks persisted before this field decode unchanged.
+    var mediaTags: [String]?
     var isrc: String?
     var provider: Provider
     var streamURL: URL?
 
     init(id: String, title: String, artist: Artist, album: AlbumSummary? = nil, duration: Double = 0,
-         explicit: Bool = false, audioQuality: String? = nil, isrc: String? = nil,
+         explicit: Bool = false, audioQuality: String? = nil, mediaTags: [String]? = nil, isrc: String? = nil,
          provider: Provider = .tidal, streamURL: URL? = nil) {
         self.id = id
         self.title = title
@@ -171,6 +215,7 @@ struct Track: Codable, Identifiable, Hashable {
         self.duration = duration
         self.explicit = explicit
         self.audioQuality = audioQuality
+        self.mediaTags = mediaTags
         self.isrc = isrc
         self.provider = provider
         self.streamURL = streamURL
@@ -178,6 +223,15 @@ struct Track: Codable, Identifiable, Hashable {
 
     var artworkURL: URL? { Artwork.url(album?.cover, size: 640) }
     var playbackID: String { id.split(separator: ":").last.map(String.init) ?? id }
+
+    /// Highest tier the *catalog* claims for this track. Used as the badge's
+    /// fallback while the stream is still resolving, like web's
+    /// `deriveTrackQuality`.
+    var catalogQuality: PlaybackQuality? {
+        var tokens: [String] = mediaTags ?? []
+        if let audioQuality { tokens.append(audioQuality) }
+        return PlaybackQuality.best(ofTokens: tokens)
+    }
 }
 
 struct AlbumSummary: Codable, Identifiable, Hashable {
@@ -243,6 +297,10 @@ struct StreamResponse: Codable {
     var previewReason: String? = nil
     /// Actual playable media length when known (e.g. from DASH `mediaPresentationDuration`).
     var mediaDuration: Double? = nil
+    /// Bit depth / sample rate of the selected tier when the provider reports it
+    /// (Amazon `available_qualities`), e.g. `24/96`. Web shows the same next to
+    /// the badge, and it is the only way to tell HD from UHD at a glance.
+    var qualityDetail: String? = nil
 }
 
 struct LyricLine: Identifiable, Hashable {
@@ -338,6 +396,24 @@ enum ModelMapper {
         return Artist(id: "unknown", name: "Unknown Artist", picture: nil)
     }
 
+    /// `mediaMetadata.tags` on the track, falling back to the flat `mediaTags`
+    /// key and then to the album the track came in (TIDAL tags albums, not
+    /// always every track).
+    static func mediaTags(_ dict: [String: Any]) -> [String]? {
+        func tags(_ value: Any?) -> [String]? {
+            if let list = value as? [String], !list.isEmpty { return list }
+            if let nested = value as? [String: Any] { return nested["tags"] as? [String] }
+            return nil
+        }
+        let candidates: [Any?] = [
+            dict["mediaMetadata"], dict["media_metadata"], dict["mediaTags"],
+            (dict["album"] as? [String: Any])?["mediaMetadata"],
+            (dict["album"] as? [String: Any])?["mediaTags"],
+        ]
+        let collected = candidates.compactMap(tags).flatMap { $0 }
+        return collected.isEmpty ? nil : collected
+    }
+
     static func track(_ dict: [String: Any]) -> Track? {
         if let nested = (dict["item"] ?? dict["track"] ?? dict["value"]) as? [String: Any] { return track(nested) }
         guard let id = string(dict, ["id", "trackId", "uuid"]), let title = string(dict, ["title", "name"]) else { return nil }
@@ -353,7 +429,8 @@ enum ModelMapper {
         let directURL = string(dict, ["streamUrl", "streamURL"]).flatMap(URL.init(string:))
         return Track(id: prefixed, title: title, artist: artist(artistValue), album: album, duration: seconds,
                      explicit: (dict["explicit"] as? Bool) ?? false,
-                     audioQuality: string(dict, ["audioQuality", "quality"]), isrc: string(dict, ["isrc", "ISRC"]),
+                     audioQuality: string(dict, ["audioQuality", "quality"]),
+                     mediaTags: mediaTags(dict), isrc: string(dict, ["isrc", "ISRC"]),
                      provider: Provider(rawValue: prefixed.split(separator: ":").first.map(String.init) ?? "tidal") ?? .tidal,
                      streamURL: directURL)
     }
