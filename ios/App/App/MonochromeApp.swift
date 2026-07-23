@@ -20,6 +20,11 @@ struct MonochromeApp: App {
                 .onOpenURL { auth.handle($0) }
                 .task {
                     library.migrateLegacyIfNeeded()
+                    // Both of these exist to move work off the first play: refresh
+                    // the instance pool before the first search runs against it,
+                    // and solve Amazon's Cloudflare gate while the user browses.
+                    await InstanceDirectory.shared.refreshIfStale()
+                    AmazonTurnstileAuth.shared.prewarm()
                     if auth.isSignedIn { await library.syncWithCloud() }
                 }
         }

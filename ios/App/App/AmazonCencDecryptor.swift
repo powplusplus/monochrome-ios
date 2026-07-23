@@ -8,16 +8,57 @@ enum AmazonCencDecryptor {
         guard let key = Data(hexString: keyHex), key.count == 16 else {
             throw ServiceError.malformed("Amazon decryption key")
         }
+
+        // Every play used to download and decrypt the whole file again, even when
+        // it was the same track seconds earlier — repeat-one, a scrub past the end
+        // and back, or simply replaying an album re-paid the full cost. The signed
+        // query string rotates per request but the object behind it does not, so
+        // key the cache on the stable part of the URL.
+        let target = cacheURL(for: sourceURL, codec: codec)
+        if let existing = try? target.resourceValues(forKeys: [.fileSizeKey]).fileSize, existing > 0 {
+            return target
+        }
+        _ = pruneCacheOnce
+
         let (data, response) = try await session.data(from: sourceURL)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw ServiceError.unavailable("Amazon stream download failed")
         }
         let clear = try decrypt(data: data, key: key, codec: codec)
-        let target = FileManager.default.temporaryDirectory
-            .appendingPathComponent("monochrome-amz-\(UUID().uuidString).m4a")
         try clear.write(to: target, options: .atomic)
         return target
     }
+
+    private static func cacheURL(for sourceURL: URL, codec: String) -> URL {
+        let seed = (sourceURL.host ?? "") + sourceURL.path
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        let seedBytes = Data(seed.utf8)
+        seedBytes.withUnsafeBytes { _ = CC_SHA256($0.baseAddress, CC_LONG(seedBytes.count), &digest) }
+        let name = digest.prefix(16).map { String(format: "%02x", $0) }.joined()
+        return FileManager.default.temporaryDirectory
+            .appendingPathComponent("monochrome-amz-\(name)-\(codec).m4a")
+    }
+
+    /// Decrypted FLAC runs tens of megabytes a track. The OS clears the temp
+    /// directory eventually, but not before a long session can fill a device, so
+    /// drop yesterday's files. `static let` gives us a thread-safe run-once
+    /// without a flag or a lock.
+    private static let pruneCacheOnce: Void = {
+        let directory = FileManager.default.temporaryDirectory
+        let cutoff = Date().addingTimeInterval(-24 * 3600)
+        Task.detached(priority: .utility) {
+            guard let entries = try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            ) else { return }
+            for entry in entries where entry.lastPathComponent.hasPrefix("monochrome-amz-") {
+                let modified = try? entry.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+                if let modified, modified > cutoff { continue }
+                try? FileManager.default.removeItem(at: entry)
+            }
+        }
+    }()
 
     static func decrypt(data: Data, key: Data, codec: String = "flac") throws -> Data {
         var output = Data()
@@ -279,28 +320,42 @@ enum AmazonCencDecryptor {
         guard createStatus == kCCSuccess, let cryptor else { return data }
         defer { CCCryptorRelease(cryptor) }
 
+        // `Data(count:)` zero-fills before CommonCrypto immediately overwrites
+        // every byte. Once per sample across a whole album that is a lot of
+        // pointless memset; hand CommonCrypto uninitialized storage instead.
         var outLength = 0
-        var outData = Data(count: data.count)
-        let updateStatus = outData.withUnsafeMutableBytes { outBytes in
-            data.withUnsafeBytes { inBytes in
+        var updateStatus = CCCryptorStatus(kCCSuccess)
+        let outBytes = [UInt8](unsafeUninitializedCapacity: data.count) { buffer, initialized in
+            updateStatus = data.withUnsafeBytes { inBytes in
                 CCCryptorUpdate(
                     cryptor,
                     inBytes.baseAddress, data.count,
-                    outBytes.baseAddress, data.count,
+                    buffer.baseAddress, data.count,
                     &outLength
                 )
             }
+            initialized = updateStatus == kCCSuccess ? outLength : 0
         }
         guard updateStatus == kCCSuccess else { return data }
-        return outData
+        return Data(outBytes)
     }
 
+    // `subdata` heap-allocates a fresh Data per read, and these run once per
+    // sample inside `parseTrun` / `parseSenc` — tens of thousands of throwaway
+    // allocations for a single track. Index the bytes directly instead.
     private static func readUInt16(_ data: Data, _ offset: Int) -> UInt16 {
-        data.subdata(in: offset..<(offset + 2)).withUnsafeBytes { $0.load(as: UInt16.self).bigEndian }
+        let index = data.startIndex + offset
+        guard index >= data.startIndex, index + 2 <= data.endIndex else { return 0 }
+        return UInt16(data[index]) << 8 | UInt16(data[index + 1])
     }
 
     private static func readUInt32(_ data: Data, _ offset: Int) -> UInt32 {
-        data.subdata(in: offset..<(offset + 4)).withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+        let index = data.startIndex + offset
+        guard index >= data.startIndex, index + 4 <= data.endIndex else { return 0 }
+        return UInt32(data[index]) << 24
+            | UInt32(data[index + 1]) << 16
+            | UInt32(data[index + 2]) << 8
+            | UInt32(data[index + 3])
     }
 }
 

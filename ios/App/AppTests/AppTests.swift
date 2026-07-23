@@ -102,6 +102,33 @@ final class AppTests: XCTestCase {
         }
     }
 
+    func testInstanceDirectoryNormalizesDocumentEntries() {
+        // Shapes taken from the live instances.json: a trailing slash on some
+        // entries, which `json(path:)` would otherwise turn into `host//search/`.
+        let normalized = InstanceDirectory.normalize([
+            "https://api.monochrome.tf/",
+            "  https://wolf.qqdl.site  ",
+            "https://hifi.p1nkhamster.xyz/",
+        ])
+        XCTAssertEqual(normalized, [
+            "https://api.monochrome.tf",
+            "https://wolf.qqdl.site",
+            "https://hifi.p1nkhamster.xyz",
+        ])
+    }
+
+    func testInstanceDirectoryDropsJunkAndDuplicates() {
+        let normalized = InstanceDirectory.normalize([
+            "https://wolf.qqdl.site",
+            "https://wolf.qqdl.site/",   // same host once the slash is trimmed
+            "",
+            "not a url",
+            "ftp://wolf.qqdl.site",      // only http(s) is fetchable here
+            "https://maus.qqdl.site",
+        ])
+        XCTAssertEqual(normalized, ["https://wolf.qqdl.site", "https://maus.qqdl.site"])
+    }
+
     /// Header/payload/signature shaped like a real token; only the payload is read.
     private static func unsignedJWT(claims: [String: Any]) -> String {
         let payload = try! JSONSerialization.data(withJSONObject: claims)

@@ -4,17 +4,6 @@ final class MusicService {
     static let shared = MusicService()
 
     private let session: URLSession
-    private let apiInstances = [
-        "https://eu-central.monochrome.tf", "https://us-west.monochrome.tf",
-        "https://arran.monochrome.tf", "https://api.monochrome.tf",
-        "https://monochrome-api.samidy.com", "https://triton.squid.wtf",
-        "https://wolf.qqdl.site", "https://maus.qqdl.site", "https://vogel.qqdl.site", "https://hund.qqdl.site"
-    ]
-    private let streamInstances = [
-        "https://eu-central.monochrome.tf", "https://us-west.monochrome.tf",
-        "https://arran.monochrome.tf", "https://triton.squid.wtf", "https://wolf.qqdl.site",
-        "https://maus.qqdl.site", "https://vogel.qqdl.site", "https://hund.qqdl.site", "https://hifi.p1nkhamster.com"
-    ]
     private let cache = NSCache<NSString, NSData>()
 
     init(session: URLSession = .shared) { self.session = session }
@@ -124,13 +113,26 @@ final class MusicService {
 
         // Match upstream Monochrome `getStreamUrl` (js/api.js):
         // Amazon Music (Turnstile JWT) → Deezer. TIDAL is catalog-only — never play PREVIEW.
-        let enriched = await enrichTrackMetadata(track)
+        //
+        // Enrichment used to run unconditionally in front of Amazon, but Amazon
+        // matches on title/artist/album/duration and never reads the ISRC — only
+        // Deezer needs it. Search cards routinely omit the ISRC, so every play
+        // paid for an `/info/` fan-out across the whole instance pool (1.2s hedge
+        // per host, 12s ceiling) before Amazon was even asked. With the pool
+        // currently answering `Upstream API error`, that was a flat multi-second
+        // stall in front of the one provider that still works. Fetch only what
+        // the leg about to run actually needs.
+        var enriched = track.duration > 0 ? track : await enrichTrackMetadata(track)
         var amazonError: Error?
         do {
             return try await resolveAmazonStream(for: enriched, quality: quality)
         } catch {
             amazonError = error
             // Fall through to Deezer like web when Amazon is rate-limited / unavailable.
+        }
+        // Deezer keys off the ISRC, so pay for the lookup here instead.
+        if enriched.isrc?.isEmpty != false {
+            enriched = await enrichTrackMetadata(enriched)
         }
         do {
             return try await resolveDeezerStream(for: enriched, quality: quality)
@@ -152,7 +154,9 @@ final class MusicService {
         }
     }
 
-    /// Pull ISRC / duration when search cards omit them (needed for Deezer/Amazon lookup).
+    /// Pull ISRC / duration when search cards omit them. The ISRC is what the
+    /// Deezer leg keys on; Amazon only benefits from the duration, so callers
+    /// should reach for this lazily rather than in front of every play.
     private func enrichTrackMetadata(_ track: Track) async -> Track {
         if let isrc = track.isrc, !isrc.isEmpty, track.duration > 0 { return track }
         guard let object = try? await json(path: "/info/?id=\(track.playbackID.urlQueryEncoded)", cacheable: true) else {
@@ -207,6 +211,11 @@ final class MusicService {
             // one request window. Errors reject in tens of milliseconds, so a
             // timeout means work in progress, not a dead endpoint — give it one
             // more window before handing the track to Deezer.
+            //
+            // The retry window is shorter than the first: the first request has
+            // already warmed the instance, and two full 30s windows back to back
+            // put a minute of silence in front of a track that was going to fail
+            // anyway.
             do {
                 return try await fetchAmazonTrack(
                     title: title,
@@ -216,7 +225,8 @@ final class MusicService {
                     quality: quality,
                     apiBase: apiBase,
                     bypass: bypass,
-                    jwt: jwt
+                    jwt: jwt,
+                    timeout: 20
                 )
             } catch let retryError as URLError where retryError.code == .timedOut {
                 throw ServiceError.unavailable("Amazon track lookup timed out twice at \(apiBase)")
@@ -253,7 +263,8 @@ final class MusicService {
         quality: PlaybackQuality,
         apiBase: String,
         bypass: String,
-        jwt: String?
+        jwt: String?,
+        timeout: TimeInterval = 30
     ) async throws -> StreamResponse {
         var components = URLComponents(string: apiBase + "/api/track/")
         var items = [
@@ -275,7 +286,7 @@ final class MusicService {
         // timeout drops the track to Deezer, whose account pool is frequently
         // dead, so the user sees "no stream" for a request Amazon would have
         // answered a few seconds later.
-        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         applyMonochromeOrigin(to: &request)
         if let jwt, !jwt.isEmpty {
@@ -324,8 +335,23 @@ final class MusicService {
             peak: nil,
             isPreview: false,
             previewReason: nil,
-            mediaDuration: duration > 0 ? duration : nil
+            mediaDuration: duration > 0 ? duration : nil,
+            qualityDetail: Self.amazonQualityDetail(payload, selected: selected)
         )
+    }
+
+    /// `24/96`-style detail for the tier Amazon actually served, read off the
+    /// `available_qualities` entry that matches `quality_selected` (web's
+    /// `getAmazonSelectedQualityInfo`).
+    private static func amazonQualityDetail(_ payload: [String: Any], selected: String) -> String? {
+        guard let entries = payload["available_qualities"] as? [[String: Any]] else { return nil }
+        let match = entries.first { ($0["quality"] as? String) == selected } ?? entries.first
+        guard let match,
+              let bitDepth = (match["bitDepth"] ?? match["bit_depth"]) as? NSNumber,
+              let sampleRate = (match["sampleRate"] ?? match["sample_rate"]) as? NSNumber else { return nil }
+        let kHz = sampleRate.doubleValue / 1000
+        let rate = kHz == 44.1 ? "44.1" : String(Int(kHz.rounded()))
+        return "\(bitDepth.intValue)/\(rate)"
     }
 
     private func resolveDeezerStream(for track: Track, quality: PlaybackQuality) async throws -> StreamResponse {
@@ -518,24 +544,59 @@ final class MusicService {
         return ["m4a", "mp3", "aac", "flac", "ogg", "wav", "mp4", "m3u8", "mpd"].contains(ext)
     }
 
+    /// How long a given instance gets to prove itself before the next one is also
+    /// allowed into the race. Healthy instances answer well inside this, so the
+    /// common case still costs exactly one request.
+    private static let instanceHedgeDelay: Double = 1.2
+
+    /// The instance pool is wildly uneven: some hosts answer in a few hundred
+    /// milliseconds, others are cold and hold the connection open until the timeout.
+    /// Walking them strictly in order meant one dead leader cost a full 12s before
+    /// the second was even attempted — with several dead, the wait in front of a
+    /// track ran into minutes. Hedge instead: stagger the fan-out and take the first
+    /// instance that returns usable JSON, cancelling the rest.
     private func json(path: String, streaming: Bool = false, cacheable: Bool = true) async throws -> Any {
         let cacheKey = path as NSString
         if cacheable, let data = cache.object(forKey: cacheKey) { return try JSONSerialization.jsonObject(with: data as Data) }
-        let bases = streaming ? streamInstances : apiInstances
-        var latestError: Error = ServiceError.invalidResponse
-        for base in bases {
-            guard let url = URL(string: base.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + path) else { continue }
-            do {
-                var request = URLRequest(url: url, cachePolicy: .returnCacheDataElseLoad, timeoutInterval: streaming ? 8 : 12)
-                request.setValue("application/json", forHTTPHeaderField: "Accept")
-                let (data, response) = try await session.data(for: request)
-                try validate(response)
-                let object = try JSONSerialization.jsonObject(with: data)
-                if cacheable { cache.setObject(data as NSData, forKey: cacheKey) }
-                return object
-            } catch { latestError = error }
+        let bases = await InstanceDirectory.shared.bases(streaming: streaming)
+        let timeout: TimeInterval = streaming ? 8 : 12
+        let hedgeDelay = Self.instanceHedgeDelay
+        let session = self.session
+
+        let winner = await withTaskGroup(of: Data?.self) { group -> Data? in
+            var launched = 0
+            for base in bases {
+                guard let url = URL(string: base.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + path) else { continue }
+                let headStart = Double(launched) * hedgeDelay
+                launched += 1
+                group.addTask {
+                    if headStart > 0 {
+                        try? await Task.sleep(nanoseconds: UInt64(headStart * 1_000_000_000))
+                    }
+                    guard !Task.isCancelled else { return nil }
+                    var request = URLRequest(url: url, cachePolicy: .returnCacheDataElseLoad, timeoutInterval: timeout)
+                    request.setValue("application/json", forHTTPHeaderField: "Accept")
+                    guard let fetched = try? await session.data(for: request),
+                          let http = fetched.1 as? HTTPURLResponse,
+                          (200..<300).contains(http.statusCode),
+                          (try? JSONSerialization.jsonObject(with: fetched.0)) != nil else { return nil }
+                    return fetched.0
+                }
+            }
+            for await result in group {
+                if let result {
+                    group.cancelAll()
+                    return result
+                }
+            }
+            return nil
         }
-        throw latestError
+
+        guard let data = winner else {
+            throw ServiceError.unavailable("No configured instance answered \(path).")
+        }
+        if cacheable { cache.setObject(data as NSData, forKey: cacheKey) }
+        return try JSONSerialization.jsonObject(with: data)
     }
 
     private func scopedSearch(path: String) async -> Any? { try? await json(path: path, cacheable: false) }
@@ -746,4 +807,127 @@ final class MusicService {
 
 private extension String {
     var urlQueryEncoded: String { addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? self }
+}
+
+/// The instance pool rotates far faster than the app ships. Web reads
+/// `monochrome.tf/instances.json` on every load; native pinned a build-time copy
+/// and had already drifted from it (`hifi.p1nkhamster.com` where the document
+/// says `.xyz`, no `katze.qqdl.site`, no `tidal.kinoplus.online`), so native was
+/// racing hosts the project had already rotated out. Read the same document,
+/// persist the last good answer, and keep the compiled list only as a seed for
+/// the very first launch.
+actor InstanceDirectory {
+    static let shared = InstanceDirectory()
+
+    /// Only used until the first successful fetch, or if the document is
+    /// unreachable on a device that has never fetched it.
+    private static let seedAPI = [
+        "https://eu-central.monochrome.tf", "https://us-west.monochrome.tf",
+        "https://arran.monochrome.tf", "https://api.monochrome.tf",
+        "https://monochrome-api.samidy.com", "https://triton.squid.wtf",
+        "https://wolf.qqdl.site", "https://maus.qqdl.site", "https://vogel.qqdl.site",
+        "https://hund.qqdl.site", "https://tidal.kinoplus.online",
+    ]
+    private static let seedStreaming = [
+        "https://arran.monochrome.tf", "https://triton.squid.wtf", "https://wolf.qqdl.site",
+        "https://maus.qqdl.site", "https://vogel.qqdl.site", "https://katze.qqdl.site",
+        "https://hund.qqdl.site", "https://hifi.p1nkhamster.xyz",
+    ]
+
+    /// The official mirrors all serve the same document; the primary going down
+    /// is exactly when a fresh list matters most.
+    private static let documentURLs = [
+        "https://monochrome.tf/instances.json",
+        "https://lossless.wtf/instances.json",
+        "https://monochrome.samidy.com/instances.json",
+    ]
+
+    private static let apiKey = "native.instances.api"
+    private static let streamingKey = "native.instances.streaming"
+    private static let fetchedAtKey = "native.instances.fetchedAt"
+    private static let ttl: TimeInterval = 6 * 3600
+
+    private var api: [String]
+    private var streaming: [String]
+    private var fetchedAt: Date
+    private var refreshTask: Task<Void, Never>?
+
+    init() {
+        let defaults = UserDefaults.standard
+        let storedAPI = Self.normalize(defaults.stringArray(forKey: Self.apiKey) ?? [])
+        let storedStreaming = Self.normalize(defaults.stringArray(forKey: Self.streamingKey) ?? [])
+        api = storedAPI.isEmpty ? Self.seedAPI : storedAPI
+        streaming = storedStreaming.isEmpty ? Self.seedStreaming : storedStreaming
+        let stamp = defaults.double(forKey: Self.fetchedAtKey)
+        fetchedAt = stamp > 0 ? Date(timeIntervalSince1970: stamp) : .distantPast
+    }
+
+    /// Never waits on the network. Answers from the persisted (or seeded) pool
+    /// and refreshes behind the caller, so wiring this in cannot add latency to
+    /// the request the user is actually waiting on.
+    func bases(streaming wantStreaming: Bool) -> [String] {
+        refreshIfStale()
+        return wantStreaming ? streaming : api
+    }
+
+    /// Call at launch so the first search already runs against a current pool.
+    func refreshIfStale() {
+        guard refreshTask == nil, Date().timeIntervalSince(fetchedAt) > Self.ttl else { return }
+        refreshTask = Task { [weak self] in
+            await self?.refresh()
+            await self?.clearRefreshTask()
+        }
+    }
+
+    private func clearRefreshTask() { refreshTask = nil }
+
+    private func refresh() async {
+        for candidate in Self.documentURLs {
+            guard let url = URL(string: candidate) else { continue }
+            var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 8)
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            guard let fetched = try? await URLSession.shared.data(for: request),
+                  let http = fetched.1 as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  let object = (try? JSONSerialization.jsonObject(with: fetched.0)) as? [String: Any]
+            else { continue }
+
+            let freshAPI = Self.normalize(object["api"] as? [String] ?? [])
+            let freshStreaming = Self.normalize(object["streaming"] as? [String] ?? [])
+            // A mirror that answers with an empty or malformed list must not be
+            // allowed to erase a working pool.
+            guard !freshAPI.isEmpty || !freshStreaming.isEmpty else { continue }
+
+            if !freshAPI.isEmpty {
+                api = freshAPI
+                UserDefaults.standard.set(freshAPI, forKey: Self.apiKey)
+            }
+            if !freshStreaming.isEmpty {
+                streaming = freshStreaming
+                UserDefaults.standard.set(freshStreaming, forKey: Self.streamingKey)
+            }
+            fetchedAt = Date()
+            UserDefaults.standard.set(fetchedAt.timeIntervalSince1970, forKey: Self.fetchedAtKey)
+            return
+        }
+    }
+
+    /// The document ships trailing slashes on some entries (`api.monochrome.tf/`,
+    /// `hifi.p1nkhamster.xyz/`) and `json(path:)` concatenates paths directly.
+    /// Internal rather than private so the parsing contract can be tested without
+    /// standing up a network fetch.
+    static func normalize(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for value in values {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            guard let url = URL(string: trimmed),
+                  let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http",
+                  url.host?.isEmpty == false,
+                  seen.insert(trimmed).inserted else { continue }
+            result.append(trimmed)
+        }
+        return result
+    }
 }

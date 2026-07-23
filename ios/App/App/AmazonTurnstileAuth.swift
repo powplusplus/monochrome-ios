@@ -26,8 +26,14 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
     private var continuation: CheckedContinuation<String, Error>?
     private var timeoutItem: DispatchWorkItem?
     private var inFlight: Task<String, Error>?
+    /// Whether the solve currently in flight is allowed to put a challenge card
+    /// on screen. A silent prewarm must never be reused to satisfy a caller that
+    /// the user is actively waiting on — see `accessToken`.
+    private var inFlightAllowsInteractive = true
+    private var inFlightGeneration = 0
     private var mode: ChallengeMode = .interactionOnly
     private var siteKeyForRetry: String = ""
+    private var allowInteractive = true
 
     func cachedJWT() -> String? {
         let jwt = UserDefaults.standard.string(forKey: jwtKey) ?? ""
@@ -41,17 +47,53 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         UserDefaults.standard.removeObject(forKey: expiryKey)
     }
 
+    /// Solve the challenge ahead of time so the first play does not pay for it.
+    ///
+    /// Amazon is gated: every `/api/track/` call 428s until a JWT exists, so the
+    /// very first track of a session waited on a WKWebView boot plus a full
+    /// Cloudflare round trip before the lookup even started. That work does not
+    /// depend on which track is chosen, so do it while the user is still
+    /// browsing. Silent by construction — if Cloudflare wants a tap, this gives
+    /// up rather than throwing a verification card at someone who has not asked
+    /// for anything yet, and the interactive path runs as before on first play.
+    func prewarm() {
+        guard PlaybackSourceSettings.amazonEnabled,
+              PlaybackSourceSettings.amazonBypassToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              cachedJWT() == nil,
+              inFlight == nil else { return }
+        let base = PlaybackSourceSettings.amazonApiBaseURL
+        Task { [weak self] in
+            // The solve puts an alert-level window on screen (transparent, and
+            // non-interactive, but still key). Let the app finish presenting its
+            // own UI before doing that at launch.
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard let self, self.cachedJWT() == nil, self.inFlight == nil else { return }
+            _ = try? await self.accessToken(apiBaseURL: base, allowInteractive: false, timeout: 15)
+        }
+    }
+
     func accessToken(
         apiBaseURL: String,
         siteKey: String = PlaybackSourceSettings.amazonTurnstileSiteKey,
-        forceRefresh: Bool = false
+        forceRefresh: Bool = false,
+        allowInteractive: Bool = true,
+        timeout: TimeInterval = 60
     ) async throws -> String {
         if !forceRefresh, let cached = cachedJWT() { return cached }
-        if let inFlight, !forceRefresh { return try await inFlight.value }
+        // Only ride along on a solve that is at least as capable as this one
+        // needs. Without this check a play tapped during a silent prewarm would
+        // inherit the prewarm's failure and never get its own visible attempt.
+        if let inFlight, !forceRefresh, inFlightAllowsInteractive || !allowInteractive {
+            return try await inFlight.value
+        }
 
         let task = Task<String, Error> {
             if forceRefresh { clearCache() }
-            let turnstileToken = try await solveTurnstile(siteKey: siteKey)
+            let turnstileToken = try await solveTurnstile(
+                siteKey: siteKey,
+                allowInteractive: allowInteractive,
+                timeout: timeout
+            )
             let base = apiBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             guard let url = URL(string: base + "/api/auth/turnstile") else {
                 throw ServiceError.invalidResponse
@@ -90,8 +132,16 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
             UserDefaults.standard.set(expiry, forKey: expiryKey)
             return jwt
         }
+        // An interactive caller that refuses to ride along on a silent prewarm
+        // replaces `inFlight`. The prewarm's own `defer` then runs *after* that
+        // swap, so clearing unconditionally would drop the live solve on the
+        // floor and let a third caller start a second WKWebView. Only the task
+        // that still owns the slot may clear it.
+        inFlightGeneration &+= 1
+        let generation = inFlightGeneration
         inFlight = task
-        defer { inFlight = nil }
+        inFlightAllowsInteractive = allowInteractive
+        defer { if inFlightGeneration == generation { inFlight = nil } }
         return try await task.value
     }
 
@@ -196,12 +246,17 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         """
     }
 
-    private func solveTurnstile(siteKey: String) async throws -> String {
+    private func solveTurnstile(
+        siteKey: String,
+        allowInteractive: Bool,
+        timeout: TimeInterval
+    ) async throws -> String {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
             self.finishPending(with: .failure(CancellationError()))
             self.continuation = continuation
             self.siteKeyForRetry = siteKey
             self.mode = .interactionOnly
+            self.allowInteractive = allowInteractive
 
             guard Self.foregroundWindowScene != nil else {
                 self.continuation = nil
@@ -211,11 +266,11 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
 
             presentChallenge(siteKey: siteKey, mode: .interactionOnly, showOverlay: false)
 
-            let timeout = DispatchWorkItem { [weak self] in
+            let deadline = DispatchWorkItem { [weak self] in
                 self?.finishPending(with: .failure(ServiceError.unavailable("Amazon Turnstile timed out")))
             }
-            timeoutItem = timeout
-            DispatchQueue.main.asyncAfter(deadline: .now() + 60, execute: timeout)
+            timeoutItem = deadline
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: deadline)
         }
     }
 
@@ -278,6 +333,10 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
     }
 
     private func retryVisibleFallback() {
+        guard allowInteractive else {
+            finishPending(with: .failure(ServiceError.unavailable("Amazon Turnstile needs interaction")))
+            return
+        }
         guard mode == .interactionOnly else {
             finishPending(with: .failure(ServiceError.unavailable("Amazon Turnstile: turnstile_failed")))
             return
@@ -293,6 +352,12 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
                 return
             }
             if body["interactive"] as? Bool == true {
+                // A silent prewarm bows out here rather than surfacing a card the
+                // user never asked for; first play then solves it interactively.
+                guard allowInteractive else {
+                    finishPending(with: .failure(ServiceError.unavailable("Amazon Turnstile needs interaction")))
+                    return
+                }
                 revealOverlay()
                 return
             }
