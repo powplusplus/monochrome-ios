@@ -38,7 +38,12 @@ enum AmazonCencDecryptor {
             }
 
             let box = data.subdata(in: offset..<(offset + boxSize))
-            if type == "trun" {
+            if type == "tfhd" {
+                // `trun` may omit per-sample sizes and defer to tfhd's
+                // default_sample_size; without it those samples stay encrypted.
+                if let size = parseTfhdDefaultSampleSize(box) { defaultSampleSize = size }
+                output.append(box)
+            } else if type == "trun" {
                 parseTrun(box, sampleSizes: &sampleSizes, defaultSampleSize: &defaultSampleSize)
                 output.append(box)
             } else if type == "senc" {
@@ -187,6 +192,17 @@ enum AmazonCencDecryptor {
             return (data.count - offset, 8, type)
         }
         return (size32, 8, type)
+    }
+
+    private static func parseTfhdDefaultSampleSize(_ box: Data) -> Int? {
+        guard box.count >= 16 else { return nil }
+        let flags = Int(readUInt32(box, 8) & 0x00FF_FFFF)
+        var offset = 16 // 8 header + 4 version/flags + 4 track_ID
+        if flags & 0x000001 != 0 { offset += 8 } // base_data_offset
+        if flags & 0x000002 != 0 { offset += 4 } // sample_description_index
+        if flags & 0x000008 != 0 { offset += 4 } // default_sample_duration
+        guard flags & 0x000010 != 0, offset + 4 <= box.count else { return nil } // default_sample_size
+        return Int(readUInt32(box, offset))
     }
 
     private static func parseTrun(_ box: Data, sampleSizes: inout [Int], defaultSampleSize: inout Int) {
