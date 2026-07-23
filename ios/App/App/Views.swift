@@ -844,7 +844,7 @@ struct NowPlayingView: View {
                     Text(resolvedQuality.title.uppercased())
                 }
                 .font(.caption2.weight(.semibold))
-                .tracking(1.0)
+                .kerning(1.0)
                 .foregroundStyle(resolvedQuality == .hiResLossless ? Color(red: 0.85, green: 0.68, blue: 0.24) : .secondary)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
