@@ -1,6 +1,5 @@
 import SwiftUI
 import AVKit
-import WebKit
 
 struct RootView: View {
     var body: some View {
@@ -23,7 +22,6 @@ private struct ModernRootShell: View {
             Tab("Home", systemImage: "house.fill", value: .home) { HomeView() }
             Tab("Library", systemImage: "music.note.list", value: .library) { LibraryView() }
             Tab("Search", systemImage: "magnifyingglass", value: .search) { SearchView() }
-            Tab("All Features", systemImage: "square.grid.2x2.fill", value: .features) { FullFeatureView() }
             Tab("Settings", systemImage: "gearshape.fill", value: .settings) { SettingsView() }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
@@ -45,7 +43,6 @@ private struct CompatibleRootShell: View {
                 HomeView().tabItem { Label("Home", systemImage: "house.fill") }.tag(AppTab.home)
                 LibraryView().tabItem { Label("Library", systemImage: "music.note.list") }.tag(AppTab.library)
                 SearchView().tabItem { Label("Search", systemImage: "magnifyingglass") }.tag(AppTab.search)
-                FullFeatureView().tabItem { Label("All Features", systemImage: "square.grid.2x2.fill") }.tag(AppTab.features)
                 SettingsView().tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(AppTab.settings)
             }
             if playback.currentTrack != nil {
@@ -59,7 +56,7 @@ private struct CompatibleRootShell: View {
 }
 
 enum AppTab: String, CaseIterable, Identifiable {
-    case home, library, search, features, settings
+    case home, library, search, settings
 
     var id: String { rawValue }
     var title: String { rawValue.capitalized }
@@ -68,7 +65,6 @@ enum AppTab: String, CaseIterable, Identifiable {
         case .home: return "house.fill"
         case .library: return "music.note.list"
         case .search: return "magnifyingglass"
-        case .features: return "square.grid.2x2.fill"
         case .settings: return "gearshape.fill"
         }
     }
@@ -147,50 +143,6 @@ struct LiquidTabBar: View {
         }
         .padding(6)
         .liquidGlass(cornerRadius: 25, strong: true)
-    }
-}
-
-/// Keeps the complete Monochrome client available while native screens are
-/// progressively enhanced. Visualizers, podcasts, listening parties, imports,
-/// playlist folders, profiles, lyrics, EQ/AutoEQ and the advanced settings all
-/// remain reachable instead of being discarded by the Apple-native shell.
-struct FullFeatureView: View {
-    var body: some View {
-        NavigationView {
-            MonochromeWebView()
-                .ignoresSafeArea(.container, edges: .bottom)
-                .navigationTitle("All Features")
-                .navigationBarTitleDisplayMode(.inline)
-        }
-        .navigationViewStyle(.stack)
-    }
-}
-
-private struct MonochromeWebView: UIViewRepresentable {
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    func makeUIView(context: Context) -> WKWebView {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-        configuration.allowsInlineMediaPlayback = true
-        configuration.mediaTypesRequiringUserActionForPlayback = []
-        let view = WKWebView(frame: .zero, configuration: configuration)
-        view.navigationDelegate = context.coordinator
-        view.uiDelegate = context.coordinator
-        view.allowsBackForwardNavigationGestures = true
-        view.scrollView.contentInsetAdjustmentBehavior = .automatic
-        view.load(URLRequest(url: URL(string: "https://monochrome.tf/")!, cachePolicy: .returnCacheDataElseLoad))
-        return view
-    }
-
-    func updateUIView(_ view: WKWebView, context: Context) {}
-
-    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
-        func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
-                     for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-            if let url = navigationAction.request.url { webView.load(URLRequest(url: url)) }
-            return nil
-        }
     }
 }
 
@@ -350,7 +302,7 @@ struct SettingsView: View {
                     HStack { Text("Legacy migration"); Spacer(); migrationLabel }
                     Button("Retry legacy migration") { library.migrateLegacyIfNeeded(force: true) }.disabled(library.migrationState == .running)
                 }
-                Section { Text("Native SwiftUI · iOS 15+").foregroundColor(.secondary) } footer: { Text("Core listening uses native SwiftUI. All Features securely opens the complete Monochrome client so advanced tools remain available during the native transition.") }
+                Section { Text("Native SwiftUI · iOS 15+").foregroundColor(.secondary) } footer: { Text("Core listening uses native SwiftUI.") }
             }.navigationTitle("Settings")
         }.navigationViewStyle(.stack).preferredColorScheme(darkAppearance ? .dark : nil)
     }
@@ -490,65 +442,237 @@ struct NowPlayingView: View {
     @EnvironmentObject private var playback: PlaybackEngine
     @EnvironmentObject private var library: LibraryRepository
     @State private var showQueue = false
+
     var body: some View {
         GeometryReader { geometry in
-            let artworkSize = min(geometry.size.width - 48, min(geometry.size.height * 0.43, 380))
+            let landscape = geometry.size.width > geometry.size.height
             ZStack {
-                Color.black.ignoresSafeArea()
-                ArtworkView(url: playback.currentTrack?.artworkURL)
-                    .scaledToFill()
-                    .blur(radius: 90)
-                    .saturation(1.1)
-                    .opacity(0.24)
-                    .scaleEffect(1.3)
-                    .ignoresSafeArea()
-                LinearGradient(colors: [.black.opacity(0.18), .black.opacity(0.72)], startPoint: .top, endPoint: .bottom).ignoresSafeArea()
+                backdrop
                 VStack(spacing: 0) {
-                    HStack {
-                        Button { dismiss() } label: {
-                            Image(systemName: "chevron.down")
-                                .font(.headline)
-                                .frame(width: 40, height: 40)
-                                .background(.thinMaterial, in: Circle())
-                        }
-                        .accessibilityLabel("Close player")
-                        Spacer()
-                        Text("NOW PLAYING")
-                            .font(.caption2.weight(.semibold))
-                            .tracking(1.2)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Color.clear.frame(width: 40, height: 40)
-                    }
-                    .padding(.horizontal, 18)
-                    .padding(.top, 8)
-                    ScrollView(.vertical, showsIndicators: false) {
-                        VStack(spacing: 28) {
-                            artwork
-                                .frame(width: artworkSize, height: artworkSize)
-                                .padding(.top, 18)
-                            controls
-                        }
-                        .frame(maxWidth: 520)
-                        .padding(.horizontal, 28)
-                        .padding(.bottom, max(18, geometry.safeAreaInsets.bottom))
-                        .frame(maxWidth: .infinity)
+                    header
+                    if landscape {
+                        landscapeLayout(in: geometry)
+                    } else {
+                        portraitLayout(in: geometry)
                     }
                 }
             }
-        }.preferredColorScheme(.dark).sheet(isPresented: $showQueue) { QueueView() }
+        }
+        .preferredColorScheme(.dark)
+        .sheet(isPresented: $showQueue) { QueueView() }
     }
-    private var artwork: some View { ArtworkView(url: playback.currentTrack?.artworkURL).aspectRatio(1, contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous)).overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.10), lineWidth: 0.5)).shadow(color: .black.opacity(0.42), radius: 28, y: 16) }
-    private var controls: some View {
-        VStack(spacing: 20) {
-            HStack { VStack(alignment: .leading, spacing: 4) { Text(playback.currentTrack?.title ?? "Not Playing").font(.title3.bold()).lineLimit(1); Text(playback.currentTrack?.artist.name ?? "").foregroundColor(.secondary).lineLimit(1) }; Spacer(); Button { if let track = playback.currentTrack { library.toggleFavorite(track) } } label: { Image(systemName: playback.currentTrack.map(library.isFavorite) == true ? "heart.fill" : "heart").font(.title2).foregroundColor(.pink) } }
-            VStack(spacing: 7) { Slider(value: Binding(get: { playback.elapsed }, set: { playback.seek(to: $0) }), in: 0...max(playback.duration, 1)); HStack { Text(time(playback.elapsed)); Spacer(); Text("−\(time(max(0, playback.duration - playback.elapsed)))") }.font(.caption2.monospacedDigit()).foregroundColor(.secondary) }
-            HStack { Button { playback.shuffleEnabled.toggle() } label: { Image(systemName: "shuffle").foregroundColor(playback.shuffleEnabled ? .pink : .primary) }; Spacer(); Button { playback.previous() } label: { Image(systemName: "backward.fill").font(.title) }; Spacer(); Button { playback.playPause() } label: { ZStack { Circle().fill(Color.primary); Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill").font(.title).foregroundColor(Color(UIColor.systemBackground)) }.frame(width: 68, height: 68) }; Spacer(); Button { playback.next() } label: { Image(systemName: "forward.fill").font(.title) }; Spacer(); Button { playback.repeatMode = playback.repeatMode == .off ? .all : playback.repeatMode == .all ? .one : .off } label: { Image(systemName: playback.repeatMode == .one ? "repeat.1" : "repeat").foregroundColor(playback.repeatMode == .off ? .primary : .pink) } }.buttonStyle(.plain)
-            HStack { RoutePickerView().frame(width: 42, height: 32); Spacer(); Menu { ForEach([Float(0.75), 1, 1.25, 1.5, 2], id: \.self) { rate in Button("\(rate.formatted(.number.precision(.fractionLength(0...2))))×") { playback.playbackRate = rate } } } label: { Label("\(playback.playbackRate.formatted(.number.precision(.fractionLength(0...2))))×", systemImage: "speedometer") }; Spacer(); Button { showQueue = true } label: { Image(systemName: "list.bullet") }.accessibilityLabel("Queue") }
-            if let message = playback.errorMessage { Text(message).font(.footnote).foregroundColor(.red).multilineTextAlignment(.center) }
+
+    private var backdrop: some View {
+        ZStack {
+            Color.black
+            ArtworkView(url: playback.currentTrack?.artworkURL)
+                .scaledToFill()
+                .blur(radius: 90)
+                .saturation(1.1)
+                .opacity(0.24)
+                .scaleEffect(1.3)
+            LinearGradient(
+                colors: [.black.opacity(0.18), .black.opacity(0.72)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        }
+        .ignoresSafeArea()
+        .clipped()
+    }
+
+    private var header: some View {
+        HStack {
+            Button { dismiss() } label: {
+                Image(systemName: "chevron.down")
+                    .font(.headline)
+                    .frame(width: 40, height: 40)
+                    .background(.thinMaterial, in: Circle())
+            }
+            .accessibilityLabel("Close player")
+            Spacer()
+            Text("NOW PLAYING")
+                .font(.caption2.weight(.semibold))
+                .tracking(1.2)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Color.clear.frame(width: 40, height: 40)
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 8)
+    }
+
+    private func portraitLayout(in geometry: GeometryProxy) -> some View {
+        let sideInset: CGFloat = 28
+        let availableWidth = max(0, geometry.size.width - (sideInset * 2))
+        let chromeHeight: CGFloat = 56 + geometry.safeAreaInsets.top
+        let controlsBudget: CGFloat = 300 + max(18, geometry.safeAreaInsets.bottom)
+        let availableHeight = max(0, geometry.size.height - chromeHeight)
+        // Shrink art to keep transport visible without scrolling on short phones.
+        let artSide = min(availableWidth, min(max(168, availableHeight - controlsBudget), 380))
+        let needsScroll = artSide + controlsBudget + 40 > availableHeight
+
+        return Group {
+            if needsScroll {
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(spacing: 24) {
+                        artwork
+                            .frame(width: min(artSide, 280), height: min(artSide, 280))
+                            .padding(.top, 12)
+                        controls
+                    }
+                    .frame(maxWidth: 520)
+                    .padding(.horizontal, sideInset)
+                    .padding(.bottom, max(18, geometry.safeAreaInsets.bottom))
+                    .frame(maxWidth: .infinity)
+                }
+            } else {
+                VStack(spacing: 0) {
+                    artwork
+                        .frame(width: artSide, height: artSide)
+                        .padding(.top, 18)
+                    Spacer(minLength: 20)
+                    controls
+                        .padding(.horizontal, sideInset)
+                        .padding(.bottom, max(18, geometry.safeAreaInsets.bottom))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         }
     }
-    private func time(_ seconds: Double) -> String { let value = Int(seconds.isFinite ? seconds : 0); return String(format: "%d:%02d", value / 60, value % 60) }
+
+    private func landscapeLayout(in geometry: GeometryProxy) -> some View {
+        let horizontalPad = max(24, geometry.safeAreaInsets.leading + 12)
+        let usableHeight = max(160, geometry.size.height - 64 - geometry.safeAreaInsets.bottom)
+        let artSide = min(usableHeight, min(geometry.size.width * 0.38, 320))
+
+        return HStack(alignment: .center, spacing: 24) {
+            artwork
+                .frame(width: artSide, height: artSide)
+            ScrollView(.vertical, showsIndicators: false) {
+                controls
+                    .frame(maxWidth: 460)
+                    .padding(.vertical, 8)
+            }
+            .frame(maxHeight: .infinity)
+        }
+        .padding(.horizontal, horizontalPad)
+        .padding(.trailing, max(16, geometry.safeAreaInsets.trailing))
+        .padding(.bottom, max(8, geometry.safeAreaInsets.bottom))
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var artwork: some View {
+        ArtworkView(url: playback.currentTrack?.artworkURL)
+            .aspectRatio(1, contentMode: .fit)
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.10), lineWidth: 0.5))
+            .shadow(color: .black.opacity(0.42), radius: 28, y: 16)
+    }
+
+    private var controls: some View {
+        VStack(spacing: 18) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(playback.currentTrack?.title ?? "Not Playing")
+                        .font(.title3.bold())
+                        .lineLimit(1)
+                    Text(playback.currentTrack?.artist.name ?? "")
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 12)
+                Button {
+                    if let track = playback.currentTrack { library.toggleFavorite(track) }
+                } label: {
+                    Image(systemName: playback.currentTrack.map(library.isFavorite) == true ? "heart.fill" : "heart")
+                        .font(.title2)
+                        .foregroundColor(.pink)
+                }
+            }
+
+            VStack(spacing: 7) {
+                Slider(
+                    value: Binding(get: { playback.elapsed }, set: { playback.seek(to: $0) }),
+                    in: 0...max(playback.duration, 1)
+                )
+                HStack {
+                    Text(time(playback.elapsed))
+                    Spacer()
+                    Text("−\(time(max(0, playback.duration - playback.elapsed)))")
+                }
+                .font(.caption2.monospacedDigit())
+                .foregroundColor(.secondary)
+            }
+
+            HStack {
+                Button { playback.shuffleEnabled.toggle() } label: {
+                    Image(systemName: "shuffle")
+                        .foregroundColor(playback.shuffleEnabled ? .pink : .primary)
+                }
+                Spacer()
+                Button { playback.previous() } label: {
+                    Image(systemName: "backward.fill").font(.title)
+                }
+                Spacer()
+                Button { playback.playPause() } label: {
+                    ZStack {
+                        Circle().fill(Color.primary)
+                        Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
+                            .font(.title)
+                            .foregroundColor(Color(UIColor.systemBackground))
+                    }
+                    .frame(width: 68, height: 68)
+                }
+                Spacer()
+                Button { playback.next() } label: {
+                    Image(systemName: "forward.fill").font(.title)
+                }
+                Spacer()
+                Button {
+                    playback.repeatMode = playback.repeatMode == .off ? .all : playback.repeatMode == .all ? .one : .off
+                } label: {
+                    Image(systemName: playback.repeatMode == .one ? "repeat.1" : "repeat")
+                        .foregroundColor(playback.repeatMode == .off ? .primary : .pink)
+                }
+            }
+            .buttonStyle(.plain)
+
+            HStack {
+                RoutePickerView().frame(width: 42, height: 32)
+                Spacer()
+                Menu {
+                    ForEach([Float(0.75), 1, 1.25, 1.5, 2], id: \.self) { rate in
+                        Button("\(rate.formatted(.number.precision(.fractionLength(0...2))))×") {
+                            playback.playbackRate = rate
+                        }
+                    }
+                } label: {
+                    Label(
+                        "\(playback.playbackRate.formatted(.number.precision(.fractionLength(0...2))))×",
+                        systemImage: "speedometer"
+                    )
+                }
+                Spacer()
+                Button { showQueue = true } label: {
+                    Image(systemName: "list.bullet")
+                }
+                .accessibilityLabel("Queue")
+            }
+
+            if let message = playback.errorMessage {
+                Text(message)
+                    .font(.footnote)
+                    .foregroundColor(.red)
+                    .multilineTextAlignment(.center)
+            }
+        }
+    }
+
+    private func time(_ seconds: Double) -> String {
+        let value = Int(seconds.isFinite ? seconds : 0)
+        return String(format: "%d:%02d", value / 60, value % 60)
+    }
 }
 
 struct QueueView: View {
@@ -597,7 +721,27 @@ struct MediaSection<Content: View>: View {
 
 struct HorizontalTrackShelf: View {
     let tracks: [Track]
-    var body: some View { ScrollView(.horizontal, showsIndicators: false) { LazyHStack(spacing: 16) { ForEach(tracks) { track in VStack(alignment: .leading, spacing: 7) { ArtworkView(url: track.artworkURL).frame(width: 142, height: 142).clipShape(RoundedRectangle(cornerRadius: 10)); Text(track.title).font(.subheadline.weight(.medium)).lineLimit(1); Text(track.artist.name).font(.caption).foregroundColor(.secondary).lineLimit(1) }.frame(width: 142).contextMenu { TrackContextMenu(track: track) } } }.padding(.horizontal) } }
+    @EnvironmentObject private var playback: PlaybackEngine
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            LazyHStack(spacing: 16) {
+                ForEach(tracks) { track in
+                    Button { playback.play(track, in: tracks) } label: {
+                        VStack(alignment: .leading, spacing: 7) {
+                            ArtworkView(url: track.artworkURL).frame(width: 142, height: 142).clipShape(RoundedRectangle(cornerRadius: 10))
+                            Text(track.title).font(.subheadline.weight(.medium)).lineLimit(1)
+                            Text(track.artist.name).font(.caption).foregroundColor(.secondary).lineLimit(1)
+                        }
+                        .frame(width: 142)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .contextMenu { TrackContextMenu(track: track) }
+                }
+            }
+            .padding(.horizontal)
+        }
+    }
 }
 
 struct TrackContextMenu: View {

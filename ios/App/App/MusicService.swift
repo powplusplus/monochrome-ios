@@ -76,7 +76,11 @@ final class MusicService {
     }
 
     func resolveStream(for track: Track, quality: String = "HIGH") async throws -> StreamResponse {
-        if let url = track.streamURL { return StreamResponse(url: url, provider: track.provider, quality: quality, replayGain: nil, peak: nil) }
+        // Catalog payloads often include a webpage `url` (e.g. tidal.com/track/…) that
+        // was historically mapped into streamURL. Only short-circuit for real media.
+        if let url = track.streamURL, Self.isDirectMediaURL(url) {
+            return StreamResponse(url: url, provider: track.provider, quality: quality, replayGain: nil, peak: nil)
+        }
         // AVFoundation does not reliably play TIDAL's fragmented-MP4 FLAC
         // representation when it is exposed through a local HLS wrapper. Ask
         // for AAC-LC explicitly; this is iOS's native hardware-decoded path.
@@ -93,6 +97,12 @@ final class MusicService {
         let gain = (findValue(named: "replayGain", in: object) as? NSNumber)?.doubleValue
         let peak = (findValue(named: "peakAmplitude", in: object) as? NSNumber)?.doubleValue
         return StreamResponse(url: url, provider: track.provider, quality: quality, replayGain: gain, peak: peak)
+    }
+
+    private static func isDirectMediaURL(_ url: URL) -> Bool {
+        if url.isFileURL { return true }
+        let ext = url.pathExtension.lowercased()
+        return ["m4a", "mp3", "aac", "flac", "ogg", "wav", "mp4", "m3u8", "mpd"].contains(ext)
     }
 
     private func json(path: String, streaming: Bool = false, cacheable: Bool = true) async throws -> Any {

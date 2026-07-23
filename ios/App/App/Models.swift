@@ -198,7 +198,7 @@ enum ModelMapper {
         }
         let seconds = (dict["duration"] as? NSNumber)?.doubleValue ?? 0
         let prefixed = id.contains(":") ? id : "tidal:\(id)"
-        let directURL = string(dict, ["streamUrl", "streamURL", "url"]).flatMap(URL.init(string:))
+        let directURL = string(dict, ["streamUrl", "streamURL"]).flatMap(URL.init(string:))
         return Track(id: prefixed, title: title, artist: artist(artistValue), album: album, duration: seconds,
                      explicit: (dict["explicit"] as? Bool) ?? false,
                      audioQuality: string(dict, ["audioQuality", "quality"]), isrc: string(dict, ["isrc", "ISRC"]),
