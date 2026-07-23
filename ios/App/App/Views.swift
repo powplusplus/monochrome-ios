@@ -483,6 +483,21 @@ struct NowPlayingView: View {
     @State private var artDragOffset: CGFloat = 0
 
     var body: some View {
+        ZStack {
+            // Fixed black base so the dismiss drag never reveals a bare gap
+            // behind the shrinking/offset content below.
+            Color.black.ignoresSafeArea()
+            dismissDrivenBody
+        }
+        .preferredColorScheme(.dark)
+        .sheet(isPresented: $showQueue) { QueueView() }
+        .task(id: playback.currentTrack?.id) {
+            await loadLyrics()
+        }
+        .animation(.easeInOut(duration: 0.35), value: showLyrics)
+    }
+
+    private var dismissDrivenBody: some View {
         GeometryReader { geometry in
             let landscape = geometry.size.width > geometry.size.height
             let dismissProgress = min(max(dismissOffset / max(geometry.size.height * 0.42, 1), 0), 1)
@@ -509,12 +524,6 @@ struct NowPlayingView: View {
             .opacity(1 - dismissProgress * 0.45)
             .simultaneousGesture(dismissDrag(screenHeight: geometry.size.height))
         }
-        .preferredColorScheme(.dark)
-        .sheet(isPresented: $showQueue) { QueueView() }
-        .task(id: playback.currentTrack?.id) {
-            await loadLyrics()
-        }
-        .animation(.easeInOut(duration: 0.35), value: showLyrics)
     }
 
     private func finishDismiss(screenHeight: CGFloat) {
@@ -604,14 +613,14 @@ struct NowPlayingView: View {
                 .overlay {
                     ArtworkView(url: playback.currentTrack?.artworkURL)
                         .scaledToFill()
-                        .blur(radius: 90)
-                        .saturation(1.1)
-                        .opacity(0.24)
-                        .scaleEffect(1.3)
+                        .blur(radius: 70)
+                        .saturation(1.6)
+                        .opacity(0.85)
+                        .scaleEffect(1.35)
                 }
                 .clipped()
             LinearGradient(
-                colors: [.black.opacity(0.18), .black.opacity(0.72)],
+                colors: [.black.opacity(0.25), .black.opacity(0.4), .black.opacity(0.82)],
                 startPoint: .top,
                 endPoint: .bottom
             )
@@ -825,6 +834,23 @@ struct NowPlayingView: View {
                 .foregroundColor(.secondary)
             }
 
+            if let resolvedQuality {
+                HStack(spacing: 5) {
+                    if resolvedQuality == .lossless || resolvedQuality == .hiResLossless {
+                        QualityWaveMark()
+                            .stroke(style: StrokeStyle(lineWidth: 1.2, lineCap: .round))
+                            .frame(width: 20, height: 12)
+                    }
+                    Text(resolvedQuality.title.uppercased())
+                }
+                .font(.caption2.weight(.semibold))
+                .tracking(1.0)
+                .foregroundStyle(resolvedQuality == .hiResLossless ? Color(red: 0.85, green: 0.68, blue: 0.24) : .secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(.thinMaterial, in: Capsule())
+            }
+
             HStack {
                 Button { playback.shuffleEnabled.toggle() } label: {
                     Image(systemName: "shuffle")
@@ -889,6 +915,12 @@ struct NowPlayingView: View {
         }
     }
 
+    private var resolvedQuality: PlaybackQuality? {
+        guard let raw = playback.currentStreamQuality else { return nil }
+        return PlaybackQuality(rawValue: raw)
+    }
+
+
     private func time(_ seconds: Double) -> String {
         let value = Int(seconds.isFinite ? seconds : 0)
         return String(format: "%d:%02d", value / 60, value % 60)
@@ -946,15 +978,16 @@ struct SyncedLyricsView: View {
                                 .multilineTextAlignment(.leading)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .scaleEffect(scale(for: role), anchor: .leading)
+                                .compositingGroup()
                                 .blur(radius: blur(for: role))
                                 .opacity(opacity(for: role))
-                                .animation(.easeInOut(duration: 0.55), value: activeIndex)
                         }
                         .buttonStyle(.plain)
                         .id(line.id)
                     }
                 }
                 .padding(.vertical, 36)
+                .animation(.easeInOut(duration: 0.55), value: activeIndex)
             }
             .modifier(HiddenScrollIndicators())
             .onChange(of: activeIndex) { index in
@@ -971,11 +1004,12 @@ struct SyncedLyricsView: View {
         }
     }
 
-    private enum LineRole { case past, active, upcoming, far }
+    private enum LineRole { case recentPast, past, active, upcoming, far }
 
     private func lineRole(for id: Int) -> LineRole {
         guard let activeIndex else { return .far }
         if id == activeIndex { return .active }
+        if id == activeIndex - 1 { return .recentPast }
         if id < activeIndex { return .past }
         if id == activeIndex + 1 { return .upcoming }
         return .far
@@ -985,7 +1019,7 @@ struct SyncedLyricsView: View {
         switch role {
         case .active: 1
         case .upcoming: 0.72
-        case .past: 0.32
+        case .recentPast, .past: 0.32
         case .far: 0.22
         }
     }
@@ -994,17 +1028,20 @@ struct SyncedLyricsView: View {
         switch role {
         case .active: 1
         case .upcoming: 0.98
-        case .past: 0.93
+        case .recentPast, .past: 0.93
         case .far: 0.92
         }
     }
 
+    // Blur is a GPU-expensive offscreen pass per view — only the lines
+    // adjacent to the active one get it, so a scrolled lyrics pane doesn't
+    // stack dozens of blurred views at once (was the source of the jank).
     private func blur(for role: LineRole) -> CGFloat {
         switch role {
         case .active: 0
         case .upcoming: 0.6
-        case .past: 1.6
-        case .far: 2.2
+        case .recentPast: 1.2
+        case .past, .far: 0
         }
     }
 
@@ -1012,8 +1049,36 @@ struct SyncedLyricsView: View {
         switch role {
         case .active: Color(white: 0.96)
         case .upcoming: Color.white.opacity(0.78)
-        case .past, .far: Color.white.opacity(0.55)
+        case .recentPast, .past, .far: Color.white.opacity(0.55)
         }
+    }
+}
+
+/// Mimics Apple's Lossless/Hi-Res badge: several sine strokes sharing a left
+/// origin, each nested one shorter, tighter, and shallower than the last.
+private struct QualityWaveMark: Shape {
+    var layers: Int = 4
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let midY = rect.height / 2
+        for layer in 0..<layers {
+            let n = CGFloat(layer)
+            let waveWidth = rect.width * max(1 - n * 0.24, 0.28)
+            let amplitude = (rect.height / 2) * max(1 - n * 0.14, 0.3)
+            let cycles = 1.35 + n * 0.4
+            var sub = Path()
+            let steps = 32
+            for i in 0...steps {
+                let t = CGFloat(i) / CGFloat(steps)
+                let x = rect.minX + t * waveWidth
+                let decay = 1 - t * 0.85
+                let y = midY - sin(t * .pi * cycles) * amplitude * decay
+                if i == 0 { sub.move(to: CGPoint(x: x, y: y)) } else { sub.addLine(to: CGPoint(x: x, y: y)) }
+            }
+            path.addPath(sub)
+        }
+        return path
     }
 }
 

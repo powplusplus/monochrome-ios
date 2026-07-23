@@ -17,6 +17,7 @@ final class PlaybackEngine: ObservableObject {
     @Published var repeatMode: RepeatMode = .off
     @Published var shuffleEnabled = false
     @Published var errorMessage: String?
+    @Published private(set) var currentStreamQuality: String?
 
     let player = AVQueuePlayer()
     private let musicService: MusicService
@@ -25,6 +26,8 @@ final class PlaybackEngine: ObservableObject {
     private var loadTask: Task<Void, Never>?
     private var itemStatusObservation: NSKeyValueObservation?
     private var pendingAutoplay = false
+    private var fadeTask: Task<Void, Never>?
+    private let fadeDuration: TimeInterval = 0.25
 
     var currentTrack: Track? {
         guard let currentIndex, queue.indices.contains(currentIndex) else { return nil }
@@ -77,11 +80,43 @@ final class PlaybackEngine: ObservableObject {
         if isPlaying { pause() } else if player.currentItem != nil { resume() } else { loadCurrent(autoplay: true) }
     }
 
-    func pause() { player.pause(); isPlaying = false; updateNowPlaying() }
+    func pause() {
+        isPlaying = false
+        updateNowPlaying()
+        fadeTask?.cancel()
+        let startVolume = player.volume
+        fadeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.fade(from: startVolume, to: 0, duration: self.fadeDuration)
+            guard !Task.isCancelled else { return }
+            self.player.pause()
+            self.player.volume = startVolume
+        }
+    }
 
     func resume() {
         do { try AVAudioSession.sharedInstance().setActive(true) } catch { errorMessage = error.localizedDescription }
-        player.playImmediately(atRate: playbackRate); isPlaying = true; updateNowPlaying()
+        fadeTask?.cancel()
+        let targetVolume = player.volume > 0 ? player.volume : 1
+        player.volume = 0
+        player.playImmediately(atRate: playbackRate)
+        isPlaying = true
+        updateNowPlaying()
+        fadeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.fade(from: 0, to: targetVolume, duration: self.fadeDuration)
+        }
+    }
+
+    private func fade(from startVolume: Float, to endVolume: Float, duration: TimeInterval) async {
+        let steps = 10
+        let stepDuration = duration / Double(steps)
+        for step in 1...steps {
+            if Task.isCancelled { return }
+            let progress = Float(step) / Float(steps)
+            player.volume = startVolume + (endVolume - startVolume) * progress
+            try? await Task.sleep(nanoseconds: UInt64(stepDuration * 1_000_000_000))
+        }
     }
 
     func next() {
@@ -142,10 +177,12 @@ final class PlaybackEngine: ObservableObject {
         pendingAutoplay = false
         isLoading = true
         errorMessage = nil
+        currentStreamQuality = nil
         loadTask = Task {
             do {
                 let stream = try await musicService.resolveStream(for: track, quality: PlaybackQuality.stored)
                 guard !Task.isCancelled else { return }
+                currentStreamQuality = stream.quality
                 let item = AVPlayerItem(url: stream.url)
                 item.audioTimePitchAlgorithm = .timeDomain
                 pendingAutoplay = autoplay
@@ -228,6 +265,17 @@ final class PlaybackEngine: ObservableObject {
                                   MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed,
                                   MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? playbackRate : 0]
         if let title = track.album?.title { info[MPMediaItemPropertyAlbumTitle] = title }
+        if let url = track.artworkURL {
+            if let cached = ArtworkImageCache.shared.image(for: url) {
+                info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: cached.size) { _ in cached }
+            } else {
+                Task { [weak self] in
+                    try? await DownloadManager.shared.prefetchArtwork(for: track)
+                    guard let self, self.currentTrack?.id == track.id else { return }
+                    self.updateNowPlaying()
+                }
+            }
+        }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
