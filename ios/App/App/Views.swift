@@ -252,12 +252,16 @@ struct LibraryView: View {
         NavigationView {
             List {
                 Section {
-                    NavigationLink(destination: TrackCollectionView(title: "Liked Songs", tracks: library.favorites)) { LibraryDestination(icon: "heart.fill", color: .pink, title: "Liked Songs", count: library.favorites.count) }
-                    NavigationLink(destination: TrackCollectionView(title: "Recently Played", tracks: library.history)) { LibraryDestination(icon: "clock.fill", color: .purple, title: "Recently Played", count: library.history.count) }
+                    NavigationLink(destination: TrackCollectionView(title: "Liked Songs", tracks: library.favorites, creator: "You", usesLikedArtwork: true)) { LibraryDestination(icon: "heart.fill", color: .pink, title: "Liked Songs", count: library.favorites.count) }
+                    NavigationLink(destination: TrackCollectionView(title: "Recently Played", tracks: library.history, creator: "You")) { LibraryDestination(icon: "clock.fill", color: .purple, title: "Recently Played", count: library.history.count) }
                     NavigationLink(destination: DownloadsView()) { LibraryDestination(icon: "arrow.down.circle.fill", color: .blue, title: "Downloads", count: nil) }
                 }
                 Section("Playlists") {
-                    ForEach(library.playlists) { playlist in NavigationLink(destination: TrackCollectionView(title: playlist.title, tracks: playlist.tracks)) { Label(playlist.title, systemImage: "music.note.list") } }
+                    ForEach(library.playlists) { playlist in
+                        NavigationLink(destination: TrackCollectionView(title: playlist.title, tracks: playlist.tracks, cover: playlist.cover, creator: playlist.creator ?? "You")) {
+                            Label(playlist.title, systemImage: "music.note.list")
+                        }
+                    }
                     if library.playlists.isEmpty { Text("Your playlists will appear here.").foregroundColor(.secondary) }
                 }
             }
@@ -1031,9 +1035,182 @@ struct QueueView: View {
 }
 
 struct TrackCollectionView: View {
-    let title: String; let tracks: [Track]
+    let title: String
+    let tracks: [Track]
+    var cover: String? = nil
+    var creator: String? = nil
+    var usesLikedArtwork = false
+
     @EnvironmentObject private var playback: PlaybackEngine
-    var body: some View { List { if let first = tracks.first { Button { playback.play(first, in: tracks) } label: { Label("Play All", systemImage: "play.fill").frame(maxWidth: .infinity) }.buttonStyle(.borderedProminent).tint(.pink).listRowBackground(Color.clear) }; ForEach(tracks) { TrackRow(track: $0, context: tracks) } }.navigationTitle(title).overlay { if tracks.isEmpty { Text("Nothing here yet.").foregroundColor(.secondary) } }.padding(.bottom, 75) }
+    @State private var downloadingAll = false
+
+    private var artworkURL: URL? {
+        if let cover, let url = Artwork.url(cover, size: 640) { return url }
+        return tracks.first?.artworkURL
+    }
+
+    private var subtitle: String {
+        let owner = (creator?.isEmpty == false) ? creator! : "You"
+        let count = tracks.count
+        let noun = count == 1 ? "song" : "songs"
+        return "\(owner) · \(count) \(noun)"
+    }
+
+    var body: some View {
+        ScrollView(showsIndicators: false) {
+            VStack(spacing: 22) {
+                collectionHero
+                collectionActions
+                if let message = playback.errorMessage, !message.isEmpty {
+                    Text(message)
+                        .font(.footnote)
+                        .foregroundColor(message.hasPrefix("Preview only") ? .secondary : .red)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
+                }
+                LazyVStack(spacing: 0) {
+                    ForEach(tracks) { track in
+                        TrackRow(track: track, context: tracks)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 6)
+                    }
+                }
+            }
+            .padding(.top, 8)
+            .padding(.bottom, 110)
+        }
+        .background {
+            ZStack {
+                Color.black.ignoresSafeArea()
+                RadialGradient(
+                    colors: [Color.pink.opacity(usesLikedArtwork ? 0.22 : 0.12), Color.clear],
+                    center: UnitPoint(x: 0.5, y: 0.0),
+                    startRadius: 20,
+                    endRadius: 420
+                )
+                .ignoresSafeArea()
+            }
+        }
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
+        .overlay {
+            if tracks.isEmpty {
+                Text("Nothing here yet.").foregroundColor(.secondary)
+            }
+        }
+    }
+
+    private var collectionHero: some View {
+        VStack(spacing: 14) {
+            Group {
+                if usesLikedArtwork {
+                    likedArtworkPlaceholder
+                } else {
+                    ArtworkView(url: artworkURL)
+                }
+            }
+            .aspectRatio(1, contentMode: .fit)
+            .frame(maxWidth: 240)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .shadow(color: .black.opacity(0.45), radius: 18, y: 10)
+
+            Text(title)
+                .font(.title2.bold())
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.primary)
+
+            Text(subtitle)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 36)
+    }
+
+    private var likedArtworkPlaceholder: some View {
+        ZStack {
+            LinearGradient(
+                colors: [Color(white: 0.72), Color(white: 0.38)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            Image(systemName: "heart.fill")
+                .font(.system(size: 72, weight: .bold))
+                .foregroundStyle(.pink)
+                .shadow(color: .black.opacity(0.25), radius: 8, y: 4)
+        }
+    }
+
+    private var collectionActions: some View {
+        HStack(spacing: 16) {
+            Button {
+                guard !tracks.isEmpty else { return }
+                playback.shuffleEnabled = true
+                if let track = tracks.randomElement() { playback.play(track, in: tracks) }
+            } label: {
+                Image(systemName: "shuffle")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .frame(width: 48, height: 48)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .liquidGlass(cornerRadius: 24, strong: false)
+            .accessibilityLabel("Shuffle")
+            .disabled(tracks.isEmpty)
+
+            Button {
+                guard let first = tracks.first else { return }
+                playback.shuffleEnabled = false
+                playback.play(first, in: tracks)
+            } label: {
+                HStack(spacing: 8) {
+                    if playback.isLoading, tracks.contains(where: { $0.id == playback.currentTrack?.id }) {
+                        ProgressView().tint(.black)
+                    } else {
+                        Image(systemName: "play.fill")
+                    }
+                    Text("Play").fontWeight(.semibold)
+                }
+                .foregroundStyle(.black)
+                .frame(maxWidth: .infinity)
+                .frame(height: 48)
+                .background(Capsule(style: .continuous).fill(Color.white))
+            }
+            .buttonStyle(.plain)
+            .disabled(tracks.isEmpty)
+            .accessibilityLabel("Play")
+
+            Button {
+                guard !tracks.isEmpty, !downloadingAll else { return }
+                downloadingAll = true
+                Task {
+                    for track in tracks {
+                        await DownloadManager.shared.download(track)
+                    }
+                    downloadingAll = false
+                }
+            } label: {
+                Group {
+                    if downloadingAll {
+                        ProgressView().tint(.white)
+                    } else {
+                        Image(systemName: "arrow.down")
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(.primary)
+                    }
+                }
+                .frame(width: 48, height: 48)
+                .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .liquidGlass(cornerRadius: 24, strong: false)
+            .accessibilityLabel("Download")
+            .disabled(tracks.isEmpty || downloadingAll)
+        }
+        .padding(.horizontal, 28)
+    }
 }
 
 struct DownloadsView: View {

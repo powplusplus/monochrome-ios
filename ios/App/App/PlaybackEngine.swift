@@ -24,6 +24,7 @@ final class PlaybackEngine: ObservableObject {
     private var endObserver: NSObjectProtocol?
     private var loadTask: Task<Void, Never>?
     private var itemStatusObservation: NSKeyValueObservation?
+    private var pendingAutoplay = false
 
     var currentTrack: Track? {
         guard let currentIndex, queue.indices.contains(currentIndex) else { return nil }
@@ -137,20 +138,30 @@ final class PlaybackEngine: ObservableObject {
 
     private func loadCurrent(autoplay: Bool) {
         guard let track = currentTrack else { return }
-        loadTask?.cancel(); isLoading = true; errorMessage = nil
+        loadTask?.cancel()
+        pendingAutoplay = false
+        isLoading = true
+        errorMessage = nil
         loadTask = Task {
             do {
                 let stream = try await musicService.resolveStream(for: track, quality: PlaybackQuality.stored)
                 guard !Task.isCancelled else { return }
                 let item = AVPlayerItem(url: stream.url)
                 item.audioTimePitchAlgorithm = .timeDomain
+                pendingAutoplay = autoplay
                 itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
                     Task { @MainActor in
                         guard let self, self.player.currentItem === item else { return }
                         switch item.status {
                         case .readyToPlay:
                             self.isLoading = false
+                            if self.pendingAutoplay {
+                                self.pendingAutoplay = false
+                                self.resume()
+                            }
+                            self.updateNowPlaying()
                         case .failed:
+                            self.pendingAutoplay = false
                             self.player.pause()
                             self.isLoading = false
                             self.isPlaying = false
@@ -169,7 +180,14 @@ final class PlaybackEngine: ObservableObject {
                     let previewSeconds = Int((stream.mediaDuration ?? 30).rounded())
                     errorMessage = "Preview only (\(previewSeconds)s). Full track needs a TIDAL subscription."
                 }
-                if autoplay { resume() }
+                // Autoplay waits for `.readyToPlay` so AVPlayer is not raced.
+                if item.status == .readyToPlay {
+                    isLoading = false
+                    if pendingAutoplay {
+                        pendingAutoplay = false
+                        resume()
+                    }
+                }
                 LibraryRepository.shared.recordPlayback(track)
                 ScrobblingCoordinator.shared.nowPlaying(track)
                 Task { try? await DownloadManager.shared.prefetchArtwork(for: track) }
@@ -177,6 +195,7 @@ final class PlaybackEngine: ObservableObject {
                 updateNowPlaying()
             } catch {
                 guard !Task.isCancelled else { return }
+                pendingAutoplay = false
                 isLoading = false; isPlaying = false; errorMessage = error.localizedDescription
             }
         }
