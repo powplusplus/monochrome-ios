@@ -69,7 +69,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
             guard let jwt = object?["access_token"] as? String, !jwt.isEmpty else {
                 throw ServiceError.malformed("Amazon Turnstile JWT")
             }
-            let expiry = Date().timeIntervalSince1970 * 1000 + 60 * 60 * 1000
+            let expiry = Self.expiryMilliseconds(forJWT: jwt)
             UserDefaults.standard.set(jwt, forKey: jwtKey)
             UserDefaults.standard.set(expiry, forKey: expiryKey)
             return jwt
@@ -77,6 +77,32 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         inFlight = task
         defer { inFlight = nil }
         return try await task.value
+    }
+
+    /// The provider signs the JWT with its own `exp`. Assuming a flat hour past
+    /// the moment the response lands overshoots that by the request latency and
+    /// by any device clock skew, so the tail of every cached hour is served with
+    /// a token the server already considers dead — it answers 401 "Invalid
+    /// Turnstile JWT", which surfaces as an unplayable track. Read the real
+    /// expiry off the token and retire it a minute early.
+    static func expiryMilliseconds(forJWT jwt: String) -> Double {
+        let fallback = Date().timeIntervalSince1970 * 1000 + 55 * 60 * 1000
+        let segments = jwt.split(separator: ".")
+        guard segments.count >= 2,
+              let payload = base64URLDecoded(String(segments[1])),
+              let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+              let exp = (object["exp"] as? NSNumber)?.doubleValue, exp > 0 else {
+            return fallback
+        }
+        return (exp - 60) * 1000
+    }
+
+    private static func base64URLDecoded(_ value: String) -> Data? {
+        var text = value
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        while text.count % 4 != 0 { text.append("=") }
+        return Data(base64Encoded: text)
     }
 
     /// HTML loaded into WKWebView. Exposed for unit tests.

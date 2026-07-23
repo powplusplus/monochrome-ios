@@ -16,6 +16,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  unit-tests:
+    name: Run AppTests
+    # Runs alongside the packaging job rather than gating it, so a simulator
+    # hiccup still leaves an installable IPA to fall back on.
+    runs-on: macos-26
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Pick an available iOS simulator
+        id: sim
+        run: |
+          set -euo pipefail
+          udid=$(xcrun simctl list devices available --json \
+            | python3 -c "import json,sys;d=json.load(sys.stdin)['devices'];print(next(x['udid'] for k,v in d.items() if 'iOS' in k for x in v if x['name'].startswith('iPhone')))")
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+          xcrun simctl list devices available | grep iPhone
+
+      - name: Run unit tests
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project ios/App/App.xcodeproj \
+            -scheme AppTests \
+            -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.udid }}" \
+            -derivedDataPath build/DerivedData-Tests \
+            CODE_SIGNING_ALLOWED=NO \
+            test
+
   build-ipa:
     name: Package unsigned IPA
     # Liquid Glass APIs require the iOS 26 SDK supplied by the Tahoe image.

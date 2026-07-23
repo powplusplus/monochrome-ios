@@ -138,9 +138,12 @@ final class MusicService {
             let amazonDetail = (amazonError as? LocalizedError)?.errorDescription
                 ?? amazonError?.localizedDescription
                 ?? "Amazon Music unavailable"
+            // Report both legs. Reporting only Amazon's made a dead Deezer pool
+            // look like an Amazon auth bug.
+            let deezerDetail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             if enriched.isrc?.isEmpty == false {
                 throw ServiceError.unavailable(
-                    "Could not resolve stream URL from Amazon Music or Deezer. \(amazonDetail)"
+                    "Could not resolve stream URL from Amazon Music or Deezer. Amazon: \(amazonDetail) Deezer: \(deezerDetail)"
                 )
             }
             throw ServiceError.unavailable(
@@ -199,22 +202,26 @@ final class MusicService {
                 jwt: jwt
             )
         } catch let error as ServiceError {
-            // Web clears JWT and retries once on 401/428.
-            if case .http(let status) = error, status == 401 || status == 428, bypass.isEmpty {
-                await AmazonTurnstileAuth.shared.clearCache()
-                let fresh = try await AmazonTurnstileAuth.shared.accessToken(apiBaseURL: apiBase, forceRefresh: true)
-                return try await fetchAmazonTrack(
-                    title: title,
-                    artist: artist,
-                    album: track.album?.title ?? "",
-                    duration: track.duration,
-                    quality: quality,
-                    apiBase: apiBase,
-                    bypass: bypass,
-                    jwt: fresh
-                )
-            }
-            throw error
+            // 401 means the provider rejected the JWT we sent; 428 means it wants
+            // one it hasn't seen. Web answers both the same way — re-solve
+            // Turnstile and send the fresh JWT *instead of* the bypass token
+            // (`forceTurnstile` makes it skip the bypass branch entirely). Native
+            // used to skip the retry whenever a bypass token was configured, and
+            // to keep sending the rejected token when it wasn't, so a client that
+            // hit this once stayed broken for every later track.
+            guard case .http(let status) = error, status == 401 || status == 428 else { throw error }
+            await AmazonTurnstileAuth.shared.clearCache()
+            let fresh = try await AmazonTurnstileAuth.shared.accessToken(apiBaseURL: apiBase, forceRefresh: true)
+            return try await fetchAmazonTrack(
+                title: title,
+                artist: artist,
+                album: track.album?.title ?? "",
+                duration: track.duration,
+                quality: quality,
+                apiBase: apiBase,
+                bypass: "",
+                jwt: fresh
+            )
         }
     }
 
@@ -304,7 +311,7 @@ final class MusicService {
         }
 
         var latestError: Error = ServiceError.unavailable("Deezer stream unavailable")
-        for format in formats {
+        probeLoop: for format in formats {
             guard var components = URLComponents(string: base + "/stream/") else { continue }
             components.queryItems = [
                 URLQueryItem(name: "isrc", value: isrc),
@@ -337,11 +344,16 @@ final class MusicService {
             probe.setValue("bytes=0-1", forHTTPHeaderField: "Range")
             applyMonochromeOrigin(to: &probe)
             do {
-                let (_, response) = try await session.data(for: probe)
+                let (body, response) = try await session.data(for: probe)
                 if let http = response as? HTTPURLResponse {
                     guard (200..<400).contains(http.statusCode) else {
-                        latestError = ServiceError.http(http.statusCode)
-                        continue
+                        let detail = Self.providerErrorDetail(in: body)
+                        latestError = detail.map { ServiceError.unavailable($0) } ?? ServiceError.http(http.statusCode)
+                        // 503 is the instance reporting that its whole account pool
+                        // is dead. Every format draws on that same pool, so probing
+                        // the rest just spends eight round trips to relearn it.
+                        if http.statusCode == 503 { break probeLoop }
+                        continue probeLoop
                     }
                 }
                 return StreamResponse(
@@ -446,6 +458,18 @@ final class MusicService {
             return dict
         }
         return [:]
+    }
+
+    /// Both providers answer failures with a JSON body that says what actually
+    /// went wrong ("All Deezer accounts are dead", "Invalid Turnstile JWT").
+    /// A bare status code hides that, so surface their wording when present.
+    private static func providerErrorDetail(in body: Data) -> String? {
+        guard !body.isEmpty,
+              let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }
+        for key in ["error", "message", "detail"] {
+            if let value = object[key] as? String, !value.isEmpty { return value }
+        }
+        return nil
     }
 
     private func stringValue(_ dict: [String: Any], _ keys: [String]) -> String? {

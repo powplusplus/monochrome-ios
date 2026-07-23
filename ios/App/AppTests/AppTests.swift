@@ -87,4 +87,28 @@ final class AppTests: XCTestCase {
         let html = AmazonTurnstileAuth.challengeHTML(siteKey: "key'\\x", mode: .interactionOnly)
         XCTAssertTrue(html.contains("sitekey: 'key\\'\\\\x'"))
     }
+
+    func testAmazonTurnstileExpiryUsesJwtExpClaim() {
+        let exp = Date().timeIntervalSince1970 + 600
+        let jwt = Self.unsignedJWT(claims: ["exp": exp])
+        // Retired a minute before the server stops honouring it.
+        XCTAssertEqual(AmazonTurnstileAuth.expiryMilliseconds(forJWT: jwt), (exp - 60) * 1000, accuracy: 1)
+    }
+
+    func testAmazonTurnstileExpiryFallsBackWhenClaimUnreadable() {
+        let floor = Date().timeIntervalSince1970 * 1000 + 54 * 60 * 1000
+        for jwt in ["", "not-a-jwt", "a.!!!.c", Self.unsignedJWT(claims: ["sub": "no-exp"])] {
+            XCTAssertGreaterThan(AmazonTurnstileAuth.expiryMilliseconds(forJWT: jwt), floor)
+        }
+    }
+
+    /// Header/payload/signature shaped like a real token; only the payload is read.
+    private static func unsignedJWT(claims: [String: Any]) -> String {
+        let payload = try! JSONSerialization.data(withJSONObject: claims)
+        let encoded = payload.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "header.\(encoded).signature"
+    }
 }
