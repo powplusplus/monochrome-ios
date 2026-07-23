@@ -75,28 +75,286 @@ final class MusicService {
         return ModelMapper.array(object, keys: ["tracks", "items"]).compactMap(ModelMapper.track)
     }
 
-    func resolveStream(for track: Track, quality: String = "HIGH") async throws -> StreamResponse {
+    func lyrics(for track: Track) async -> SyncedLyrics? {
+        let title = track.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let artist = track.artist.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, !artist.isEmpty else { return nil }
+
+        var components = URLComponents(string: "https://lrclib.net/api/get")
+        var items = [
+            URLQueryItem(name: "track_name", value: title),
+            URLQueryItem(name: "artist_name", value: artist),
+        ]
+        if let album = track.album?.title, !album.isEmpty {
+            items.append(URLQueryItem(name: "album_name", value: album))
+        }
+        if track.duration > 0 {
+            items.append(URLQueryItem(name: "duration", value: String(Int(track.duration.rounded()))))
+        }
+        components?.queryItems = items
+
+        if let url = components?.url, let lyrics = try? await fetchLRCLIB(url: url) {
+            return lyrics
+        }
+
+        // Loose search when exact metadata miss (remix titles, featuring tags).
+        var search = URLComponents(string: "https://lrclib.net/api/search")
+        search?.queryItems = [URLQueryItem(name: "q", value: "\(artist) \(title)")]
+        guard let searchURL = search?.url else { return nil }
+        guard let candidates = try? await fetchLRCLIBSearch(url: searchURL) else { return nil }
+        return candidates.first
+    }
+
+    func resolveStream(for track: Track, quality: PlaybackQuality = .stored) async throws -> StreamResponse {
         // Catalog payloads often include a webpage `url` (e.g. tidal.com/track/…) that
         // was historically mapped into streamURL. Only short-circuit for real media.
         if let url = track.streamURL, Self.isDirectMediaURL(url) {
-            return StreamResponse(url: url, provider: track.provider, quality: quality, replayGain: nil, peak: nil)
+            return StreamResponse(url: url, provider: track.provider, quality: quality.rawValue, replayGain: nil, peak: nil)
         }
-        // AVFoundation does not reliably play TIDAL's fragmented-MP4 FLAC
-        // representation when it is exposed through a local HLS wrapper. Ask
-        // for AAC-LC explicitly; this is iOS's native hardware-decoded path.
-        let formats = ["AACLC"]
-        var query = "id=\(track.playbackID.urlQueryEncoded)&quality=\(quality)&adaptive=false"
-        formats.forEach { query += "&formats=\($0)" }
-        let object = try await json(path: "/trackManifests/?\(query)", streaming: true, cacheable: false)
+
+        // Same acquisition order as web Monochrome `getStreamUrl`:
+        // Amazon Music → Deezer → TIDAL FULL `/track/` → TIDAL manifests (may be preview).
+        let enriched = await enrichTrackMetadata(track)
+        if let amazon = try? await resolveAmazonStream(for: enriched, quality: quality) {
+            return amazon
+        }
+        if let deezer = try? await resolveDeezerStream(for: enriched, quality: quality) {
+            return deezer
+        }
+        if let full = try? await resolveLegacyFullStream(for: enriched, quality: quality) {
+            return full
+        }
+        return try await resolveTidalManifestStream(for: enriched, quality: quality)
+    }
+
+    /// Pull ISRC / duration when search cards omit them (needed for Deezer/Amazon lookup).
+    private func enrichTrackMetadata(_ track: Track) async -> Track {
+        if let isrc = track.isrc, !isrc.isEmpty, track.duration > 0 { return track }
+        guard let object = try? await json(path: "/info/?id=\(track.playbackID.urlQueryEncoded)", cacheable: true) else {
+            return track
+        }
+        let root = ModelMapper.unwrap(object)
+        let items = ModelMapper.array(root, keys: ["items", "data"])
+        let matchDict: [String: Any]? = items.first {
+            ModelMapper.string($0, ["id"]) == track.playbackID || ModelMapper.string($0, ["id"]) == track.id
+        } ?? (root as? [String: Any])
+        guard let matchDict, let mapped = ModelMapper.track(matchDict) else { return track }
+        var enriched = track
+        if enriched.isrc == nil || enriched.isrc?.isEmpty == true { enriched.isrc = mapped.isrc }
+        if enriched.duration <= 0 { enriched.duration = mapped.duration }
+        if enriched.album == nil { enriched.album = mapped.album }
+        return enriched
+    }
+
+    private func resolveAmazonStream(for track: Track, quality: PlaybackQuality) async throws -> StreamResponse {
+        guard PlaybackSourceSettings.amazonEnabled else {
+            throw ServiceError.unavailable("Amazon Music disabled")
+        }
+        let title = track.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let artist = track.artist.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, !artist.isEmpty else {
+            throw ServiceError.unavailable("Amazon lookup needs title and artist")
+        }
+
+        var components = URLComponents(string: PlaybackSourceSettings.amazonApiBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/api/track/")
+        var items = [
+            URLQueryItem(name: "track", value: title),
+            URLQueryItem(name: "artist", value: artist),
+            URLQueryItem(name: "album", value: track.album?.title ?? ""),
+            URLQueryItem(name: "quality", value: quality.amazonQuality),
+        ]
+        if track.duration > 0 {
+            items.append(URLQueryItem(name: "duration", value: String(Int(track.duration.rounded()))))
+        }
+        let bypass = PlaybackSourceSettings.amazonBypassToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !bypass.isEmpty {
+            items.append(URLQueryItem(name: "bypass_token", value: bypass))
+        }
+        components?.queryItems = items
+        guard let url = components?.url else { throw ServiceError.invalidResponse }
+
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, response) = try await session.data(for: request)
+        try validate(response)
+        let object = try JSONSerialization.jsonObject(with: data)
+        let payload = amazonTrackPayload(object)
+        guard let stream = stringValue(payload, ["stream_url", "streamUrl", "url"]),
+              let streamURL = URL(string: stream) else {
+            throw ServiceError.unavailable("Amazon Music returned no stream URL")
+        }
+
+        let key = stringValue(payload, ["decryption_key", "decryptionKey"])
+            ?? ((payload["decryption"] as? [String: Any]).flatMap { stringValue($0, ["key"]) })
+            ?? ((payload["drm"] as? [String: Any]).flatMap { stringValue($0, ["decryption_key", "decryptionKey"]) })
+
+        let playURL: URL
+        if let key, !key.isEmpty {
+            // Web routes CENC through SW decryptor; native decrypts to a local clear file.
+            playURL = try await AmazonCencDecryptor.decryptFile(from: streamURL, keyHex: key, session: session)
+        } else {
+            playURL = streamURL
+        }
+
+        let selected = stringValue(payload, ["quality_selected", "quality"]) ?? quality.amazonQuality
+        return StreamResponse(
+            url: playURL,
+            provider: .amazon,
+            quality: selected,
+            replayGain: nil,
+            peak: nil,
+            isPreview: false,
+            previewReason: nil,
+            mediaDuration: track.duration > 0 ? track.duration : nil
+        )
+    }
+
+    private func resolveDeezerStream(for track: Track, quality: PlaybackQuality) async throws -> StreamResponse {
+        guard PlaybackSourceSettings.deezerEnabled else {
+            throw ServiceError.unavailable("Deezer fallback disabled")
+        }
+        guard let isrc = track.isrc?.trimmingCharacters(in: .whitespacesAndNewlines), !isrc.isEmpty else {
+            throw ServiceError.unavailable("Deezer lookup needs ISRC")
+        }
+        let base = PlaybackSourceSettings.deezerApiBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard var components = URLComponents(string: base + "/stream/") else { throw ServiceError.invalidResponse }
+        components.queryItems = [
+            URLQueryItem(name: "isrc", value: isrc),
+            URLQueryItem(name: "format", value: quality.deezerFormat),
+        ]
+        guard let url = components.url else { throw ServiceError.invalidResponse }
+
+        // Web only HEAD-checks then feeds the URL to <audio>. Prefer HEAD, fall back to ranged GET.
+        var head = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
+        head.httpMethod = "HEAD"
+        head.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+        if let (_, headResponse) = try? await session.data(for: head),
+           let http = headResponse as? HTTPURLResponse,
+           (200..<400).contains(http.statusCode) || http.statusCode == 405 || http.statusCode == 501 {
+            return StreamResponse(
+                url: url,
+                provider: .deezer,
+                quality: quality.rawValue,
+                replayGain: nil,
+                peak: nil,
+                isPreview: false,
+                previewReason: nil,
+                mediaDuration: track.duration > 0 ? track.duration : nil
+            )
+        }
+
+        var probe = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
+        probe.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+        probe.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+        let (_, response) = try await session.data(for: probe)
+        if let http = response as? HTTPURLResponse {
+            guard (200..<400).contains(http.statusCode) else { throw ServiceError.http(http.statusCode) }
+        }
+        return StreamResponse(
+            url: url,
+            provider: .deezer,
+            quality: quality.rawValue,
+            replayGain: nil,
+            peak: nil,
+            isPreview: false,
+            previewReason: nil,
+            mediaDuration: track.duration > 0 ? track.duration : nil
+        )
+    }
+
+    /// Classic `/track/` asks TIDAL for `assetpresentation=FULL` at the selected quality.
+    private func resolveLegacyFullStream(for track: Track, quality: PlaybackQuality) async throws -> StreamResponse {
+        let object = try await json(
+            path: "/track/?id=\(track.playbackID.urlQueryEncoded)&quality=\(quality.rawValue)",
+            streaming: true,
+            cacheable: false
+        )
+        let presentation = (findValue(named: "assetPresentation", in: object) as? String)?.uppercased()
+        guard presentation != "PREVIEW" else {
+            throw ServiceError.unavailable("Legacy stream is also preview-only.")
+        }
         let url: URL
         if let manifest = findValue(named: "manifest", in: object) as? String,
-           let extracted = extractURL(fromManifest: manifest) { url = extracted }
-        else if let uri = findValue(named: "uri", in: object) as? String,
-                let manifestURL = URL(string: uri) { url = try await playableURL(from: manifestURL) }
-        else { throw ServiceError.unavailable("No playable stream was returned by the configured providers.") }
+           let extracted = extractURL(fromManifest: manifest) {
+            url = extracted
+        } else if let urls = findValue(named: "urls", in: object) as? [String],
+                  let first = urls.compactMap(URL.init(string:)).first {
+            url = first
+        } else {
+            throw ServiceError.unavailable("Legacy stream missing playable URL.")
+        }
+        let gain = (findValue(named: "replayGain", in: object) as? NSNumber)?.doubleValue
+            ?? (findValue(named: "trackReplayGain", in: object) as? NSNumber)?.doubleValue
+        let peak = (findValue(named: "peakAmplitude", in: object) as? NSNumber)?.doubleValue
+            ?? (findValue(named: "trackPeakAmplitude", in: object) as? NSNumber)?.doubleValue
+        return StreamResponse(
+            url: url,
+            provider: .tidal,
+            quality: quality.rawValue,
+            replayGain: gain,
+            peak: peak,
+            isPreview: false,
+            previewReason: nil,
+            mediaDuration: track.duration > 0 ? track.duration : nil
+        )
+    }
+
+    private func resolveTidalManifestStream(for track: Track, quality: PlaybackQuality) async throws -> StreamResponse {
+        // Last resort. Prefer AAC-LC for AVPlayer when quality is lossy; still try FLAC
+        // formats for lossless settings (joined fMP4). May be PREVIEW-only.
+        var query = "id=\(track.playbackID.urlQueryEncoded)&quality=\(quality.rawValue)&adaptive=false"
+        quality.tidalFormats.forEach { query += "&formats=\($0)" }
+        let object = try await json(path: "/trackManifests/?\(query)", streaming: true, cacheable: false)
+        let presentation = (findValue(named: "trackPresentation", in: object) as? String)?.uppercased()
+        let previewReason = findValue(named: "previewReason", in: object) as? String
+        let isPreview = presentation == "PREVIEW"
+        let url: URL
+        var mediaDuration: Double?
+        if let manifest = findValue(named: "manifest", in: object) as? String,
+           let extracted = extractURL(fromManifest: manifest) {
+            url = extracted
+        } else if let uri = findValue(named: "uri", in: object) as? String,
+                  let manifestURL = URL(string: uri) {
+            let playable = try await playableURL(from: manifestURL)
+            url = playable.url
+            mediaDuration = playable.duration
+        } else {
+            throw ServiceError.unavailable("No playable stream was returned by the configured providers.")
+        }
         let gain = (findValue(named: "replayGain", in: object) as? NSNumber)?.doubleValue
         let peak = (findValue(named: "peakAmplitude", in: object) as? NSNumber)?.doubleValue
-        return StreamResponse(url: url, provider: track.provider, quality: quality, replayGain: gain, peak: peak)
+        return StreamResponse(
+            url: url,
+            provider: .tidal,
+            quality: quality.rawValue,
+            replayGain: gain,
+            peak: peak,
+            isPreview: isPreview,
+            previewReason: previewReason,
+            mediaDuration: mediaDuration ?? (track.duration > 0 ? track.duration : nil)
+        )
+    }
+
+    private func amazonTrackPayload(_ object: Any) -> [String: Any] {
+        if let dict = object as? [String: Any] {
+            if dict["stream_url"] != nil || dict["streamUrl"] != nil { return dict }
+            for key in ["data", "track", "result"] {
+                if let nested = dict[key] as? [String: Any],
+                   nested["stream_url"] != nil || nested["streamUrl"] != nil {
+                    return nested
+                }
+            }
+            return dict
+        }
+        return [:]
+    }
+
+    private func stringValue(_ dict: [String: Any], _ keys: [String]) -> String? {
+        for key in keys {
+            if let value = dict[key] as? String, !value.isEmpty { return value }
+            if let value = dict[key] as? NSNumber { return value.stringValue }
+        }
+        return nil
     }
 
     private static func isDirectMediaURL(_ url: URL) -> Bool {
@@ -191,16 +449,17 @@ final class MusicService {
     /// static fragmented-MP4 timelines, so join the initialization fragment and
     /// media fragments into one local fragmented MP4 that AVFoundation can open
     /// without waiting on a synthetic local HLS playlist.
-    private func playableURL(from manifestURL: URL) async throws -> URL {
+    private func playableURL(from manifestURL: URL) async throws -> (url: URL, duration: Double?) {
         let (data, response) = try await session.data(from: manifestURL)
         try validate(response)
         guard let xml = String(data: data, encoding: .utf8) else { throw ServiceError.malformed("stream manifest") }
-        if xml.contains("#EXTM3U") { return manifestURL }
+        if xml.contains("#EXTM3U") { return (manifestURL, nil) }
         guard let initialization = attribute("initialization", in: xml),
               let media = attribute("media", in: xml),
               attribute("timescale", in: xml) != nil else {
             throw ServiceError.malformed("DASH audio timeline")
         }
+        let mediaDuration = attribute("mediaPresentationDuration", in: xml).flatMap(Self.parseISO8601Duration)
         let startNumber = Int(attribute("startNumber", in: xml) ?? "1") ?? 1
         let segmentPattern = #"<S\s+([^>]+)/?>"#
         let regex = try NSRegularExpression(pattern: segmentPattern)
@@ -228,7 +487,29 @@ final class MusicService {
         }
         let target = FileManager.default.temporaryDirectory.appendingPathComponent("monochrome-\(UUID().uuidString).m4a")
         try combined.write(to: target, options: .atomic)
-        return target
+        return (target, mediaDuration)
+    }
+
+    /// Parses MPD durations like `PT29.976S`, `PT7M36S`, `PT1H2M3.5S`.
+    private static func parseISO8601Duration(_ value: String) -> Double? {
+        guard value.hasPrefix("PT") else { return nil }
+        var seconds = 0.0
+        var number = ""
+        for character in value.dropFirst(2) {
+            if character.isNumber || character == "." {
+                number.append(character)
+                continue
+            }
+            guard let amount = Double(number) else { return nil }
+            number = ""
+            switch character {
+            case "H": seconds += amount * 3600
+            case "M": seconds += amount * 60
+            case "S": seconds += amount
+            default: return nil
+            }
+        }
+        return seconds > 0 ? seconds : nil
     }
 
     private func fragmentData(from url: URL) async throws -> Data {
@@ -250,6 +531,61 @@ final class MusicService {
     private func xmlDecoded(_ value: String) -> String {
         value.replacingOccurrences(of: "&amp;", with: "&")
              .replacingOccurrences(of: "&quot;", with: "\"")
+    }
+
+    private func fetchLRCLIB(url: URL) async throws -> SyncedLyrics? {
+        var request = URLRequest(url: url, cachePolicy: .returnCacheDataElseLoad, timeoutInterval: 10)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, response) = try await session.data(for: request)
+        try validate(response)
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return parseLRCLIBObject(object)
+    }
+
+    private func fetchLRCLIBSearch(url: URL) async throws -> [SyncedLyrics] {
+        var request = URLRequest(url: url, cachePolicy: .returnCacheDataElseLoad, timeoutInterval: 10)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, response) = try await session.data(for: request)
+        try validate(response)
+        guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+        return array.compactMap(parseLRCLIBObject).filter { !$0.isEmpty }
+    }
+
+    private func parseLRCLIBObject(_ object: [String: Any]) -> SyncedLyrics? {
+        let synced = object["syncedLyrics"] as? String
+        let plain = object["plainLyrics"] as? String
+        let lines = Self.parseLRC(synced ?? "")
+        guard !lines.isEmpty || !(plain?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) else {
+            return nil
+        }
+        return SyncedLyrics(lines: lines, plainText: plain, provider: "LRCLIB")
+    }
+
+    static func parseLRC(_ subtitles: String) -> [LyricLine] {
+        let pattern = #"\[(\d+):(\d+)(?:\.(\d+))?\]\s*(.+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        var lines: [LyricLine] = []
+        for raw in subtitles.split(whereSeparator: \.isNewline) {
+            let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+            let range = NSRange(line.startIndex..., in: line)
+            guard let match = regex.firstMatch(in: line, range: range),
+                  let minRange = Range(match.range(at: 1), in: line),
+                  let secRange = Range(match.range(at: 2), in: line),
+                  let textRange = Range(match.range(at: 4), in: line) else { continue }
+            let minutes = Double(line[minRange]) ?? 0
+            let seconds = Double(line[secRange]) ?? 0
+            var fraction = 0.0
+            if match.range(at: 3).location != NSNotFound, let fracRange = Range(match.range(at: 3), in: line) {
+                let digits = String(line[fracRange])
+                let value = Double(digits) ?? 0
+                fraction = value / pow(10, Double(digits.count))
+            }
+            let text = String(line[textRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            lines.append(LyricLine(id: lines.count, time: minutes * 60 + seconds + fraction, text: text))
+        }
+        return lines
     }
 }
 

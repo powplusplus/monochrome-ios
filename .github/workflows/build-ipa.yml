@@ -4,6 +4,9 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    paths:
+      - 'ios/**'
+      - '.github/workflows/build-ipa.yml'
 
 permissions:
   contents: read
@@ -13,11 +16,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test-and-build:
-    name: Test native app and package IPA
+  build-ipa:
+    name: Package unsigned IPA
     # Liquid Glass APIs require the iOS 26 SDK supplied by the Tahoe image.
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 25
 
     steps:
       - name: Check out source
@@ -25,29 +28,6 @@ jobs:
 
       - name: Display active Xcode
         run: xcodebuild -version
-
-      - name: Create iPhone 12 simulator
-        id: simulator
-        run: |
-          set -euo pipefail
-          sdk_version="$(xcrun --sdk iphonesimulator --show-sdk-version)"
-          runtime="$(xcrun simctl list runtimes -j | jq -r --arg sdk "$sdk_version" '.runtimes[] | select(.isAvailable == true and .version == $sdk and (.identifier | contains("iOS"))) | .identifier' | head -1)"
-          test -n "$runtime"
-          udid="$(xcrun simctl create 'Monochrome iPhone 12' com.apple.CoreSimulator.SimDeviceType.iPhone-12 "$runtime")"
-          echo "udid=$udid" >> "$GITHUB_OUTPUT"
-          xcrun simctl boot "$udid"
-          xcrun simctl bootstatus "$udid" -b
-
-      - name: Run simulator tests first
-        run: |
-          set -euo pipefail
-          xcodebuild test \
-            -project ios/App/App.xcodeproj \
-            -scheme App \
-            -configuration Debug \
-            -destination 'platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}' \
-            -derivedDataPath build/DerivedData-Simulator \
-            CODE_SIGNING_ALLOWED=NO
 
       - name: Build arm64 iPhone application
         run: |

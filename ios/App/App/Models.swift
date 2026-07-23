@@ -6,6 +6,99 @@ enum Provider: String, Codable, CaseIterable, Identifiable {
     var title: String { rawValue.capitalized }
 }
 
+/// Mirrors web `playback-quality` tokens (mapped to Amazon UHD/HD/SD and Deezer formats).
+enum PlaybackQuality: String, CaseIterable, Identifiable, Codable {
+    case low = "LOW"
+    case high = "HIGH"
+    case lossless = "LOSSLESS"
+    case hiResLossless = "HI_RES_LOSSLESS"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .low: return "Low"
+        case .high: return "High"
+        case .lossless: return "Lossless (HiFi)"
+        case .hiResLossless: return "Hi-Res Lossless"
+        }
+    }
+
+    var amazonQuality: String {
+        switch self {
+        case .low: return "SD_LOW"
+        case .high: return "SD_HIGH"
+        case .lossless: return "HD"
+        case .hiResLossless: return "UHD"
+        }
+    }
+
+    var deezerFormat: String {
+        switch self {
+        case .low: return "MP3_128"
+        case .high: return "MP3_320"
+        case .lossless, .hiResLossless: return "FLAC"
+        }
+    }
+
+    /// TIDAL OpenAPI `formats` preference order when falling back to HiFi manifests.
+    var tidalFormats: [String] {
+        switch self {
+        case .low: return ["HEAACV1", "AACLC"]
+        case .high: return ["AACLC"]
+        case .lossless: return ["FLAC", "AACLC"]
+        case .hiResLossless: return ["FLAC_HIRES", "FLAC", "AACLC"]
+        }
+    }
+
+    static var stored: PlaybackQuality {
+        let raw = UserDefaults.standard.string(forKey: "native.playbackQuality")
+        if let raw, let value = PlaybackQuality(rawValue: raw) { return value }
+        // Migrate legacy lossless toggle.
+        if UserDefaults.standard.object(forKey: "native.highQuality") as? Bool == false {
+            return .high
+        }
+        return .lossless
+    }
+
+    static func store(_ quality: PlaybackQuality) {
+        UserDefaults.standard.set(quality.rawValue, forKey: "native.playbackQuality")
+    }
+}
+
+enum PlaybackSourceSettings {
+    static var amazonEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "native.amazonEnabled") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "native.amazonEnabled") }
+    }
+
+    static var amazonApiBaseURL: String {
+        get {
+            let value = UserDefaults.standard.string(forKey: "native.amazonApiBaseURL")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (value?.isEmpty == false) ? value! : "https://amz.geeked.wtf"
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "native.amazonApiBaseURL") }
+    }
+
+    static var amazonBypassToken: String {
+        get { UserDefaults.standard.string(forKey: "native.amazonBypassToken") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "native.amazonBypassToken") }
+    }
+
+    static var deezerEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "native.deezerEnabled") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "native.deezerEnabled") }
+    }
+
+    static var deezerApiBaseURL: String {
+        get {
+            let value = UserDefaults.standard.string(forKey: "native.deezerApiBaseURL")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (value?.isEmpty == false) ? value! : "https://dzr.tabs-vs-spaces.wtf"
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "native.deezerApiBaseURL") }
+    }
+}
+
 struct Artist: Codable, Identifiable, Hashable {
     var id: String
     var name: String
@@ -115,6 +208,35 @@ struct StreamResponse: Codable {
     var quality: String
     var replayGain: Double?
     var peak: Double?
+    /// TIDAL OpenAPI can return a ~30s `PREVIEW` when full playback needs a subscription.
+    var isPreview: Bool = false
+    var previewReason: String? = nil
+    /// Actual playable media length when known (e.g. from DASH `mediaPresentationDuration`).
+    var mediaDuration: Double? = nil
+}
+
+struct LyricLine: Identifiable, Hashable {
+    var id: Int
+    var time: Double
+    var text: String
+}
+
+struct SyncedLyrics: Hashable {
+    var lines: [LyricLine]
+    var plainText: String?
+    var provider: String
+
+    var isSynced: Bool { !lines.isEmpty }
+    var isEmpty: Bool { lines.isEmpty && (plainText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) }
+
+    func activeIndex(at time: Double) -> Int? {
+        guard !lines.isEmpty else { return nil }
+        var match = 0
+        for (index, line) in lines.enumerated() {
+            if line.time <= time { match = index } else { break }
+        }
+        return match
+    }
 }
 
 enum ServiceError: LocalizedError, Equatable {

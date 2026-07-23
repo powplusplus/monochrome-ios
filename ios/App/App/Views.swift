@@ -277,8 +277,13 @@ struct SettingsView: View {
     @EnvironmentObject private var library: LibraryRepository
     @EnvironmentObject private var auth: AuthSession
     @AppStorage("native.darkAppearance") private var darkAppearance = true
-    @AppStorage("native.highQuality") private var highQuality = true
+    @AppStorage("native.playbackQuality") private var playbackQuality = PlaybackQuality.lossless.rawValue
     @AppStorage("native.gapless") private var gapless = true
+    @AppStorage("native.amazonEnabled") private var amazonEnabled = true
+    @AppStorage("native.amazonApiBaseURL") private var amazonApiBaseURL = "https://amz.geeked.wtf"
+    @AppStorage("native.amazonBypassToken") private var amazonBypassToken = ""
+    @AppStorage("native.deezerEnabled") private var deezerEnabled = true
+    @AppStorage("native.deezerApiBaseURL") private var deezerApiBaseURL = "https://dzr.tabs-vs-spaces.wtf"
 
     var body: some View {
         NavigationView {
@@ -289,9 +294,32 @@ struct SettingsView: View {
                 }
                 Section("Appearance") { Toggle("Dark appearance", isOn: $darkAppearance); Label("Uses your system text size", systemImage: "textformat.size") }
                 Section("Audio") {
-                    Toggle("Prefer lossless", isOn: $highQuality)
+                    Picker("Streaming quality", selection: $playbackQuality) {
+                        ForEach(PlaybackQuality.allCases) { quality in
+                            Text(quality.title).tag(quality.rawValue)
+                        }
+                    }
                     Toggle("Gapless transitions", isOn: $gapless)
                     Picker("Playback speed", selection: $playback.playbackRate) { Text("0.75×").tag(Float(0.75)); Text("1×").tag(Float(1)); Text("1.25×").tag(Float(1.25)); Text("1.5×").tag(Float(1.5)); Text("2×").tag(Float(2)) }
+                }
+                Section(header: Text("Sources"), footer: Text("Same order as web Monochrome: Amazon → Deezer → TIDAL. Amazon needs a bypass token (or Turnstile on web). Encrypted Amazon streams decrypt on-device.")) {
+                    Toggle("Amazon Music", isOn: $amazonEnabled)
+                    if amazonEnabled {
+                        TextField("Amazon API base URL", text: $amazonApiBaseURL)
+                            .textInputAutocapitalization(.never)
+                            .keyboardType(.URL)
+                            .disableAutocorrection(true)
+                        SecureField("Amazon bypass token", text: $amazonBypassToken)
+                            .textInputAutocapitalization(.never)
+                            .disableAutocorrection(true)
+                    }
+                    Toggle("Deezer fallback", isOn: $deezerEnabled)
+                    if deezerEnabled {
+                        TextField("Deezer API base URL", text: $deezerApiBaseURL)
+                            .textInputAutocapitalization(.never)
+                            .keyboardType(.URL)
+                            .disableAutocorrection(true)
+                    }
                 }
                 Section("Services") { NavigationLink("Scrobbling", destination: ScrobblingSettingsView()); NavigationLink("Provider order", destination: ProviderSettingsView()) }
                 Section("Data") {
@@ -444,17 +472,26 @@ struct NowPlayingView: View {
     @EnvironmentObject private var playback: PlaybackEngine
     @EnvironmentObject private var library: LibraryRepository
     @State private var showQueue = false
+    @State private var showLyrics = false
+    @State private var lyrics: SyncedLyrics?
+    @State private var lyricsLoading = false
+    @State private var dismissOffset: CGFloat = 0
+    @State private var artDragOffset: CGFloat = 0
 
     var body: some View {
         GeometryReader { geometry in
             let landscape = geometry.size.width > geometry.size.height
+            let dismissProgress = min(max(dismissOffset / max(geometry.size.height * 0.42, 1), 0), 1)
             ZStack {
                 backdrop
-                    .frame(width: geometry.size.width, height: geometry.size.height)
-                    .clipped()
+                    .ignoresSafeArea()
+                // Content stays in system safe area (incl. hotspot / call status bar).
+                // Only backdrop bleeds edge-to-edge.
                 VStack(spacing: 0) {
                     header
-                        .padding(.top, geometry.safeAreaInsets.top)
+                        .padding(.top, max(geometry.safeAreaInsets.top, Self.keyWindowTopInset))
+                        .contentShape(Rectangle())
+                        .gesture(dismissDrag(screenHeight: geometry.size.height))
                     if landscape {
                         landscapeLayout(in: geometry)
                     } else {
@@ -463,11 +500,96 @@ struct NowPlayingView: View {
                 }
                 .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
             }
-            .frame(width: geometry.size.width, height: geometry.size.height)
+            .offset(y: dismissOffset)
+            .scaleEffect(1 - dismissProgress * 0.06, anchor: .top)
+            .opacity(1 - dismissProgress * 0.45)
+            .simultaneousGesture(dismissDrag(screenHeight: geometry.size.height))
         }
-        .ignoresSafeArea()
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showQueue) { QueueView() }
+        .task(id: playback.currentTrack?.id) {
+            await loadLyrics()
+        }
+        .animation(.easeInOut(duration: 0.35), value: showLyrics)
+    }
+
+    private func finishDismiss(screenHeight: CGFloat) {
+        withAnimation(.easeOut(duration: 0.2)) {
+            dismissOffset = screenHeight
+            artDragOffset = 0
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) {
+            dismiss()
+        }
+    }
+
+    private func snapDismissBack() {
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+            dismissOffset = 0
+        }
+    }
+
+    private func dismissDrag(screenHeight: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 20, coordinateSpace: .local)
+            .onChanged { value in
+                let dy = value.translation.height
+                let dx = abs(value.translation.width)
+                guard dy > 0, dy > dx * 1.15 else { return }
+                dismissOffset = dy
+            }
+            .onEnded { value in
+                let dy = value.translation.height
+                let dx = abs(value.translation.width)
+                let predicted = value.predictedEndTranslation.height
+                if dy > dx && (dy > 100 || predicted > 220) {
+                    finishDismiss(screenHeight: screenHeight)
+                } else {
+                    snapDismissBack()
+                }
+            }
+    }
+
+    private var artworkSwipe: some Gesture {
+        DragGesture(minimumDistance: 28, coordinateSpace: .local)
+            .onChanged { value in
+                let dx = value.translation.width
+                let dy = value.translation.height
+                if dy > 20, dy > abs(dx) * 1.1 {
+                    artDragOffset = 0
+                    dismissOffset = dy
+                    return
+                }
+                guard abs(dx) > abs(dy) * 1.2 else {
+                    artDragOffset = 0
+                    return
+                }
+                artDragOffset = dx * 0.35
+            }
+            .onEnded { value in
+                let dx = value.translation.width
+                let dy = value.translation.height
+                let predictedY = value.predictedEndTranslation.height
+                let predictedX = value.predictedEndTranslation.width
+
+                if dy > abs(dx) * 1.1, dy > 100 || predictedY > 220 {
+                    finishDismiss(screenHeight: UIScreen.main.bounds.height)
+                    return
+                }
+
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                    artDragOffset = 0
+                }
+                if dismissOffset > 0 {
+                    snapDismissBack()
+                }
+
+                guard abs(dx) > abs(dy), abs(dx) > 56 || abs(predictedX) > 140 else { return }
+                if dx < 0 || predictedX < -140 {
+                    playback.next()
+                } else {
+                    playback.previous()
+                }
+            }
     }
 
     private var backdrop: some View {
@@ -502,12 +624,23 @@ struct NowPlayingView: View {
             }
             .accessibilityLabel("Close player")
             Spacer()
-            Text("NOW PLAYING")
+            Text(showLyrics ? "LYRICS" : "NOW PLAYING")
                 .font(.caption2.weight(.semibold))
                 .tracking(1.2)
                 .foregroundStyle(.secondary)
             Spacer()
-            Color.clear.frame(width: 40, height: 40)
+            Button {
+                withAnimation(.easeInOut(duration: 0.35)) { showLyrics.toggle() }
+            } label: {
+                Image(systemName: showLyrics ? "quote.bubble.fill" : "quote.bubble")
+                    .font(.headline)
+                    .frame(width: 40, height: 40)
+                    .background(.thinMaterial, in: Circle())
+                    .foregroundStyle(showLyrics ? Color.pink : Color.primary)
+            }
+            .accessibilityLabel(showLyrics ? "Hide lyrics" : "Show lyrics")
+            .disabled(lyrics == nil && !lyricsLoading)
+            .opacity(lyrics == nil && !lyricsLoading ? 0.35 : 1)
         }
         .padding(.horizontal, 18)
         .padding(.top, 8)
@@ -526,7 +659,19 @@ struct NowPlayingView: View {
         let needsScroll = artSide + controlsBudget + 40 > availableHeight
 
         return Group {
-            if needsScroll {
+            if showLyrics {
+                VStack(spacing: 12) {
+                    artwork
+                        .frame(width: min(96, artSide * 0.28), height: min(96, artSide * 0.28))
+                        .padding(.top, 4)
+                    lyricsPane
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    controls
+                        .padding(.horizontal, sideInset)
+                        .padding(.bottom, bottomPad)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if needsScroll {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 24) {
                         artwork
@@ -561,19 +706,72 @@ struct NowPlayingView: View {
         let artSide = min(usableHeight, min(geometry.size.width * 0.38, 320))
 
         return HStack(alignment: .center, spacing: 24) {
-            artwork
-                .frame(width: artSide, height: artSide)
-            ScrollView(.vertical, showsIndicators: false) {
-                controls
-                    .frame(maxWidth: 460)
-                    .padding(.vertical, 8)
+            if showLyrics {
+                VStack(spacing: 16) {
+                    artwork
+                        .frame(width: min(artSide * 0.72, 220), height: min(artSide * 0.72, 220))
+                    controls
+                        .frame(maxWidth: 420)
+                }
+                .frame(maxWidth: geometry.size.width * 0.42)
+                lyricsPane
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                artwork
+                    .frame(width: artSide, height: artSide)
+                ScrollView(.vertical, showsIndicators: false) {
+                    controls
+                        .frame(maxWidth: 460)
+                        .padding(.vertical, 8)
+                }
+                .frame(maxHeight: .infinity)
             }
-            .frame(maxHeight: .infinity)
         }
         .padding(.leading, leadingPad)
         .padding(.trailing, trailingPad)
         .padding(.bottom, max(8, geometry.safeAreaInsets.bottom))
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder
+    private var lyricsPane: some View {
+        if lyricsLoading && lyrics == nil {
+            ProgressView()
+                .tint(.white)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if let lyrics, !lyrics.isEmpty {
+            SyncedLyricsView(
+                lyrics: lyrics,
+                currentTime: playback.elapsed,
+                onSeek: { playback.seek(to: $0) }
+            )
+            .padding(.horizontal, 22)
+        } else {
+            Text("No lyrics for this track")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func loadLyrics() async {
+        guard let track = playback.currentTrack else {
+            lyrics = nil
+            lyricsLoading = false
+            showLyrics = false
+            return
+        }
+        lyricsLoading = true
+        lyrics = nil
+        let fetched = await MusicService.shared.lyrics(for: track)
+        guard playback.currentTrack?.id == track.id else { return }
+        lyrics = fetched
+        lyricsLoading = false
+        if let fetched, !fetched.isEmpty {
+            showLyrics = true
+        } else {
+            showLyrics = false
+        }
     }
 
     private var artwork: some View {
@@ -582,6 +780,10 @@ struct NowPlayingView: View {
             .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.10), lineWidth: 0.5))
             .shadow(color: .black.opacity(0.42), radius: 28, y: 16)
+            .offset(x: artDragOffset)
+            .opacity(1 - min(abs(artDragOffset) / 180, 0.35))
+            .gesture(artworkSwipe)
+            .accessibilityHint("Swipe down to close. Swipe sideways to change track.")
     }
 
     private var controls: some View {
@@ -677,7 +879,7 @@ struct NowPlayingView: View {
             if let message = playback.errorMessage {
                 Text(message)
                     .font(.footnote)
-                    .foregroundColor(.red)
+                    .foregroundColor(message.hasPrefix("Preview only") ? Color.white.opacity(0.7) : .red)
                     .multilineTextAlignment(.center)
             }
         }
@@ -686,6 +888,139 @@ struct NowPlayingView: View {
     private func time(_ seconds: Double) -> String {
         let value = Int(seconds.isFinite ? seconds : 0)
         return String(format: "%d:%02d", value / 60, value % 60)
+    }
+
+    /// GeometryReader can lag behind status-bar expansions (hotspot/call).
+    private static var keyWindowTopInset: CGFloat {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let window = scenes.flatMap(\.windows).first(where: \.isKeyWindow) ?? scenes.flatMap(\.windows).first
+        return window?.safeAreaInsets.top ?? 0
+    }
+}
+
+/// Old-site karaoke: blur/scale past+upcoming, glow active line, auto-scroll.
+struct SyncedLyricsView: View {
+    let lyrics: SyncedLyrics
+    let currentTime: Double
+    var onSeek: (Double) -> Void
+
+    private var activeIndex: Int? { lyrics.activeIndex(at: currentTime) }
+
+    var body: some View {
+        Group {
+            if lyrics.isSynced {
+                syncedBody
+            } else if let plain = lyrics.plainText, !plain.isEmpty {
+                ScrollView {
+                    Text(plain)
+                        .font(.title3.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.78))
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 24)
+                }
+                .modifier(HiddenScrollIndicators())
+            }
+        }
+    }
+
+    private var syncedBody: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 18) {
+                    ForEach(lyrics.lines) { line in
+                        let role = lineRole(for: line.id)
+                        Button {
+                            onSeek(line.time)
+                        } label: {
+                            Text(line.text)
+                                .font(role == .active
+                                      ? .system(size: 28, weight: .semibold, design: .rounded)
+                                      : .system(size: 22, weight: .medium, design: .rounded))
+                                .foregroundStyle(foreground(for: role))
+                                .shadow(color: role == .active ? Color.white.opacity(0.28) : .clear, radius: 16)
+                                .multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .scaleEffect(scale(for: role), anchor: .leading)
+                                .blur(radius: blur(for: role))
+                                .opacity(opacity(for: role))
+                                .animation(.easeInOut(duration: 0.55), value: activeIndex)
+                        }
+                        .buttonStyle(.plain)
+                        .id(line.id)
+                    }
+                }
+                .padding(.vertical, 36)
+            }
+            .modifier(HiddenScrollIndicators())
+            .onChange(of: activeIndex) { index in
+                guard let index else { return }
+                withAnimation(.easeInOut(duration: 0.45)) {
+                    proxy.scrollTo(index, anchor: UnitPoint(x: 0.5, y: 0.32))
+                }
+            }
+            .onAppear {
+                if let index = activeIndex {
+                    proxy.scrollTo(index, anchor: UnitPoint(x: 0.5, y: 0.32))
+                }
+            }
+        }
+    }
+
+    private enum LineRole { case past, active, upcoming, far }
+
+    private func lineRole(for id: Int) -> LineRole {
+        guard let activeIndex else { return .far }
+        if id == activeIndex { return .active }
+        if id < activeIndex { return .past }
+        if id == activeIndex + 1 { return .upcoming }
+        return .far
+    }
+
+    private func opacity(for role: LineRole) -> Double {
+        switch role {
+        case .active: 1
+        case .upcoming: 0.72
+        case .past: 0.32
+        case .far: 0.22
+        }
+    }
+
+    private func scale(for role: LineRole) -> CGFloat {
+        switch role {
+        case .active: 1
+        case .upcoming: 0.98
+        case .past: 0.93
+        case .far: 0.92
+        }
+    }
+
+    private func blur(for role: LineRole) -> CGFloat {
+        switch role {
+        case .active: 0
+        case .upcoming: 0.6
+        case .past: 1.6
+        case .far: 2.2
+        }
+    }
+
+    private func foreground(for role: LineRole) -> Color {
+        switch role {
+        case .active: Color(white: 0.96)
+        case .upcoming: Color.white.opacity(0.78)
+        case .past, .far: Color.white.opacity(0.55)
+        }
+    }
+}
+
+private struct HiddenScrollIndicators: ViewModifier {
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 16.0, *) {
+            content.scrollIndicators(.hidden)
+        } else {
+            content
+        }
     }
 }
 
@@ -719,7 +1054,17 @@ struct ScrobblingSettingsView: View {
 
 struct ProviderSettingsView: View {
     @AppStorage("native.provider") private var provider = Provider.tidal.rawValue
-    var body: some View { Form { Picker("Preferred provider", selection: $provider) { ForEach(Provider.allCases) { Text($0.title).tag($0.rawValue) } }; Text("Monochrome fails over to another healthy API instance automatically. Protected streams bypass unsupported processing instead of delaying playback.").font(.footnote).foregroundColor(.secondary) }.navigationTitle("Providers") }
+    var body: some View {
+        Form {
+            Picker("Preferred catalog provider", selection: $provider) {
+                ForEach(Provider.allCases) { Text($0.title).tag($0.rawValue) }
+            }
+            Text("Catalog search still uses TIDAL metadata. Full audio resolves Amazon → Deezer → TIDAL, matching web Monochrome.")
+                .font(.footnote)
+                .foregroundColor(.secondary)
+        }
+        .navigationTitle("Providers")
+    }
 }
 
 struct RoutePickerView: UIViewRepresentable {
@@ -841,6 +1186,89 @@ final class ArtworkImageCache {
     func insert(_ image: UIImage, for url: URL) {
         let cost = Int(image.size.width * image.size.height * image.scale * image.scale * 4)
         cache.setObject(image, forKey: url as NSURL, cost: cost)
+    }
+}
+
+/// Dominant cover colors for Now Playing ambient gradient (Apple Music–style).
+struct ArtworkPalette: Equatable {
+    var top: Color
+    var mid: Color
+    var bottom: Color
+
+    static let fallback = ArtworkPalette(
+        top: Color(red: 0.18, green: 0.18, blue: 0.22),
+        mid: Color(red: 0.10, green: 0.10, blue: 0.12),
+        bottom: .black
+    )
+
+    static func load(from url: URL?) async -> ArtworkPalette {
+        guard let url else { return .fallback }
+        if let cached = ArtworkImageCache.shared.image(for: url) {
+            return extract(from: cached)
+        }
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            guard let image = UIImage(data: data) else { return .fallback }
+            ArtworkImageCache.shared.insert(image, for: url)
+            return extract(from: image)
+        } catch {
+            return .fallback
+        }
+    }
+
+    static func extract(from image: UIImage) -> ArtworkPalette {
+        let width = 32
+        let height = 32
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return .fallback }
+        UIGraphicsPushContext(ctx)
+        image.draw(in: CGRect(x: 0, y: 0, width: width, height: height))
+        UIGraphicsPopContext()
+
+        func average(x0: Int, y0: Int, x1: Int, y1: Int) -> (CGFloat, CGFloat, CGFloat) {
+            var r = 0.0, g = 0.0, b = 0.0, n = 0.0
+            for y in y0..<y1 {
+                for x in x0..<x1 {
+                    let i = (y * width + x) * 4
+                    let pr = Double(pixels[i]) / 255
+                    let pg = Double(pixels[i + 1]) / 255
+                    let pb = Double(pixels[i + 2]) / 255
+                    // Skip near-white / near-black → keep palette vivid.
+                    let luma = 0.2126 * pr + 0.7152 * pg + 0.0722 * pb
+                    if luma < 0.08 || luma > 0.92 { continue }
+                    r += pr; g += pg; b += pb; n += 1
+                }
+            }
+            guard n > 0 else { return (0.2, 0.2, 0.24) }
+            return (r / n, g / n, b / n)
+        }
+
+        let topRGB = average(x0: 0, y0: 0, x1: width, y1: height / 2)
+        let midRGB = average(x0: 0, y0: height / 4, x1: width, y1: (height * 3) / 4)
+        let botRGB = average(x0: 0, y0: height / 2, x1: width, y1: height)
+
+        func wash(_ c: (CGFloat, CGFloat, CGFloat), boost: CGFloat, darken: CGFloat) -> Color {
+            let avg = (c.0 + c.1 + c.2) / 3
+            let r = min(1, max(0, (avg + (c.0 - avg) * boost) * darken))
+            let g = min(1, max(0, (avg + (c.1 - avg) * boost) * darken))
+            let b = min(1, max(0, (avg + (c.2 - avg) * boost) * darken))
+            return Color(red: r, green: g, blue: b)
+        }
+
+        return ArtworkPalette(
+            top: wash(topRGB, boost: 1.45, darken: 0.72),
+            mid: wash(midRGB, boost: 1.35, darken: 0.48),
+            bottom: wash(botRGB, boost: 1.2, darken: 0.22)
+        )
     }
 }
 

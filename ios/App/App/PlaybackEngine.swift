@@ -140,7 +140,7 @@ final class PlaybackEngine: ObservableObject {
         loadTask?.cancel(); isLoading = true; errorMessage = nil
         loadTask = Task {
             do {
-                let stream = try await musicService.resolveStream(for: track)
+                let stream = try await musicService.resolveStream(for: track, quality: PlaybackQuality.stored)
                 guard !Task.isCancelled else { return }
                 let item = AVPlayerItem(url: stream.url)
                 item.audioTimePitchAlgorithm = .timeDomain
@@ -163,7 +163,12 @@ final class PlaybackEngine: ObservableObject {
                     }
                 }
                 player.removeAllItems(); player.insert(item, after: nil)
-                elapsed = 0; duration = track.duration
+                elapsed = 0
+                duration = stream.mediaDuration ?? track.duration
+                if stream.isPreview {
+                    let previewSeconds = Int((stream.mediaDuration ?? 30).rounded())
+                    errorMessage = "Preview only (\(previewSeconds)s). Full track needs a TIDAL subscription."
+                }
                 if autoplay { resume() }
                 LibraryRepository.shared.recordPlayback(track)
                 ScrobblingCoordinator.shared.nowPlaying(track)
@@ -228,7 +233,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
 
     func download(_ track: Track) async {
         do {
-            let stream = try await MusicService.shared.resolveStream(for: track)
+            let stream = try await MusicService.shared.resolveStream(for: track, quality: PlaybackQuality.stored)
             let task = session.downloadTask(with: stream.url); tasks[task.taskIdentifier] = track; progress[track.id] = 0; task.resume()
         } catch { progress[track.id] = nil }
     }
