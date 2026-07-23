@@ -64,14 +64,20 @@ final class AppTests: XCTestCase {
         auth.clearCache()
     }
 
-    func testAmazonTurnstileChallengeHTMLInteractionOnlyParity() {
-        let html = AmazonTurnstileAuth.challengeHTML(siteKey: "0xTEST", mode: .interactionOnly)
+    func testAmazonTurnstileChallengeHTMLInvisibleParity() {
+        let html = AmazonTurnstileAuth.challengeHTML(siteKey: "0xTEST", mode: .invisible)
         XCTAssertTrue(html.contains("execution: 'execute'"))
-        XCTAssertTrue(html.contains("appearance: 'interaction-only'"))
+        XCTAssertTrue(html.contains("size: 'invisible'"))
         XCTAssertTrue(html.contains("before-interactive-callback"))
         XCTAssertTrue(html.contains("turnstile.execute(id)"))
         XCTAssertTrue(html.contains("sitekey: '0xTEST'"))
+        XCTAssertFalse(html.contains("appearance: 'interaction-only'"))
         XCTAssertFalse(html.contains("appearance: 'always'"))
+    }
+
+    func testProviderRequestsUseOfficialMonochromeOrigin() {
+        XCTAssertEqual(MusicService.webRequestHeaders["Origin"], "https://monochrome.tf")
+        XCTAssertEqual(MusicService.webRequestHeaders["Referer"], "https://monochrome.tf/")
     }
 
     func testAmazonTurnstileChallengeHTMLVisibleFallbackParity() {
@@ -84,7 +90,7 @@ final class AppTests: XCTestCase {
     }
 
     func testAmazonTurnstileSiteKeyEscapesQuotes() {
-        let html = AmazonTurnstileAuth.challengeHTML(siteKey: "key'\\x", mode: .interactionOnly)
+        let html = AmazonTurnstileAuth.challengeHTML(siteKey: "key'\\x", mode: .invisible)
         XCTAssertTrue(html.contains("sitekey: 'key\\'\\\\x'"))
     }
 }

@@ -146,7 +146,18 @@ final class PlaybackEngine: ObservableObject {
             do {
                 let stream = try await musicService.resolveStream(for: track, quality: PlaybackQuality.stored)
                 guard !Task.isCancelled else { return }
-                let item = AVPlayerItem(url: stream.url)
+                let item: AVPlayerItem
+                if stream.requestHeaders.isEmpty {
+                    item = AVPlayerItem(url: stream.url)
+                } else {
+                    // Deezer authorizes the official Monochrome web origin. Keep those headers
+                    // on AVFoundation's follow-up range requests, not only on the initial probe.
+                    let asset = AVURLAsset(
+                        url: stream.url,
+                        options: ["AVURLAssetHTTPHeaderFieldsKey": stream.requestHeaders]
+                    )
+                    item = AVPlayerItem(asset: asset)
+                }
                 item.audioTimePitchAlgorithm = .timeDomain
                 pendingAutoplay = autoplay
                 itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
@@ -253,7 +264,9 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     func download(_ track: Track) async {
         do {
             let stream = try await MusicService.shared.resolveStream(for: track, quality: PlaybackQuality.stored)
-            let task = session.downloadTask(with: stream.url); tasks[task.taskIdentifier] = track; progress[track.id] = 0; task.resume()
+            var request = URLRequest(url: stream.url)
+            stream.requestHeaders.forEach { request.setValue($1, forHTTPHeaderField: $0) }
+            let task = session.downloadTask(with: request); tasks[task.taskIdentifier] = track; progress[track.id] = 0; task.resume()
         } catch { progress[track.id] = nil }
     }
     func cancel(_ track: Track) {

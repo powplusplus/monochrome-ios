@@ -5,15 +5,15 @@ import WebKit
 /// Mirrors web Monochrome `getTurnstileJwt`: solve Cloudflare Turnstile on
 /// `monochrome.tf` origin, exchange token at Amazon `/api/auth/turnstile`.
 ///
-/// Invisible / interaction-only first (no UI flash). Overlay only when CF needs
+/// Invisible first (no UI flash). Overlay only when CF needs
 /// a click, or when the invisible attempt fails and we fall back to compact.
 @MainActor
 final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
     static let shared = AmazonTurnstileAuth()
 
     enum ChallengeMode: String {
-        /// Web parity: `execution: execute` + `appearance: interaction-only`.
-        case interactionOnly
+        /// Exact web parity: `size: invisible` + `execution: execute`.
+        case invisible
         /// Visible compact fallback after invisible failure.
         case alwaysVisible
     }
@@ -26,7 +26,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
     private var continuation: CheckedContinuation<String, Error>?
     private var timeoutItem: DispatchWorkItem?
     private var inFlight: Task<String, Error>?
-    private var mode: ChallengeMode = .interactionOnly
+    private var mode: ChallengeMode = .invisible
     private var siteKeyForRetry: String = ""
 
     func cachedJWT() -> String? {
@@ -59,6 +59,8 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
             var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("https://monochrome.tf", forHTTPHeaderField: "Origin")
+            request.setValue("https://monochrome.tf/", forHTTPHeaderField: "Referer")
             request.httpBody = try JSONSerialization.data(withJSONObject: [
                 "cf_turnstile_response": turnstileToken
             ])
@@ -86,12 +88,12 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
             .replacingOccurrences(of: "'", with: "\\'")
         let renderOptions: String
         switch mode {
-        case .interactionOnly:
+        case .invisible:
             renderOptions = """
                   sitekey: '\(escapedKey)',
+                  size: 'invisible',
                   execution: 'execute',
-                  appearance: 'interaction-only',
-                  theme: 'dark',
+                  theme: 'auto',
                   'before-interactive-callback': function() {
                     window.webkit.messageHandlers.monochromeTurnstile.postMessage({ interactive: true });
                   },
@@ -123,7 +125,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
                   }
             """
         }
-        let executeLine = mode == .interactionOnly
+        let executeLine = mode == .invisible
             ? "var id = turnstile.render('#cf', opts); turnstile.execute(id);"
             : "turnstile.render('#cf', opts);"
         return """
@@ -159,7 +161,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
             self.finishPending(with: .failure(CancellationError()))
             self.continuation = continuation
             self.siteKeyForRetry = siteKey
-            self.mode = .interactionOnly
+            self.mode = .invisible
 
             guard Self.foregroundWindowScene != nil else {
                 self.continuation = nil
@@ -167,7 +169,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
                 return
             }
 
-            presentChallenge(siteKey: siteKey, mode: .interactionOnly, showOverlay: false)
+            presentChallenge(siteKey: siteKey, mode: .invisible, showOverlay: false)
 
             let timeout = DispatchWorkItem { [weak self] in
                 self?.finishPending(with: .failure(ServiceError.unavailable("Amazon Turnstile timed out")))
@@ -236,7 +238,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
     }
 
     private func retryVisibleFallback() {
-        guard mode == .interactionOnly else {
+        guard mode == .invisible else {
             finishPending(with: .failure(ServiceError.unavailable("Amazon Turnstile: turnstile_failed")))
             return
         }
@@ -258,7 +260,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
                 finishPending(with: .success(token))
             } else {
                 let detail = body["error"] as? String ?? "turnstile_failed"
-                if detail == "turnstile_failed", mode == .interactionOnly {
+                if detail == "turnstile_failed", mode == .invisible {
                     retryVisibleFallback()
                     return
                 }

@@ -3,6 +3,13 @@ import Foundation
 final class MusicService {
     static let shared = MusicService()
 
+    /// Provider gateways deliberately allow the official web app rather than arbitrary API clients.
+    /// Preserve that contract when the native shell makes the equivalent request.
+    static let webRequestHeaders = [
+        "Origin": "https://monochrome.tf",
+        "Referer": "https://monochrome.tf/",
+    ]
+
     private let session: URLSession
     private let apiInstances = [
         "https://eu-central.monochrome.tf", "https://us-west.monochrome.tf",
@@ -236,6 +243,7 @@ final class MusicService {
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        Self.webRequestHeaders.forEach { request.setValue($1, forHTTPHeaderField: $0) }
         if let jwt, !jwt.isEmpty {
             request.setValue(jwt, forHTTPHeaderField: "X-Turnstile-JWT")
         }
@@ -281,11 +289,8 @@ final class MusicService {
             throw ServiceError.unavailable("Deezer lookup needs ISRC")
         }
         let base = PlaybackSourceSettings.deezerApiBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        // Prefer selected quality, then fall back through lighter formats (FLAC mirrors often 403).
-        var formats = [quality.deezerFormat]
-        for extra in ["MP3_320", "MP3_128", "FLAC"] where !formats.contains(extra) {
-            formats.append(extra)
-        }
+        // Web Monochrome resolves exactly one format for the selected quality.
+        let formats = [quality.deezerFormat]
 
         var latestError: Error = ServiceError.unavailable("Deezer stream unavailable")
         for format in formats {
@@ -300,6 +305,7 @@ final class MusicService {
             var head = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
             head.httpMethod = "HEAD"
             head.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+            Self.webRequestHeaders.forEach { head.setValue($1, forHTTPHeaderField: $0) }
             if let (_, headResponse) = try? await session.data(for: head),
                let http = headResponse as? HTTPURLResponse,
                (200..<400).contains(http.statusCode) || http.statusCode == 405 || http.statusCode == 501 {
@@ -309,6 +315,7 @@ final class MusicService {
                     quality: format,
                     replayGain: nil,
                     peak: nil,
+                    requestHeaders: Self.webRequestHeaders,
                     isPreview: false,
                     previewReason: nil,
                     mediaDuration: track.duration > 0 ? track.duration : nil
@@ -318,6 +325,7 @@ final class MusicService {
             var probe = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
             probe.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
             probe.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+            Self.webRequestHeaders.forEach { probe.setValue($1, forHTTPHeaderField: $0) }
             do {
                 let (_, response) = try await session.data(for: probe)
                 if let http = response as? HTTPURLResponse {
@@ -332,6 +340,7 @@ final class MusicService {
                     quality: format,
                     replayGain: nil,
                     peak: nil,
+                    requestHeaders: Self.webRequestHeaders,
                     isPreview: false,
                     previewReason: nil,
                     mediaDuration: track.duration > 0 ? track.duration : nil
