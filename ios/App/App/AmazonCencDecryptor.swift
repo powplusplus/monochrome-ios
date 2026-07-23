@@ -4,7 +4,7 @@ import CommonCrypto
 /// Ports Monochrome's SW Amazon CENC decryptor enough for AVPlayer: download
 /// encrypted fMP4, AES-CTR decrypt samples from `senc`, strip DRM boxes.
 enum AmazonCencDecryptor {
-    static func decryptFile(from sourceURL: URL, keyHex: String, session: URLSession = .shared) async throws -> URL {
+    static func decryptFile(from sourceURL: URL, keyHex: String, codec: String = "flac", session: URLSession = .shared) async throws -> URL {
         guard let key = Data(hexString: keyHex), key.count == 16 else {
             throw ServiceError.malformed("Amazon decryption key")
         }
@@ -12,14 +12,14 @@ enum AmazonCencDecryptor {
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw ServiceError.unavailable("Amazon stream download failed")
         }
-        let clear = try decrypt(data: data, key: key)
+        let clear = try decrypt(data: data, key: key, codec: codec)
         let target = FileManager.default.temporaryDirectory
             .appendingPathComponent("monochrome-amz-\(UUID().uuidString).m4a")
         try clear.write(to: target, options: .atomic)
         return target
     }
 
-    static func decrypt(data: Data, key: Data) throws -> Data {
+    static func decrypt(data: Data, key: Data, codec: String = "flac") throws -> Data {
         var output = Data()
         output.reserveCapacity(data.count)
         var offset = 0
@@ -46,6 +46,11 @@ enum AmazonCencDecryptor {
                 var free = box
                 renameBoxToFree(&free)
                 output.append(free)
+            } else if type == "stsd" {
+                // Amazon delivers encrypted `enca` sample entries. AVPlayer refuses
+                // them, so rewrite `enca` -> real codec fourcc and swap the DRM `sinf`
+                // for a FLAC `dfLa` config (ports sw-decrypter.js `modifyBox`).
+                output.append(modifyStsd(box, codec: codec))
             } else if ["sinf", "sbgp", "sgpd", "pssh"].contains(type) {
                 var free = box
                 renameBoxToFree(&free)
@@ -77,6 +82,95 @@ enum AmazonCencDecryptor {
             offset += boxSize
         }
         return output
+    }
+
+    /// Faithful port of sw-decrypter.js `modifyBox` for the `stsd` box: rewrite the
+    /// encrypted `enca` sample entry to the clear codec fourcc, and for FLAC replace
+    /// the DRM `sinf` with a `dfLa` decoder-config box (preserving an existing dfLa
+    /// when present). Byte-scan heuristic matches the reference implementation.
+    private static func modifyStsd(_ box: Data, codec: String) -> Data {
+        var bytes = [UInt8](box)
+        guard bytes.count > 12 else { return box }
+        let wantFlac = codec == "flac"
+        var isFlac = false
+        let hasDfLa = containsBox(bytes, "dfLa")
+
+        var i = 8
+        while i < bytes.count - 4 {
+            // 'enca' -> clear codec fourcc
+            if bytes[i] == 0x65, bytes[i + 1] == 0x6e, bytes[i + 2] == 0x63, bytes[i + 3] == 0x61 {
+                if wantFlac {
+                    bytes[i] = 0x66; bytes[i + 1] = 0x4c; bytes[i + 2] = 0x61; bytes[i + 3] = 0x43 // fLaC
+                    isFlac = true
+                } else {
+                    bytes[i] = 0x6d; bytes[i + 1] = 0x70; bytes[i + 2] = 0x34; bytes[i + 3] = 0x61 // mp4a
+                }
+            }
+
+            // 'sinf' -> dfLa (FLAC only). Needs the size dword at i-4.
+            if isFlac, i >= 4,
+               bytes[i] == 0x73, bytes[i + 1] == 0x69, bytes[i + 2] == 0x6e, bytes[i + 3] == 0x66 {
+                let start = i - 4
+                let sinfSize = Int(readU32(bytes, start))
+                guard sinfSize >= 8, start + sinfSize <= bytes.count else { i += 1; continue }
+                if hasDfLa {
+                    renameNestedToFree(&bytes, at: start, size: sinfSize)
+                } else if sinfSize >= 50 {
+                    // 50-byte dfLa (FullBox) with dummy 44.1kHz/16-bit/stereo STREAMINFO.
+                    let dfLa: [UInt8] = [
+                        0x00, 0x00, 0x00, 0x32, 0x64, 0x66, 0x4c, 0x61,
+                        0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x22,
+                        0x10, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x0a, 0xc4, 0x42, 0xf0, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00,
+                    ]
+                    for k in 0..<50 { bytes[start + k] = dfLa[k] }
+                    let remaining = sinfSize - 50
+                    if remaining >= 8 {
+                        writeU32(&bytes, start + 50, UInt32(remaining))
+                        bytes[start + 54] = 0x66; bytes[start + 55] = 0x72
+                        bytes[start + 56] = 0x65; bytes[start + 57] = 0x65 // free
+                        for j in (start + 58)..<(start + sinfSize) { bytes[j] = 0x00 }
+                    }
+                }
+            }
+            i += 1
+        }
+        return Data(bytes)
+    }
+
+    private static func containsBox(_ bytes: [UInt8], _ type: String) -> Bool {
+        let t = [UInt8](type.utf8)
+        guard t.count == 4, bytes.count >= 8 else { return false }
+        var i = 4
+        while i < bytes.count - 4 {
+            if bytes[i] == t[0], bytes[i + 1] == t[1], bytes[i + 2] == t[2], bytes[i + 3] == t[3] {
+                let size = Int(readU32(bytes, i - 4))
+                if size >= 8, i - 4 + size <= bytes.count { return true }
+            }
+            i += 1
+        }
+        return false
+    }
+
+    private static func renameNestedToFree(_ bytes: inout [UInt8], at start: Int, size: Int) {
+        guard start >= 0, size >= 8, start + size <= bytes.count else { return }
+        bytes[start + 4] = 0x66; bytes[start + 5] = 0x72
+        bytes[start + 6] = 0x65; bytes[start + 7] = 0x65 // free
+        for i in (start + 8)..<(start + size) { bytes[i] = 0x00 }
+    }
+
+    private static func readU32(_ bytes: [UInt8], _ offset: Int) -> UInt32 {
+        UInt32(bytes[offset]) << 24 | UInt32(bytes[offset + 1]) << 16 | UInt32(bytes[offset + 2]) << 8 | UInt32(bytes[offset + 3])
+    }
+
+    private static func writeU32(_ bytes: inout [UInt8], _ offset: Int, _ value: UInt32) {
+        bytes[offset] = UInt8((value >> 24) & 0xFF)
+        bytes[offset + 1] = UInt8((value >> 16) & 0xFF)
+        bytes[offset + 2] = UInt8((value >> 8) & 0xFF)
+        bytes[offset + 3] = UInt8(value & 0xFF)
     }
 
     private static func readBoxHeader(_ data: Data, at offset: Int) throws -> (size: Int, headerSize: Int, type: String) {

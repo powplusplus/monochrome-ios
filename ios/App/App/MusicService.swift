@@ -266,7 +266,12 @@ final class MusicService {
         let playURL: URL
         if let key, !key.isEmpty {
             // Web routes CENC through SW decryptor; native decrypts to a local clear file.
-            playURL = try await AmazonCencDecryptor.decryptFile(from: streamURL, keyHex: key, session: session)
+            playURL = try await AmazonCencDecryptor.decryptFile(
+                from: streamURL,
+                keyHex: key,
+                codec: quality.amazonTargetCodec,
+                session: session
+            )
         } else {
             playURL = streamURL
         }

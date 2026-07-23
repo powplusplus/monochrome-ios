@@ -41,6 +41,15 @@ enum PlaybackQuality: String, CaseIterable, Identifiable, Codable {
         }
     }
 
+    /// Original codec behind Amazon's `enca` (encrypted) sample entry. HD/UHD are
+    /// FLAC; SD tiers are AAC. Drives the CENC decryptor's sample-entry rewrite.
+    var amazonTargetCodec: String {
+        switch self {
+        case .low, .high: return "mp4a"
+        case .lossless, .hiResLossless: return "flac"
+        }
+    }
+
     /// TIDAL OpenAPI `formats` preference order when falling back to HiFi manifests.
     var tidalFormats: [String] {
         switch self {
