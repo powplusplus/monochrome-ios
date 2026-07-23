@@ -56,15 +56,31 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
             guard let url = URL(string: base + "/api/auth/turnstile") else {
                 throw ServiceError.invalidResponse
             }
-            var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+            var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            // The exchange endpoint sits behind the same origin check as the
+            // media routes.
+            request.setValue("https://monochrome.tf", forHTTPHeaderField: "Origin")
+            request.setValue("https://monochrome.tf/", forHTTPHeaderField: "Referer")
             request.httpBody = try JSONSerialization.data(withJSONObject: [
                 "cf_turnstile_response": turnstileToken
             ])
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let data: Data
+            let response: URLResponse
+            do {
+                (data, response) = try await URLSession.shared.data(for: request)
+            } catch let error as URLError where error.code == .timedOut {
+                // Naming the leg matters: a bare "The request timed out." was
+                // indistinguishable from the track lookup timing out.
+                throw ServiceError.unavailable("Amazon Turnstile exchange timed out")
+            }
             guard let http = response as? HTTPURLResponse else { throw ServiceError.invalidResponse }
-            guard (200..<300).contains(http.statusCode) else { throw ServiceError.http(http.statusCode) }
+            guard (200..<300).contains(http.statusCode) else {
+                let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                let detail = (body?["detail"] as? String) ?? (body?["error"] as? String)
+                throw detail.map { ServiceError.unavailable("Amazon Turnstile: \($0)") } ?? ServiceError.http(http.statusCode)
+            }
             let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             guard let jwt = object?["access_token"] as? String, !jwt.isEmpty else {
                 throw ServiceError.malformed("Amazon Turnstile JWT")

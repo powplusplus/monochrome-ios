@@ -201,6 +201,26 @@ final class MusicService {
                 bypass: bypass,
                 jwt: jwt
             )
+        } catch let error as URLError where error.code == .timedOut {
+            // `/api/track/` searches the Amazon catalog and mints a signed CDN
+            // URL before it answers; a cold instance regularly needs longer than
+            // one request window. Errors reject in tens of milliseconds, so a
+            // timeout means work in progress, not a dead endpoint — give it one
+            // more window before handing the track to Deezer.
+            do {
+                return try await fetchAmazonTrack(
+                    title: title,
+                    artist: artist,
+                    album: track.album?.title ?? "",
+                    duration: track.duration,
+                    quality: quality,
+                    apiBase: apiBase,
+                    bypass: bypass,
+                    jwt: jwt
+                )
+            } catch let retryError as URLError where retryError.code == .timedOut {
+                throw ServiceError.unavailable("Amazon track lookup timed out twice at \(apiBase)")
+            }
         } catch let error as ServiceError {
             // 401 means the provider rejected the JWT we sent; 428 means it wants
             // one it hasn't seen. Web answers both the same way — re-solve
@@ -251,13 +271,25 @@ final class MusicService {
         components?.queryItems = items
         guard let url = components?.url else { throw ServiceError.invalidResponse }
 
-        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        // Web can afford 15s because a stalled fetch there costs nothing; here a
+        // timeout drops the track to Deezer, whose account pool is frequently
+        // dead, so the user sees "no stream" for a request Amazon would have
+        // answered a few seconds later.
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         applyMonochromeOrigin(to: &request)
         if let jwt, !jwt.isEmpty {
             request.setValue(jwt, forHTTPHeaderField: "X-Turnstile-JWT")
         }
         let (data, response) = try await session.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            // Amazon states its own failures ("Invalid Turnstile JWT",
+            // "turnstile_required"); a bare status code hid which one it was.
+            if let detail = Self.providerErrorDetail(in: data), http.statusCode != 401, http.statusCode != 428 {
+                throw ServiceError.unavailable("Amazon Music: \(detail)")
+            }
+            throw ServiceError.http(http.statusCode)
+        }
         try validate(response)
         let object = try JSONSerialization.jsonObject(with: data)
         let payload = amazonTrackPayload(object)

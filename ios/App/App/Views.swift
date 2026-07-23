@@ -436,9 +436,11 @@ struct MiniPlayer: View {
         HStack(spacing: 8) {
             Button { showPlayer = true } label: {
                 HStack(spacing: 11) {
+                    // 48pt art was taller than the pill's own capsule, so the
+                    // corners clipped. Keep it inside the 38pt transport row.
                     ArtworkView(url: playback.currentTrack?.artworkURL)
-                        .frame(width: 48, height: 48)
-                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .frame(width: 38, height: 38)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                         .compositingGroup()
                     VStack(alignment: .leading, spacing: 2) {
                         Text(playback.currentTrack?.title ?? "").lineLimit(1).font(.subheadline.weight(.semibold))
@@ -893,14 +895,25 @@ struct NowPlayingView: View {
                 Spacer()
                 SkipButton(direction: .backward, font: .title) { playback.previous() }
                 Spacer()
-                Button { playback.playPause() } label: {
-                    ZStack {
-                        Circle().fill(Color.primary)
-                        Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
-                            .font(.title)
-                            .foregroundColor(Color(UIColor.systemBackground))
+                // Mini player already spins while a stream resolves; the full
+                // player showed a static play glyph, so a slow resolve read as
+                // a dead button.
+                SettledLoading(isLoading: playback.isLoading) { spinning in
+                    Button { playback.playPause() } label: {
+                        ZStack {
+                            Circle().fill(Color.primary)
+                            Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
+                                .font(.title)
+                                .foregroundColor(Color(UIColor.systemBackground))
+                                .opacity(spinning ? 0 : 1)
+                            ProgressView()
+                                .tint(Color(UIColor.systemBackground))
+                                .opacity(spinning ? 1 : 0)
+                        }
+                        .frame(width: 68, height: 68)
                     }
-                    .frame(width: 68, height: 68)
+                    .allowsHitTesting(!spinning)
+                    .accessibilityLabel(spinning ? "Loading track" : (playback.isPlaying ? "Pause" : "Play"))
                 }
                 Spacer()
                 SkipButton(direction: .forward, font: .title) { playback.next() }
