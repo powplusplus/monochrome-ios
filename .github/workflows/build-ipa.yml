@@ -56,7 +56,7 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent build/Payload build/Monochrome-native-unsigned.ipa
           cd build
           shasum -a 256 Monochrome-native-unsigned.ipa > Monochrome-native-unsigned.ipa.sha256
-          printf 'commit=%s\nminimum_ios=15.0\narchitecture=arm64\nnative_root=SwiftUI\n' "$GITHUB_SHA" > build-metadata.txt
+          printf 'commit=%s\nminimum_ios=26.0\narchitecture=arm64\nnative_root=SwiftUI\n' "$GITHUB_SHA" > build-metadata.txt
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
