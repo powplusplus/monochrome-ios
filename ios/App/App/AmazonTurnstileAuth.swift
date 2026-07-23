@@ -85,7 +85,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
     /// a token the server already considers dead — it answers 401 "Invalid
     /// Turnstile JWT", which surfaces as an unplayable track. Read the real
     /// expiry off the token and retire it a minute early.
-    static func expiryMilliseconds(forJWT jwt: String) -> Double {
+    nonisolated static func expiryMilliseconds(forJWT jwt: String) -> Double {
         let fallback = Date().timeIntervalSince1970 * 1000 + 55 * 60 * 1000
         let segments = jwt.split(separator: ".")
         guard segments.count >= 2,
@@ -97,7 +97,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         return (exp - 60) * 1000
     }
 
-    private static func base64URLDecoded(_ value: String) -> Data? {
+    nonisolated private static func base64URLDecoded(_ value: String) -> Data? {
         var text = value
             .replacingOccurrences(of: "-", with: "+")
             .replacingOccurrences(of: "_", with: "/")
@@ -106,7 +106,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
     }
 
     /// HTML loaded into WKWebView. Exposed for unit tests.
-    static func challengeHTML(siteKey: String, mode: ChallengeMode) -> String {
+    nonisolated static func challengeHTML(siteKey: String, mode: ChallengeMode) -> String {
         let escapedKey = siteKey
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "'", with: "\\'")
