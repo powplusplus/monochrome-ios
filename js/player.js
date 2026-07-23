@@ -80,6 +80,12 @@ export class Player {
             isFetching: false,
             hasMore: true,
         };
+        this._recentlyPlayedIds = [];
+        this._maxRecentlyPlayed = 100;
+        this.autoplayEnabled = false;
+        this.autoplaySeeds = [];
+        this.isFetchingAutoplay = false;
+        this.autoplayFetchPromise = null;
     }
 
     static async initialize(audioElement, api, quality) {

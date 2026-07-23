@@ -52,9 +52,15 @@ describe('Amazon Music source selection', () => {
                 isrc: 'USABC1234567',
             })
         );
+        localStorage.setItem('amazon-music-enabled', 'true');
+        localStorage.setItem('amazon-music-turnstile-bypass-token', 'test-bypass');
+        localStorage.removeItem('amazon-music-rate-limited-until');
+        api.streamCache?.clear?.();
     });
 
     afterEach(() => {
+        localStorage.removeItem('amazon-music-enabled');
+        localStorage.removeItem('amazon-music-turnstile-bypass-token');
         vi.restoreAllMocks();
     });
 
@@ -211,10 +217,14 @@ describe('Amazon Music Turnstile auth', () => {
     beforeEach(() => {
         api = new LosslessAPI({});
         document.body.innerHTML = '';
+        localStorage.setItem('amazon-music-turnstile-site-key', 'test-site-key');
     });
 
     afterEach(() => {
         document.body.innerHTML = '';
+        localStorage.removeItem('amazon-music-turnstile-site-key');
+        localStorage.removeItem('amazon_turnstile_jwt');
+        localStorage.removeItem('amazon_turnstile_expiry');
         vi.restoreAllMocks();
     });
 
@@ -248,6 +258,82 @@ describe('Amazon Music Turnstile auth', () => {
             appearance: 'always',
         });
         expect(turnstile.execute).toHaveBeenCalledWith('widget-1');
+    });
+
+    test('keeps the Turnstile panel hidden when the invisible challenge auto-passes', async () => {
+        const turnstile = {
+            render: vi.fn((_container, config) => {
+                queueMicrotask(() => config.callback('auto-token'));
+                return 'widget-1';
+            }),
+            execute: vi.fn(),
+            remove: vi.fn(),
+        };
+        api.loadTurnstile = vi.fn(() => Promise.resolve(turnstile));
+
+        await expect(api.getTurnstileResponse()).resolves.toBe('auto-token');
+
+        const panel = document.getElementById('amazon-music-turnstile-panel');
+        expect(panel).toBeNull();
+        expect(turnstile.execute).toHaveBeenCalledWith('widget-1');
+    });
+
+    test('shows the Turnstile panel only when Cloudflare requests interaction', async () => {
+        let finishChallenge;
+        const turnstile = {
+            render: vi.fn((_container, config) => {
+                queueMicrotask(() => {
+                    config['before-interactive-callback']();
+                });
+                finishChallenge = () => config.callback('interactive-token');
+                return 'widget-1';
+            }),
+            execute: vi.fn(),
+            remove: vi.fn(),
+        };
+        api.loadTurnstile = vi.fn(() => Promise.resolve(turnstile));
+
+        const tokenPromise = api.getTurnstileResponse();
+        await vi.waitFor(() => {
+            const panel = document.getElementById('amazon-music-turnstile-panel');
+            expect(panel?.style.display).toBe('block');
+        });
+        finishChallenge();
+        await expect(tokenPromise).resolves.toBe('interactive-token');
+        expect(document.getElementById('amazon-music-turnstile-panel')).toBeNull();
+    });
+
+    test('returns cached Turnstile JWT until expiry', async () => {
+        localStorage.setItem('amazon_turnstile_jwt', 'cached-jwt');
+        localStorage.setItem('amazon_turnstile_expiry', String(Date.now() + 60_000));
+        api.getTurnstileResponse = vi.fn();
+
+        await expect(api.getTurnstileJwt()).resolves.toBe('cached-jwt');
+        expect(api.getTurnstileResponse).not.toHaveBeenCalled();
+    });
+
+    test('exchanges a Turnstile token for a JWT', async () => {
+        api.getTurnstileResponse = vi.fn(() => Promise.resolve('cf-token'));
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(() =>
+                Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    json: () => Promise.resolve({ access_token: 'fresh-jwt' }),
+                })
+            )
+        );
+
+        await expect(api.getTurnstileJwt({ forceRefresh: true })).resolves.toBe('fresh-jwt');
+        expect(localStorage.getItem('amazon_turnstile_jwt')).toBe('fresh-jwt');
+        expect(fetch).toHaveBeenCalledWith(
+            expect.stringContaining('/api/auth/turnstile'),
+            expect.objectContaining({
+                method: 'POST',
+                body: JSON.stringify({ cf_turnstile_response: 'cf-token' }),
+            })
+        );
     });
 });
 

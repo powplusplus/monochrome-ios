@@ -28,6 +28,12 @@ vi.mock('../storage.js', () => ({
         setPreservePitch: vi.fn(),
     },
     radioSettings: { isEnabled: vi.fn(() => false) },
+    autoplaySettings: {
+        isEnabled: vi.fn(() => false),
+        setEnabled: vi.fn(),
+        isSmartRecsEnabled: vi.fn(() => false),
+    },
+    binauralDspSettings: { isEnabled: vi.fn(() => false) },
     contentBlockingSettings: {
         shouldHideTrack: vi.fn(() => false),
         shouldHideAlbum: vi.fn(() => false),
@@ -113,7 +119,8 @@ describe('Player', () => {
         api = {
             getCoverUrl: vi.fn((id) => `url-${id}`),
             getCoverSrcset: vi.fn(),
-            getStreamUrl: vi.fn(),
+            getStreamUrl: vi.fn(() => Promise.resolve({ url: 'https://example.com/a.flac' })),
+            getVideoArtwork: vi.fn(() => Promise.resolve(null)),
         };
 
         Player._instance = null;

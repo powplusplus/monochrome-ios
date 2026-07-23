@@ -215,6 +215,14 @@ export class MusicAPI {
         return api.getStreamUrl(cleanId, quality);
     }
 
+    async canPlayAmazonMusicStream(options) {
+        const api = this.getAPI();
+        if (typeof api.canPlayAmazonMusicStream === 'function') {
+            return api.canPlayAmazonMusicStream(options);
+        }
+        return false;
+    }
+
     // Cover/artwork methods
     getCoverUrl(id, size = '320') {
         if (typeof id === 'string' && id.startsWith('blob:')) {

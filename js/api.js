@@ -2004,6 +2004,8 @@ export class LosslessAPI {
         const normalized = String(codec || '').toLowerCase();
         if (normalized === 'flac') return 'fLaC';
         if (normalized === 'opus') return 'Opus';
+        if (normalized === 'aac' || normalized === 'mp4a' || normalized === 'mp4a.40.2') return 'mp4a.40.2';
+        if (normalized === 'eac3' || normalized === 'ec-3') return 'ec-3';
         return normalized;
     }
 
@@ -2134,6 +2136,20 @@ export class LosslessAPI {
         return await new Promise((resolve, reject) => {
             let timeoutId;
             let widgetId;
+            let retriedVisible = false;
+            const showPanel = () => {
+                const p = document.getElementById('amazon-music-turnstile-panel');
+                if (p) p.style.display = 'block';
+            };
+            const removeWidget = () => {
+                if (widgetId && turnstile.remove) {
+                    try {
+                        turnstile.remove(widgetId);
+                    } catch {}
+                }
+                widgetId = undefined;
+                container.innerHTML = '';
+            };
             const cleanup = () => {
                 playBtns.forEach((btn) => {
                     if (oldHtmls.has(btn)) {
@@ -2141,12 +2157,31 @@ export class LosslessAPI {
                     }
                 });
                 clearTimeout(timeoutId);
-                if (widgetId && turnstile.remove) {
-                    try {
-                        turnstile.remove(widgetId);
-                    } catch {}
-                }
+                removeWidget();
                 document.getElementById('amazon-music-turnstile-panel')?.remove();
+            };
+
+            const renderVisibleFallback = () => {
+                removeWidget();
+                showPanel();
+                widgetId = turnstile.render(container, {
+                    sitekey: siteKey,
+                    execution: 'render',
+                    appearance: 'always',
+                    theme: 'auto',
+                    callback: (token) => {
+                        cleanup();
+                        resolve(token);
+                    },
+                    'error-callback': () => {
+                        cleanup();
+                        reject(new Error('Turnstile failed'));
+                    },
+                    'expired-callback': () => {
+                        cleanup();
+                        reject(new Error('Turnstile expired'));
+                    },
+                });
             };
 
             timeoutId = setTimeout(() => {
@@ -2154,22 +2189,25 @@ export class LosslessAPI {
                 reject(new Error('Turnstile timed out'));
             }, 30000);
 
+            // Invisible / interaction-only first — panel stays hidden unless CF needs a click.
             widgetId = turnstile.render(container, {
                 sitekey: siteKey,
-                size: 'invisible',
                 execution: 'execute',
+                appearance: 'interaction-only',
                 theme: 'auto',
-                'before-interactive-callback': () => {
-                    const p = document.getElementById('amazon-music-turnstile-panel');
-                    if (p) p.style.display = 'block';
-                },
+                'before-interactive-callback': showPanel,
                 callback: (token) => {
                     cleanup();
                     resolve(token);
                 },
                 'error-callback': () => {
-                    cleanup();
-                    reject(new Error('Turnstile failed'));
+                    if (retriedVisible) {
+                        cleanup();
+                        reject(new Error('Turnstile failed'));
+                        return;
+                    }
+                    retriedVisible = true;
+                    renderVisibleFallback();
                 },
                 'expired-callback': () => {
                     cleanup();
@@ -2621,6 +2659,11 @@ export class LosslessAPI {
         return response;
     }
 
+    async canPlayAmazonMusicStream(_options = {}) {
+        // Native MSE/EME CENC playback vs SW decryptor proxy path.
+        return !!canUseNativeAmazonCenc;
+    }
+
     async getAmazonMusicStreamUrl(tidalTrackId, quality = 'LOSSLESS', options = {}) {
         try {
             if (!amazonMusicSettings?.isEnabled()) {
@@ -2765,18 +2808,34 @@ export class LosslessAPI {
         let qobuzResult = null;
         let deezerResult = null;
 
-        if (track?.isrc) {
-            qobuzResult = await this.getQobuzStreamUrl(track.isrc, quality);
-        }
-        if (!qobuzResult?.url) {
+        // 50/50 roll between Amazon and Qobuz when Amazon Music is enabled.
+        const preferAmazonFirst = amazonMusicSettings?.isEnabled() ? Math.random() >= 0.5 : false;
+
+        const tryAmazon = async () => {
+            if (amazonResult?.url) return;
             amazonResult = await this.getAmazonMusicStreamUrl(id, actualQuality, {
                 preferAdaptiveAuto: true,
                 track,
                 allowCencWithoutKeyId: needsProxyDecryption,
             });
-            if (!amazonResult?.url && track?.isrc) {
-                deezerResult = await this.getDeezerStreamUrl(track.isrc, quality);
-            }
+        };
+        const tryQobuz = async () => {
+            if (qobuzResult?.url || !track?.isrc) return;
+            qobuzResult = await this.getQobuzStreamUrl(track.isrc, quality);
+        };
+        const tryDeezer = async () => {
+            if (deezerResult?.url || !track?.isrc) return;
+            deezerResult = await this.getDeezerStreamUrl(track.isrc, quality);
+        };
+
+        if (preferAmazonFirst) {
+            await tryAmazon();
+            if (!amazonResult?.url) await tryQobuz();
+            if (!amazonResult?.url && !qobuzResult?.url) await tryDeezer();
+        } else {
+            await tryQobuz();
+            if (!qobuzResult?.url) await tryAmazon();
+            if (!qobuzResult?.url && !amazonResult?.url) await tryDeezer();
         }
 
         if (amazonResult?.url) {

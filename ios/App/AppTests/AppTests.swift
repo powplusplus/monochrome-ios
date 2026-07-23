@@ -39,4 +39,52 @@ final class AppTests: XCTestCase {
         repository.toggleFavorite(track)
         XCTAssertFalse(repository.isFavorite(track))
     }
+
+    @MainActor
+    func testAmazonTurnstileJwtCacheRoundTrip() {
+        let auth = AmazonTurnstileAuth.shared
+        auth.clearCache()
+        XCTAssertNil(auth.cachedJWT())
+
+        let expiry = Date().timeIntervalSince1970 * 1000 + 60 * 60 * 1000
+        UserDefaults.standard.set("native-jwt", forKey: "native.amazonTurnstileJwt")
+        UserDefaults.standard.set(expiry, forKey: "native.amazonTurnstileExpiry")
+        XCTAssertEqual(auth.cachedJWT(), "native-jwt")
+
+        auth.clearCache()
+        XCTAssertNil(auth.cachedJWT())
+    }
+
+    @MainActor
+    func testAmazonTurnstileJwtCacheRejectsExpired() {
+        let auth = AmazonTurnstileAuth.shared
+        UserDefaults.standard.set("stale-jwt", forKey: "native.amazonTurnstileJwt")
+        UserDefaults.standard.set(Date().timeIntervalSince1970 * 1000 - 1000, forKey: "native.amazonTurnstileExpiry")
+        XCTAssertNil(auth.cachedJWT())
+        auth.clearCache()
+    }
+
+    func testAmazonTurnstileChallengeHTMLInteractionOnlyParity() {
+        let html = AmazonTurnstileAuth.challengeHTML(siteKey: "0xTEST", mode: .interactionOnly)
+        XCTAssertTrue(html.contains("execution: 'execute'"))
+        XCTAssertTrue(html.contains("appearance: 'interaction-only'"))
+        XCTAssertTrue(html.contains("before-interactive-callback"))
+        XCTAssertTrue(html.contains("turnstile.execute(id)"))
+        XCTAssertTrue(html.contains("sitekey: '0xTEST'"))
+        XCTAssertFalse(html.contains("appearance: 'always'"))
+    }
+
+    func testAmazonTurnstileChallengeHTMLVisibleFallbackParity() {
+        let html = AmazonTurnstileAuth.challengeHTML(siteKey: "0xTEST", mode: .alwaysVisible)
+        XCTAssertTrue(html.contains("execution: 'render'"))
+        XCTAssertTrue(html.contains("appearance: 'always'"))
+        XCTAssertTrue(html.contains("size: 'compact'"))
+        XCTAssertFalse(html.contains("turnstile.execute"))
+        XCTAssertFalse(html.contains("interaction-only"))
+    }
+
+    func testAmazonTurnstileSiteKeyEscapesQuotes() {
+        let html = AmazonTurnstileAuth.challengeHTML(siteKey: "key'\\x", mode: .interactionOnly)
+        XCTAssertTrue(html.contains("sitekey: 'key\\'\\\\x'"))
+    }
 }
