@@ -182,7 +182,7 @@ final class MusicService {
         } catch let error as ServiceError {
             // Web clears JWT and retries once on 401/428.
             if case .http(let status) = error, status == 401 || status == 428, bypass.isEmpty {
-                AmazonTurnstileAuth.shared.clearCache()
+                await AmazonTurnstileAuth.shared.clearCache()
                 let fresh = try await AmazonTurnstileAuth.shared.accessToken(apiBaseURL: apiBase, forceRefresh: true)
                 return try await fetchAmazonTrack(
                     title: title,
