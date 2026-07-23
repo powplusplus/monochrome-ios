@@ -306,7 +306,7 @@ struct SettingsView: View {
                     Toggle("Gapless transitions", isOn: $gapless)
                     Picker("Playback speed", selection: $playback.playbackRate) { Text("0.75×").tag(Float(0.75)); Text("1×").tag(Float(1)); Text("1.25×").tag(Float(1.25)); Text("1.5×").tag(Float(1.5)); Text("2×").tag(Float(2)) }
                 }
-                Section(header: Text("Sources"), footer: Text("Same as web Monochrome: Amazon (Cloudflare Turnstile) → Deezer. TIDAL is catalog only — not used for full playback.")) {
+                Section(header: Text("Sources"), footer: Text("Same as web Monochrome: Amazon (Cloudflare check on first play) → Deezer. TIDAL is catalog only — not used for full playback.")) {
                     Toggle("Amazon Music", isOn: $amazonEnabled)
                     if amazonEnabled {
                         TextField("Amazon API base URL", text: $amazonApiBaseURL)

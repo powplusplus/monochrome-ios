@@ -115,19 +115,28 @@ final class MusicService {
         // Match upstream Monochrome `getStreamUrl` (js/api.js):
         // Amazon Music (Turnstile JWT) → Deezer. TIDAL is catalog-only — never play PREVIEW.
         let enriched = await enrichTrackMetadata(track)
+        var amazonError: Error?
         do {
             return try await resolveAmazonStream(for: enriched, quality: quality)
         } catch {
+            amazonError = error
             // Fall through to Deezer like web when Amazon is rate-limited / unavailable.
         }
-        if let deezer = try? await resolveDeezerStream(for: enriched, quality: quality) {
-            return deezer
+        do {
+            return try await resolveDeezerStream(for: enriched, quality: quality)
+        } catch {
+            let amazonDetail = (amazonError as? LocalizedError)?.errorDescription
+                ?? amazonError?.localizedDescription
+                ?? "Amazon Music unavailable"
+            if enriched.isrc?.isEmpty == false {
+                throw ServiceError.unavailable(
+                    "Could not resolve stream URL from Amazon Music or Deezer. \(amazonDetail)"
+                )
+            }
+            throw ServiceError.unavailable(
+                "Could not resolve stream URL: \(amazonDetail). Track has no ISRC for Deezer lookup."
+            )
         }
-        throw ServiceError.unavailable(
-            (enriched.isrc?.isEmpty == false)
-                ? "Could not resolve stream URL from Amazon Music or Deezer"
-                : "Could not resolve stream URL: Amazon Music failed and track has no ISRC for Deezer lookup"
-        )
     }
 
     /// Pull ISRC / duration when search cards omit them (needed for Deezer/Amazon lookup).
@@ -272,49 +281,66 @@ final class MusicService {
             throw ServiceError.unavailable("Deezer lookup needs ISRC")
         }
         let base = PlaybackSourceSettings.deezerApiBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard var components = URLComponents(string: base + "/stream/") else { throw ServiceError.invalidResponse }
-        components.queryItems = [
-            URLQueryItem(name: "isrc", value: isrc),
-            URLQueryItem(name: "format", value: quality.deezerFormat),
-        ]
-        guard let url = components.url else { throw ServiceError.invalidResponse }
-
-        // Web only HEAD-checks then feeds the URL to <audio>. Prefer HEAD, fall back to ranged GET.
-        var head = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
-        head.httpMethod = "HEAD"
-        head.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-        if let (_, headResponse) = try? await session.data(for: head),
-           let http = headResponse as? HTTPURLResponse,
-           (200..<400).contains(http.statusCode) || http.statusCode == 405 || http.statusCode == 501 {
-            return StreamResponse(
-                url: url,
-                provider: .deezer,
-                quality: quality.rawValue,
-                replayGain: nil,
-                peak: nil,
-                isPreview: false,
-                previewReason: nil,
-                mediaDuration: track.duration > 0 ? track.duration : nil
-            )
+        // Prefer selected quality, then fall back through lighter formats (FLAC mirrors often 403).
+        var formats = [quality.deezerFormat]
+        for extra in ["MP3_320", "MP3_128", "FLAC"] where !formats.contains(extra) {
+            formats.append(extra)
         }
 
-        var probe = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
-        probe.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-        probe.setValue("bytes=0-1", forHTTPHeaderField: "Range")
-        let (_, response) = try await session.data(for: probe)
-        if let http = response as? HTTPURLResponse {
-            guard (200..<400).contains(http.statusCode) else { throw ServiceError.http(http.statusCode) }
+        var latestError: Error = ServiceError.unavailable("Deezer stream unavailable")
+        for format in formats {
+            guard var components = URLComponents(string: base + "/stream/") else { continue }
+            components.queryItems = [
+                URLQueryItem(name: "isrc", value: isrc),
+                URLQueryItem(name: "format", value: format),
+            ]
+            guard let url = components.url else { continue }
+
+            // Web HEAD-checks then feeds URL to <audio>. Accept 405/501 (method not allowed).
+            var head = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
+            head.httpMethod = "HEAD"
+            head.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+            if let (_, headResponse) = try? await session.data(for: head),
+               let http = headResponse as? HTTPURLResponse,
+               (200..<400).contains(http.statusCode) || http.statusCode == 405 || http.statusCode == 501 {
+                return StreamResponse(
+                    url: url,
+                    provider: .deezer,
+                    quality: format,
+                    replayGain: nil,
+                    peak: nil,
+                    isPreview: false,
+                    previewReason: nil,
+                    mediaDuration: track.duration > 0 ? track.duration : nil
+                )
+            }
+
+            var probe = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
+            probe.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+            probe.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+            do {
+                let (_, response) = try await session.data(for: probe)
+                if let http = response as? HTTPURLResponse {
+                    guard (200..<400).contains(http.statusCode) else {
+                        latestError = ServiceError.http(http.statusCode)
+                        continue
+                    }
+                }
+                return StreamResponse(
+                    url: url,
+                    provider: .deezer,
+                    quality: format,
+                    replayGain: nil,
+                    peak: nil,
+                    isPreview: false,
+                    previewReason: nil,
+                    mediaDuration: track.duration > 0 ? track.duration : nil
+                )
+            } catch {
+                latestError = error
+            }
         }
-        return StreamResponse(
-            url: url,
-            provider: .deezer,
-            quality: quality.rawValue,
-            replayGain: nil,
-            peak: nil,
-            isPreview: false,
-            previewReason: nil,
-            mediaDuration: track.duration > 0 ? track.duration : nil
-        )
+        throw latestError
     }
 
     /// Classic `/track/` asks TIDAL for `assetpresentation=FULL` at the selected quality.
