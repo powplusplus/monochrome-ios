@@ -85,6 +85,14 @@ enum PlaybackSourceSettings {
         set { UserDefaults.standard.set(newValue, forKey: "native.amazonBypassToken") }
     }
 
+    static var amazonTurnstileSiteKey: String {
+        get {
+            let value = UserDefaults.standard.string(forKey: "native.amazonTurnstileSiteKey")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (value?.isEmpty == false) ? value! : "0x4AAAAAADgxqF6QVMm0GLHH"
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "native.amazonTurnstileSiteKey") }
+    }
+
     static var deezerEnabled: Bool {
         get { UserDefaults.standard.object(forKey: "native.deezerEnabled") as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: "native.deezerEnabled") }

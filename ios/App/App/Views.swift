@@ -302,14 +302,14 @@ struct SettingsView: View {
                     Toggle("Gapless transitions", isOn: $gapless)
                     Picker("Playback speed", selection: $playback.playbackRate) { Text("0.75×").tag(Float(0.75)); Text("1×").tag(Float(1)); Text("1.25×").tag(Float(1.25)); Text("1.5×").tag(Float(1.5)); Text("2×").tag(Float(2)) }
                 }
-                Section(header: Text("Sources"), footer: Text("Same order as web Monochrome: Amazon → Deezer → TIDAL. Amazon needs a bypass token (or Turnstile on web). Encrypted Amazon streams decrypt on-device.")) {
+                Section(header: Text("Sources"), footer: Text("Same as web Monochrome: Amazon (Cloudflare Turnstile) → Deezer. TIDAL is catalog only — not used for full playback.")) {
                     Toggle("Amazon Music", isOn: $amazonEnabled)
                     if amazonEnabled {
                         TextField("Amazon API base URL", text: $amazonApiBaseURL)
                             .textInputAutocapitalization(.never)
                             .keyboardType(.URL)
                             .disableAutocorrection(true)
-                        SecureField("Amazon bypass token", text: $amazonBypassToken)
+                        SecureField("Amazon bypass token (optional)", text: $amazonBypassToken)
                             .textInputAutocapitalization(.never)
                             .disableAutocorrection(true)
                     }
@@ -1059,7 +1059,7 @@ struct ProviderSettingsView: View {
             Picker("Preferred catalog provider", selection: $provider) {
                 ForEach(Provider.allCases) { Text($0.title).tag($0.rawValue) }
             }
-            Text("Catalog search still uses TIDAL metadata. Full audio resolves Amazon → Deezer → TIDAL, matching web Monochrome.")
+            Text("Catalog search uses TIDAL metadata. Full audio resolves Amazon → Deezer like web Monochrome — not TIDAL stream manifests.")
                 .font(.footnote)
                 .foregroundColor(.secondary)
         }

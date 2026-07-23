@@ -112,19 +112,22 @@ final class MusicService {
             return StreamResponse(url: url, provider: track.provider, quality: quality.rawValue, replayGain: nil, peak: nil)
         }
 
-        // Same acquisition order as web Monochrome `getStreamUrl`:
-        // Amazon Music → Deezer → TIDAL FULL `/track/` → TIDAL manifests (may be preview).
+        // Match upstream Monochrome `getStreamUrl` (js/api.js):
+        // Amazon Music (Turnstile JWT) → Deezer. TIDAL is catalog-only — never play PREVIEW.
         let enriched = await enrichTrackMetadata(track)
-        if let amazon = try? await resolveAmazonStream(for: enriched, quality: quality) {
-            return amazon
+        do {
+            return try await resolveAmazonStream(for: enriched, quality: quality)
+        } catch {
+            // Fall through to Deezer like web when Amazon is rate-limited / unavailable.
         }
         if let deezer = try? await resolveDeezerStream(for: enriched, quality: quality) {
             return deezer
         }
-        if let full = try? await resolveLegacyFullStream(for: enriched, quality: quality) {
-            return full
-        }
-        return try await resolveTidalManifestStream(for: enriched, quality: quality)
+        throw ServiceError.unavailable(
+            (enriched.isrc?.isEmpty == false)
+                ? "Could not resolve stream URL from Amazon Music or Deezer"
+                : "Could not resolve stream URL: Amazon Music failed and track has no ISRC for Deezer lookup"
+        )
     }
 
     /// Pull ISRC / duration when search cards omit them (needed for Deezer/Amazon lookup).
@@ -156,17 +159,66 @@ final class MusicService {
             throw ServiceError.unavailable("Amazon lookup needs title and artist")
         }
 
-        var components = URLComponents(string: PlaybackSourceSettings.amazonApiBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/api/track/")
+        let apiBase = PlaybackSourceSettings.amazonApiBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let bypass = PlaybackSourceSettings.amazonBypassToken.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Prefer bypass token (web settings parity). Otherwise solve Turnstile → JWT.
+        var jwt: String?
+        if bypass.isEmpty {
+            jwt = try await AmazonTurnstileAuth.shared.accessToken(apiBaseURL: apiBase)
+        }
+
+        do {
+            return try await fetchAmazonTrack(
+                title: title,
+                artist: artist,
+                album: track.album?.title ?? "",
+                duration: track.duration,
+                quality: quality,
+                apiBase: apiBase,
+                bypass: bypass,
+                jwt: jwt
+            )
+        } catch let error as ServiceError {
+            // Web clears JWT and retries once on 401/428.
+            if case .http(let status) = error, status == 401 || status == 428, bypass.isEmpty {
+                AmazonTurnstileAuth.shared.clearCache()
+                let fresh = try await AmazonTurnstileAuth.shared.accessToken(apiBaseURL: apiBase, forceRefresh: true)
+                return try await fetchAmazonTrack(
+                    title: title,
+                    artist: artist,
+                    album: track.album?.title ?? "",
+                    duration: track.duration,
+                    quality: quality,
+                    apiBase: apiBase,
+                    bypass: bypass,
+                    jwt: fresh
+                )
+            }
+            throw error
+        }
+    }
+
+    private func fetchAmazonTrack(
+        title: String,
+        artist: String,
+        album: String,
+        duration: Double,
+        quality: PlaybackQuality,
+        apiBase: String,
+        bypass: String,
+        jwt: String?
+    ) async throws -> StreamResponse {
+        var components = URLComponents(string: apiBase + "/api/track/")
         var items = [
             URLQueryItem(name: "track", value: title),
             URLQueryItem(name: "artist", value: artist),
-            URLQueryItem(name: "album", value: track.album?.title ?? ""),
+            URLQueryItem(name: "album", value: album),
             URLQueryItem(name: "quality", value: quality.amazonQuality),
         ]
-        if track.duration > 0 {
-            items.append(URLQueryItem(name: "duration", value: String(Int(track.duration.rounded()))))
+        if duration > 0 {
+            items.append(URLQueryItem(name: "duration", value: String(Int(duration.rounded()))))
         }
-        let bypass = PlaybackSourceSettings.amazonBypassToken.trimmingCharacters(in: .whitespacesAndNewlines)
         if !bypass.isEmpty {
             items.append(URLQueryItem(name: "bypass_token", value: bypass))
         }
@@ -175,6 +227,9 @@ final class MusicService {
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let jwt, !jwt.isEmpty {
+            request.setValue(jwt, forHTTPHeaderField: "X-Turnstile-JWT")
+        }
         let (data, response) = try await session.data(for: request)
         try validate(response)
         let object = try JSONSerialization.jsonObject(with: data)
@@ -205,7 +260,7 @@ final class MusicService {
             peak: nil,
             isPreview: false,
             previewReason: nil,
-            mediaDuration: track.duration > 0 ? track.duration : nil
+            mediaDuration: duration > 0 ? duration : nil
         )
     }
 
