@@ -19,6 +19,16 @@ final class MusicService {
 
     init(session: URLSession = .shared) { self.session = session }
 
+    /// Amazon/Deezer provider instances gate their media APIs behind a
+    /// Referer/Origin site-check ("Forbidden: requests must come from an allowed
+    /// site"). The web client passes it implicitly because the browser stamps
+    /// its page origin on every fetch; native URLSession sends neither header
+    /// and gets a 403. Stamp the Monochrome origin so native reaches parity.
+    private func applyMonochromeOrigin(to request: inout URLRequest) {
+        request.setValue("https://monochrome.tf", forHTTPHeaderField: "Origin")
+        request.setValue("https://monochrome.tf/", forHTTPHeaderField: "Referer")
+    }
+
     func search(_ query: String) async throws -> SearchResults {
         // The combined `?q=` route is not supported by every HiFi instance. The
         // web client already treats the scoped routes as the compatibility
@@ -236,6 +246,7 @@ final class MusicService {
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyMonochromeOrigin(to: &request)
         if let jwt, !jwt.isEmpty {
             request.setValue(jwt, forHTTPHeaderField: "X-Turnstile-JWT")
         }
@@ -300,6 +311,7 @@ final class MusicService {
             var head = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
             head.httpMethod = "HEAD"
             head.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+            applyMonochromeOrigin(to: &head)
             if let (_, headResponse) = try? await session.data(for: head),
                let http = headResponse as? HTTPURLResponse,
                (200..<400).contains(http.statusCode) || http.statusCode == 405 || http.statusCode == 501 {
@@ -318,6 +330,7 @@ final class MusicService {
             var probe = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
             probe.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
             probe.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+            applyMonochromeOrigin(to: &probe)
             do {
                 let (_, response) = try await session.data(for: probe)
                 if let http = response as? HTTPURLResponse {
