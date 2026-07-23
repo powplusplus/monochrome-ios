@@ -14,8 +14,8 @@ final class PlaybackEngine: ObservableObject {
     @Published private(set) var elapsed: Double = 0
     @Published private(set) var duration: Double = 0
     @Published var playbackRate: Float = 1 { didSet { if isPlaying { player.rate = playbackRate }; updateNowPlaying() } }
-    @Published var repeatMode: RepeatMode = .off
-    @Published var shuffleEnabled = false
+    @Published var repeatMode: RepeatMode = .off { didSet { prefetchUpcoming() } }
+    @Published var shuffleEnabled = false { didSet { prefetchUpcoming() } }
     @Published var errorMessage: String?
     @Published private(set) var currentStreamQuality: String?
 
@@ -29,6 +29,20 @@ final class PlaybackEngine: ObservableObject {
     private var fadeTask: Task<Void, Never>?
     private let fadeDuration: TimeInterval = 0.25
 
+    /// A stream that has already been resolved and whose asset header has been fetched.
+    /// `AVURLAsset` is not `Sendable`, but this one is only ever touched on the main actor.
+    private struct PreparedStream: @unchecked Sendable {
+        let stream: StreamResponse
+        let asset: AVURLAsset
+    }
+
+    private var prefetch: [String: (task: Task<PreparedStream, Error>, startedAt: Date)] = [:]
+    /// Signed CDN URLs go stale; past this age we re-resolve instead of handing
+    /// AVPlayer a dead URL.
+    private let prefetchTTL: TimeInterval = 8 * 60
+    private let prefetchDepth = 2
+    private var lastNowPlayingElapsed: Double = -1
+
     var currentTrack: Track? {
         guard let currentIndex, queue.indices.contains(currentIndex) else { return nil }
         return queue[currentIndex]
@@ -41,16 +55,23 @@ final class PlaybackEngine: ObservableObject {
         player.actionAtItemEnd = .none
         restoreQueue()
         configureRemoteCommands()
-        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] time in
+        // Ticks at 4 Hz so synced lyrics land on the beat instead of up to half
+        // a second late. The published values and the now-playing centre are
+        // still throttled below so the faster clock costs nothing downstream.
+        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self] time in
             Task { @MainActor in
                 guard let self else { return }
                 let seconds = max(0, time.seconds.isFinite ? time.seconds : 0)
                 let value = self.player.currentItem?.duration.seconds ?? 0
                 let nextDuration = value.isFinite ? max(0, value) : (self.currentTrack?.duration ?? 0)
                 // Avoid thrashing SwiftUI (AsyncImage / pill art) on every tick.
-                if abs(self.elapsed - seconds) >= 0.25 { self.elapsed = seconds }
+                if abs(self.elapsed - seconds) >= 0.2 { self.elapsed = seconds }
                 if abs(self.duration - nextDuration) >= 0.25 { self.duration = nextDuration }
-                self.updateNowPlaying()
+                // Cross-process call — once a second is plenty for lock screen.
+                if abs(seconds - self.lastNowPlayingElapsed) >= 0.9 {
+                    self.lastNowPlayingElapsed = seconds
+                    self.updateNowPlaying()
+                }
             }
         }
         endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main) { [weak self] notification in
@@ -154,8 +175,8 @@ final class PlaybackEngine: ObservableObject {
 
     func move(from offsets: IndexSet, to destination: Int) { queue.move(fromOffsets: offsets, toOffset: destination); persistQueue() }
 
-    func append(_ track: Track) { queue.append(track); persistQueue() }
-    func playNext(_ track: Track) { queue.insert(track, at: min((currentIndex ?? -1) + 1, queue.count)); persistQueue() }
+    func append(_ track: Track) { queue.append(track); persistQueue(); prefetchUpcoming() }
+    func playNext(_ track: Track) { queue.insert(track, at: min((currentIndex ?? -1) + 1, queue.count)); persistQueue(); prefetchUpcoming() }
 
     func handleInterruption(_ notification: Notification) {
         guard let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
@@ -171,19 +192,30 @@ final class PlaybackEngine: ObservableObject {
         pause()
     }
 
-    private func loadCurrent(autoplay: Bool) {
+    private func loadCurrent(autoplay: Bool, usePrefetch: Bool = true) {
         guard let track = currentTrack else { return }
         loadTask?.cancel()
         pendingAutoplay = false
         isLoading = true
         errorMessage = nil
         currentStreamQuality = nil
+        let warm = usePrefetch ? takePrefetch(for: track) : nil
         loadTask = Task {
             do {
-                let stream = try await musicService.resolveStream(for: track, quality: PlaybackQuality.stored)
+                let stream: StreamResponse
+                let asset: AVURLAsset
+                var wasPrefetched = false
+                if let warm, let prepared = try? await warm.value {
+                    stream = prepared.stream
+                    asset = prepared.asset
+                    wasPrefetched = true
+                } else {
+                    stream = try await musicService.resolveStream(for: track, quality: PlaybackQuality.stored)
+                    asset = AVURLAsset(url: stream.url)
+                }
                 guard !Task.isCancelled else { return }
                 currentStreamQuality = stream.quality
-                let item = AVPlayerItem(url: stream.url)
+                let item = AVPlayerItem(asset: asset)
                 item.audioTimePitchAlgorithm = .timeDomain
                 pendingAutoplay = autoplay
                 itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
@@ -200,6 +232,11 @@ final class PlaybackEngine: ObservableObject {
                         case .failed:
                             self.pendingAutoplay = false
                             self.player.pause()
+                            if wasPrefetched {
+                                // Warmed URL went stale. Re-resolve once before blaming the track.
+                                self.loadCurrent(autoplay: autoplay, usePrefetch: false)
+                                return
+                            }
                             self.isLoading = false
                             self.isPlaying = false
                             self.errorMessage = item.error?.localizedDescription ?? "This song could not be played."
@@ -230,12 +267,67 @@ final class PlaybackEngine: ObservableObject {
                 Task { try? await DownloadManager.shared.prefetchArtwork(for: track) }
                 Task { _ = try? await musicService.recommendations(for: track.playbackID) }
                 updateNowPlaying()
+                prefetchUpcoming()
             } catch {
                 guard !Task.isCancelled else { return }
                 pendingAutoplay = false
                 isLoading = false; isPlaying = false; errorMessage = error.localizedDescription
             }
         }
+    }
+
+    /// The next `limit` tracks in play order, or none when the next pick is unpredictable
+    /// (shuffle) or is the current track again (repeat one).
+    private func upcomingTracks(limit: Int) -> [Track] {
+        guard let currentIndex, queue.indices.contains(currentIndex) else { return [] }
+        guard !shuffleEnabled, repeatMode != .one else { return [] }
+        var result: [Track] = []
+        var index = currentIndex
+        while result.count < limit {
+            index += 1
+            if index >= queue.count {
+                guard repeatMode == .all else { break }
+                index = 0
+            }
+            if index == currentIndex { break }
+            result.append(queue[index])
+        }
+        return result
+    }
+
+    /// Resolving a stream is several network hops (Amazon Turnstile → Deezer fallback)
+    /// and dominates skip latency, so warm the next couple of tracks while this one plays.
+    private func prefetchUpcoming() {
+        let targets = upcomingTracks(limit: prefetchDepth)
+        var keep = Set(targets.map(\.id))
+        if let id = currentTrack?.id { keep.insert(id) }
+        for (id, entry) in prefetch where !keep.contains(id) {
+            entry.task.cancel()
+            prefetch[id] = nil
+        }
+        for track in targets where prefetch[track.id] == nil {
+            let service = musicService
+            let task = Task<PreparedStream, Error> {
+                let stream = try await service.resolveStream(for: track, quality: PlaybackQuality.stored)
+                try Task.checkCancellation()
+                let asset = AVURLAsset(url: stream.url)
+                // Pull the manifest / moov box now so playback starts on bytes we already hold.
+                _ = try? await asset.load(.isPlayable, .duration)
+                return PreparedStream(stream: stream, asset: asset)
+            }
+            prefetch[track.id] = (task, Date())
+            Task { try? await DownloadManager.shared.prefetchArtwork(for: track) }
+        }
+    }
+
+    /// Hands back the warmed task for `track` (possibly still in flight) and stops tracking it.
+    private func takePrefetch(for track: Track) -> Task<PreparedStream, Error>? {
+        guard let entry = prefetch.removeValue(forKey: track.id) else { return nil }
+        guard Date().timeIntervalSince(entry.startedAt) < prefetchTTL else {
+            entry.task.cancel()
+            return nil
+        }
+        return entry.task
     }
 
     private func itemDidFinish() {

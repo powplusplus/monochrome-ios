@@ -15,6 +15,19 @@ enum PlaybackQuality: String, CaseIterable, Identifiable, Codable {
 
     var id: String { rawValue }
 
+    /// Stream responses echo the *provider's* token, not our raw value: Amazon
+    /// returns `HD`/`UHD`/`SD_*`, Deezer returns `FLAC`/`MP3_*`, only TIDAL
+    /// returns our own. Map all of them back so the badge resolves everywhere.
+    init?(providerToken raw: String) {
+        switch raw.trimmingCharacters(in: .whitespaces).uppercased() {
+        case "LOW", "SD_LOW", "MP3_128", "HEAACV1": self = .low
+        case "HIGH", "SD_HIGH", "MP3_320", "AACLC": self = .high
+        case "LOSSLESS", "HD", "FLAC": self = .lossless
+        case "HI_RES_LOSSLESS", "UHD", "FLAC_HIRES": self = .hiResLossless
+        default: return nil
+        }
+    }
+
     var title: String {
         switch self {
         case .low: return "Low"

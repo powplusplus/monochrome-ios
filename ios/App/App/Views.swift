@@ -447,13 +447,47 @@ struct MiniPlayer: View {
                     Spacer(minLength: 0)
                 }.contentShape(Rectangle())
             }.buttonStyle(.plain)
-            if playback.isLoading { ProgressView().tint(.white).frame(width: 38, height: 38) }
-            else { Button { playback.playPause() } label: { Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill").font(.title3).frame(width: 38, height: 38) }.buttonStyle(.plain).accessibilityLabel(playback.isPlaying ? "Pause" : "Play") }
-            Button { playback.next() } label: { Image(systemName: "forward.fill").frame(width: 34, height: 38) }.buttonStyle(.plain).accessibilityLabel("Next track")
+            SettledLoading(isLoading: playback.isLoading) { spinning in
+                ZStack {
+                    Button { playback.playPause() } label: { Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill").font(.title3).frame(width: 38, height: 38) }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
+                        .opacity(spinning ? 0 : 1)
+                        .allowsHitTesting(!spinning)
+                        .accessibilityHidden(spinning)
+                    ProgressView().tint(.white).opacity(spinning ? 1 : 0).accessibilityHidden(!spinning)
+                }.frame(width: 38, height: 38)
+            }
+            SkipButton(direction: .forward, font: .body) { playback.next() }.frame(width: 34, height: 38)
         }
         .foregroundStyle(.primary)
         .padding(7)
         .modifier(MiniPlayerBackground(usesSystemBackground: usesSystemBackground))
+    }
+}
+
+/// Gates a spinner so loads too short to read as anything but a flash never
+/// show one: `settled` turns on after ~180ms of loading and holds ~320ms after.
+struct SettledLoading<Content: View>: View {
+    let isLoading: Bool
+    @ViewBuilder var content: (Bool) -> Content
+
+    @State private var settled = false
+
+    var body: some View {
+        content(settled)
+            .animation(.easeInOut(duration: 0.18), value: settled)
+            .task(id: isLoading) {
+                if isLoading {
+                    try? await Task.sleep(nanoseconds: 180_000_000)
+                    guard !Task.isCancelled else { return }
+                    settled = true
+                } else if settled {
+                    try? await Task.sleep(nanoseconds: 320_000_000)
+                    guard !Task.isCancelled else { return }
+                    settled = false
+                }
+            }
     }
 }
 
@@ -755,7 +789,7 @@ struct NowPlayingView: View {
         } else if let lyrics, !lyrics.isEmpty {
             SyncedLyricsView(
                 lyrics: lyrics,
-                currentTime: playback.elapsed,
+                activeIndex: lyrics.activeIndex(at: playback.elapsed),
                 onSeek: { playback.seek(to: $0) }
             )
             .padding(.horizontal, 22)
@@ -857,9 +891,7 @@ struct NowPlayingView: View {
                         .foregroundColor(playback.shuffleEnabled ? .pink : .primary)
                 }
                 Spacer()
-                Button { playback.previous() } label: {
-                    Image(systemName: "backward.fill").font(.title)
-                }
+                SkipButton(direction: .backward, font: .title) { playback.previous() }
                 Spacer()
                 Button { playback.playPause() } label: {
                     ZStack {
@@ -871,9 +903,7 @@ struct NowPlayingView: View {
                     .frame(width: 68, height: 68)
                 }
                 Spacer()
-                Button { playback.next() } label: {
-                    Image(systemName: "forward.fill").font(.title)
-                }
+                SkipButton(direction: .forward, font: .title) { playback.next() }
                 Spacer()
                 Button {
                     playback.repeatMode = playback.repeatMode == .off ? .all : playback.repeatMode == .all ? .one : .off
@@ -917,7 +947,7 @@ struct NowPlayingView: View {
 
     private var resolvedQuality: PlaybackQuality? {
         guard let raw = playback.currentStreamQuality else { return nil }
-        return PlaybackQuality(rawValue: raw)
+        return PlaybackQuality(providerToken: raw)
     }
 
 
@@ -934,13 +964,15 @@ struct NowPlayingView: View {
     }
 }
 
-/// Old-site karaoke: blur/scale past+upcoming, glow active line, auto-scroll.
+/// Old-site karaoke: scale/dim past+upcoming, glow active line, auto-scroll.
+///
+/// Takes the resolved `activeIndex` rather than the raw clock: the body must
+/// only re-evaluate when the highlighted line actually changes, not on every
+/// playback tick, or the in-flight highlight animation restarts mid-flight.
 struct SyncedLyricsView: View {
     let lyrics: SyncedLyrics
-    let currentTime: Double
+    let activeIndex: Int?
     var onSeek: (Double) -> Void
-
-    private var activeIndex: Int? { lyrics.activeIndex(at: currentTime) }
 
     var body: some View {
         Group {
@@ -963,34 +995,21 @@ struct SyncedLyricsView: View {
     private var syncedBody: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 18) {
+                // Plain VStack, not Lazy: an animated scrollTo into a lazy
+                // stack has to guess at the offsets of rows it never built,
+                // which lands the target line in the wrong place and snaps.
+                // Lyrics are a bounded list, so building them all is cheaper.
+                VStack(alignment: .leading, spacing: 18) {
                     ForEach(lyrics.lines) { line in
-                        let role = lineRole(for: line.id)
-                        Button {
-                            onSeek(line.time)
-                        } label: {
-                            Text(line.text)
-                                .font(role == .active
-                                      ? .system(size: 28, weight: .semibold, design: .rounded)
-                                      : .system(size: 22, weight: .medium, design: .rounded))
-                                .foregroundStyle(foreground(for: role))
-                                .shadow(color: role == .active ? Color.white.opacity(0.28) : .clear, radius: 16)
-                                .multilineTextAlignment(.leading)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .scaleEffect(scale(for: role), anchor: .leading)
-                                .compositingGroup()
-                                .blur(radius: blur(for: role))
-                                .opacity(opacity(for: role))
-                        }
-                        .buttonStyle(.plain)
-                        .id(line.id)
+                        LyricLineView(line: line, role: lineRole(for: line.id), onSeek: onSeek)
+                            .equatable()
+                            .id(line.id)
                     }
                 }
                 .padding(.vertical, 36)
-                .animation(.easeInOut(duration: 0.55), value: activeIndex)
             }
             .modifier(HiddenScrollIndicators())
-            .onChange(of: activeIndex) { index in
+            .onChange(of: activeIndex) { _, index in
                 guard let index else { return }
                 withAnimation(.easeInOut(duration: 0.45)) {
                     proxy.scrollTo(index, anchor: UnitPoint(x: 0.5, y: 0.32))
@@ -1004,9 +1023,7 @@ struct SyncedLyricsView: View {
         }
     }
 
-    private enum LineRole { case recentPast, past, active, upcoming, far }
-
-    private func lineRole(for id: Int) -> LineRole {
+    fileprivate func lineRole(for id: Int) -> LyricLineRole {
         guard let activeIndex else { return .far }
         if id == activeIndex { return .active }
         if id == activeIndex - 1 { return .recentPast }
@@ -1014,8 +1031,43 @@ struct SyncedLyricsView: View {
         if id == activeIndex + 1 { return .upcoming }
         return .far
     }
+}
 
-    private func opacity(for role: LineRole) -> Double {
+private enum LyricLineRole: Equatable { case recentPast, past, active, upcoming, far }
+
+/// One lyric line. Equatable so a redraw of the pane only re-renders the two
+/// or three rows whose role actually changed.
+private struct LyricLineView: View, Equatable {
+    let line: LyricLine
+    let role: LyricLineRole
+    let onSeek: (Double) -> Void
+
+    static func == (lhs: LyricLineView, rhs: LyricLineView) -> Bool {
+        lhs.line == rhs.line && lhs.role == rhs.role
+    }
+
+    var body: some View {
+        Button {
+            onSeek(line.time)
+        } label: {
+            Text(line.text)
+                // Fixed size for every role. Swapping the font on the active
+                // line re-wraps the text and changes the row height, which
+                // shoves the whole column mid-scroll; scaleEffect is a GPU
+                // transform that leaves layout untouched.
+                .font(.system(size: 26, weight: .semibold, design: .rounded))
+                .foregroundStyle(foreground)
+                .shadow(color: role == .active ? Color.white.opacity(0.28) : .clear, radius: 14)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .scaleEffect(scale, anchor: .leading)
+                .opacity(opacity)
+                .animation(.easeInOut(duration: 0.45), value: role)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var opacity: Double {
         switch role {
         case .active: 1
         case .upcoming: 0.72
@@ -1024,28 +1076,19 @@ struct SyncedLyricsView: View {
         }
     }
 
-    private func scale(for role: LineRole) -> CGFloat {
+    // Active sits at 1 and the rest shrink, rather than the active line growing
+    // past 1 — scaling up from a full-width frame would push the tail of a long
+    // line outside the scroll view and clip it.
+    private var scale: CGFloat {
         switch role {
         case .active: 1
-        case .upcoming: 0.98
-        case .recentPast, .past: 0.93
-        case .far: 0.92
+        case .upcoming: 0.9
+        case .recentPast, .past: 0.86
+        case .far: 0.85
         }
     }
 
-    // Blur is a GPU-expensive offscreen pass per view — only the lines
-    // adjacent to the active one get it, so a scrolled lyrics pane doesn't
-    // stack dozens of blurred views at once (was the source of the jank).
-    private func blur(for role: LineRole) -> CGFloat {
-        switch role {
-        case .active: 0
-        case .upcoming: 0.6
-        case .recentPast: 1.2
-        case .past, .far: 0
-        }
-    }
-
-    private func foreground(for role: LineRole) -> Color {
+    private var foreground: Color {
         switch role {
         case .active: Color(white: 0.96)
         case .upcoming: Color.white.opacity(0.78)
@@ -1230,18 +1273,20 @@ struct TrackCollectionView: View {
                 playback.shuffleEnabled = false
                 playback.play(first, in: tracks)
             } label: {
-                HStack(spacing: 8) {
-                    if playback.isLoading, tracks.contains(where: { $0.id == playback.currentTrack?.id }) {
-                        ProgressView().tint(.black)
-                    } else {
-                        Image(systemName: "play.fill")
+                SettledLoading(isLoading: playback.isLoading && tracks.contains(where: { $0.id == playback.currentTrack?.id })) { spinning in
+                    HStack(spacing: 8) {
+                        // ZStack keeps the glyph slot a fixed width so "Play" never shifts.
+                        ZStack {
+                            Image(systemName: "play.fill").opacity(spinning ? 0 : 1)
+                            ProgressView().tint(.black).opacity(spinning ? 1 : 0)
+                        }
+                        Text("Play").fontWeight(.semibold)
                     }
-                    Text("Play").fontWeight(.semibold)
+                    .foregroundStyle(.black)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 48)
+                    .background(Capsule(style: .continuous).fill(Color.white))
                 }
-                .foregroundStyle(.black)
-                .frame(maxWidth: .infinity)
-                .frame(height: 48)
-                .background(Capsule(style: .continuous).fill(Color.white))
             }
             .buttonStyle(.plain)
             .disabled(tracks.isEmpty)
@@ -1367,6 +1412,13 @@ struct ArtworkView: View {
     @State private var image: UIImage?
     @State private var loadFailed = false
 
+    init(url: URL?) {
+        self.url = url
+        // Seed from cache before the first render; `.task` only runs after one
+        // frame, which flashed a spinner over art that was already in memory.
+        _image = State(initialValue: url.flatMap { ArtworkImageCache.shared.image(for: $0) })
+    }
+
     var body: some View {
         Group {
             if let image {
@@ -1376,7 +1428,9 @@ struct ArtworkView: View {
             } else if loadFailed || url == nil {
                 placeholder
             } else {
-                ZStack { placeholder; ProgressView() }
+                SettledLoading(isLoading: true) { spinning in
+                    ZStack { placeholder; ProgressView().opacity(spinning ? 1 : 0) }
+                }
             }
         }
         .clipped()
@@ -1522,4 +1576,49 @@ struct FeatureCard: View {
 struct LibraryDestination: View {
     let icon: String; let color: Color; let title: String; let count: Int?
     var body: some View { HStack { Image(systemName: icon).foregroundColor(.white).frame(width: 34, height: 34).background(color, in: RoundedRectangle(cornerRadius: 7)); Text(title); Spacer(); if let count { Text("\(count)").foregroundColor(.secondary) } } }
+}
+
+/// Skip controls get a springy press-in plus a directional nudge, so a tap reads as
+/// "moving" even while the next stream is still resolving.
+struct SkipButton: View {
+    enum Direction {
+        case backward, forward
+
+        var symbol: String { self == .forward ? "forward.fill" : "backward.fill" }
+        var label: String { self == .forward ? "Next track" : "Previous track" }
+        var nudge: CGFloat { self == .forward ? 5 : -5 }
+    }
+
+    let direction: Direction
+    var font: Font = .title
+    let action: () -> Void
+
+    @State private var pulse = 0
+
+    var body: some View {
+        Button {
+            pulse += 1
+            UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+            action()
+        } label: {
+            Image(systemName: direction.symbol)
+                .font(font)
+                .symbolEffect(.bounce, options: .speed(1.8), value: pulse)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(SkipButtonStyle(direction: direction))
+        .accessibilityLabel(direction.label)
+    }
+}
+
+struct SkipButtonStyle: ButtonStyle {
+    let direction: SkipButton.Direction
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.84 : 1)
+            .offset(x: configuration.isPressed ? direction.nudge : 0)
+            .opacity(configuration.isPressed ? 0.6 : 1)
+            .animation(.spring(response: 0.26, dampingFraction: 0.5), value: configuration.isPressed)
+    }
 }
