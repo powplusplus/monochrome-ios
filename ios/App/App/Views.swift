@@ -1185,26 +1185,31 @@ private struct LyricLineView: View, Equatable {
     }
 }
 
-/// Mimics Apple's Lossless/Hi-Res badge: several sine strokes sharing a left
-/// origin, each nested one shorter, tighter, and shallower than the last.
+/// Mimics Apple's Lossless/Hi-Res badge: nested sine strokes sharing a left
+/// origin, each one shorter, tighter, and shallower than the last, fading out
+/// smoothly toward the right so the strokes read as one radiating waveform.
 private struct QualityWaveMark: Shape {
-    var layers: Int = 4
+    var layers: Int = 3
 
     func path(in rect: CGRect) -> Path {
         var path = Path()
-        let midY = rect.height / 2
+        let midY = rect.midY
+        let steps = 60
         for layer in 0..<layers {
             let n = CGFloat(layer)
-            let waveWidth = rect.width * max(1 - n * 0.24, 0.28)
-            let amplitude = (rect.height / 2) * max(1 - n * 0.14, 0.3)
-            let cycles = 1.35 + n * 0.4
+            let waveWidth = rect.width * (1 - n * 0.2)
+            let amplitude = (rect.height / 2) * (1 - n * 0.22)
+            // Higher layers oscillate faster ("tighter").
+            let cycles = 1.0 + n * 0.5
             var sub = Path()
-            let steps = 32
             for i in 0...steps {
                 let t = CGFloat(i) / CGFloat(steps)
                 let x = rect.minX + t * waveWidth
-                let decay = 1 - t * 0.85
-                let y = midY - sin(t * .pi * cycles) * amplitude * decay
+                // Smooth cosine envelope: full at the shared left origin,
+                // tapering to zero at the tip so every stroke lands back on
+                // the midline instead of being pinched off mid-swing.
+                let envelope = cos(t * .pi / 2)
+                let y = midY - sin(t * .pi * cycles) * amplitude * envelope
                 if i == 0 { sub.move(to: CGPoint(x: x, y: y)) } else { sub.addLine(to: CGPoint(x: x, y: y)) }
             }
             path.addPath(sub)
