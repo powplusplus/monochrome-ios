@@ -3176,18 +3176,18 @@ export const deezerFallbackSettings = {
     },
 };
 
-// Experimental Qobuz-via-Lucida fallback. OFF by default: the Lucida backend rips a
-// track to a file before it can be served, so first play of an uncached track costs
-// ~10-35s. Once a track is edge-cached by the /qobuz-lucida/* Functions, playback is
-// instant and seekable. Enable with lucidaQobuzSettings.setEnabled(true).
+// Qobuz-via-Lucida provider. ON by default. The Lucida backend rips a track to a file
+// before it can be served, so first play of an uncached track costs ~10-35s; once a
+// track is edge-cached by the /qobuz-lucida/* Functions, playback is instant and
+// seekable. Disable with lucidaQobuzSettings.setEnabled(false).
 export const lucidaQobuzSettings = {
     ENABLED_KEY: 'lucida-qobuz-enabled',
 
     isEnabled() {
         try {
-            return localStorage.getItem(this.ENABLED_KEY) === 'true';
+            return localStorage.getItem(this.ENABLED_KEY) !== 'false';
         } catch {
-            return false;
+            return true;
         }
     },
 

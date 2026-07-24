@@ -34,6 +34,7 @@ import {
     musicProviderSettings,
     amazonMusicSettings,
     deezerFallbackSettings,
+    lucidaQobuzSettings,
     gaplessPlaybackSettings,
     analyticsSettings,
     modalSettings,
@@ -885,6 +886,14 @@ export async function initializeSettings(scrobbler, player, api, ui) {
         deezerApiBaseUrlInput.value = deezerFallbackSettings.getApiBaseUrl();
         deezerApiBaseUrlInput.addEventListener('change', (e) => {
             deezerFallbackSettings.setApiBaseUrl(e.target.value.trim());
+        });
+    }
+
+    const lucidaQobuzToggle = document.getElementById('lucida-qobuz-toggle');
+    if (lucidaQobuzToggle) {
+        lucidaQobuzToggle.checked = lucidaQobuzSettings.isEnabled();
+        lucidaQobuzToggle.addEventListener('change', (e) => {
+            lucidaQobuzSettings.setEnabled(e.target.checked);
         });
     }
 

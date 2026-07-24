@@ -2765,8 +2765,14 @@ export class LosslessAPI {
         let qobuzResult = null;
         let deezerResult = null;
 
-        // 50/50 roll between Amazon and Qobuz when Amazon Music is enabled.
-        const preferAmazonFirst = amazonMusicSettings?.isEnabled() ? Math.random() >= 0.5 : false;
+        // When the experimental Lucida-Qobuz provider is on, always try Qobuz first so
+        // it actually wins; otherwise 50/50 roll between Amazon and Qobuz when Amazon
+        // Music is enabled.
+        const preferAmazonFirst = lucidaQobuzSettings.isEnabled()
+            ? false
+            : amazonMusicSettings?.isEnabled()
+              ? Math.random() >= 0.5
+              : false;
 
         const tryAmazon = async () => {
             if (amazonResult?.url) return;
