@@ -16,6 +16,7 @@ import {
     devModeSettings,
     amazonMusicSettings,
     deezerFallbackSettings,
+    lucidaQobuzSettings,
 } from './storage.js';
 import { APICache } from './cache.js';
 import { DashDownloader } from './dash-downloader.ts';
@@ -1822,80 +1823,36 @@ export class LosslessAPI {
         return result;
     }
 
+    // Qobuz via Lucida (https://lucida.to). Experimental, gated by lucidaQobuzSettings
+    // (off by default). Lucida rips a track to a FLAC file before serving it, so the
+    // heavy lifting — rip, download, edge-cache, and HTTP Range streaming — lives in
+    // the /qobuz-lucida/* Cloudflare Functions. Here we only resolve the track to a
+    // stable, seekable stream URL and hand it back to the player like any other.
     async getQobuzStreamUrl(isrc, quality = 'LOSSLESS') {
-        return null; // Temporarily disabled
-        let qobuzInstances = [];
-        try {
-            qobuzInstances = await this.settings.getInstances('qobuz');
-        } catch {
-            // ignore
-        }
+        if (!isrc || !lucidaQobuzSettings.isEnabled()) return null;
 
-        if (!qobuzInstances || qobuzInstances.length === 0) {
+        // Source FLAC for lossless tiers; transcode to mp3 for the lossy tiers.
+        const downscale = quality === 'HIGH' || quality === 'LOW' || quality === 'NORMAL' ? 'mp3' : 'original';
+
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 15000);
+            const res = await fetch(
+                `/qobuz-lucida/resolve?q=${encodeURIComponent(isrc)}&quality=${downscale}`,
+                { signal: controller.signal }
+            );
+            clearTimeout(timeoutId);
+            if (!res.ok) return null;
+            const json = await res.json();
+            if (!json || !json.success || !json.url) return null;
+
+            const origin = typeof location !== 'undefined' && location.origin ? location.origin : '';
+            const url = json.url.startsWith('http') ? json.url : `${origin}${json.url}`;
+            return { url, provider: 'qobuz', rgInfo: null };
+        } catch (e) {
+            console.warn(`Lucida Qobuz resolve failed for ISRC ${isrc}:`, e);
             return null;
         }
-
-        for (const instance of qobuzInstances) {
-            const rawUrl = typeof instance === 'string' ? instance : instance?.url;
-            if (!rawUrl || typeof rawUrl !== 'string') continue;
-            const baseUrl = rawUrl.replace(/\/+$/, '');
-            try {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 8000);
-
-                const trackRes = await fetch(
-                    getProxyUrl(`${baseUrl}/api/get-music?q=${encodeURIComponent(isrc)}&offset=0`),
-                    {
-                        signal: controller.signal,
-                    }
-                );
-                clearTimeout(timeoutId);
-                if (!trackRes.ok) continue;
-                const trackJson = await trackRes.json();
-
-                const tracks = trackJson.data?.tracks?.items || [];
-                const match = tracks.find((t) => t.isrc?.toLowerCase() === isrc.toLowerCase()) || tracks[0];
-
-                if (match && match.id) {
-                    const qobuzTrackId = match.id;
-                    const qobuzQualityMap = {
-                        HI_RES_LOSSLESS: '27',
-                        LOSSLESS: '6',
-                        HIGH: '5',
-                        LOW: '5',
-                    };
-                    const qobuzQuality = qobuzQualityMap[quality] || '6';
-
-                    const streamController = new AbortController();
-                    const streamTimeoutId = setTimeout(() => streamController.abort(), 8000);
-
-                    const streamRes = await fetch(
-                        `${baseUrl}/api/download-music?track_id=${qobuzTrackId}&quality=${qobuzQuality}`,
-                        { signal: streamController.signal }
-                    );
-                    clearTimeout(streamTimeoutId);
-                    if (!streamRes.ok) continue;
-                    const streamJson = await streamRes.json();
-
-                    if (streamJson.success && streamJson.data && streamJson.data.url) {
-                        let rgInfo = null;
-                        if (match.audio_info) {
-                            rgInfo = {
-                                trackReplayGain: match.audio_info.replaygain_track_gain,
-                                trackPeakAmplitude: match.audio_info.replaygain_track_peak,
-                                albumReplayGain: match.audio_info.replaygain_album_gain,
-                                albumPeakAmplitude: match.audio_info.replaygain_album_peak,
-                            };
-                        }
-                        return { url: streamJson.data.url, rgInfo };
-                    }
-                }
-            } catch (e) {
-                console.warn(`Qobuz instance ${baseUrl} failed for ISRC ${isrc}:`, e);
-                continue;
-            }
-        }
-        return null;
     }
 
     getDeezerStreamFormat(quality = 'LOSSLESS') {

@@ -593,6 +593,11 @@ struct NowPlayingView: View {
             let bottomInset = landscape
                 ? geometry.safeAreaInsets.bottom
                 : max(geometry.safeAreaInsets.bottom, Self.keyWindowBottomInset)
+            // The reader ignores the safe area, so these underreport in landscape
+            // (where the notch is on the leading edge). Guard both against the
+            // window's real insets; both are 0 in portrait so this is a no-op there.
+            let leadingInset = max(geometry.safeAreaInsets.leading, Self.keyWindowLeadingInset)
+            let trailingInset = max(geometry.safeAreaInsets.trailing, Self.keyWindowTrailingInset)
             let dismissProgress = min(max(dismissOffset / max(geometry.size.height * 0.42, 1), 0), 1)
             ZStack {
                 backdrop
@@ -607,12 +612,12 @@ struct NowPlayingView: View {
                         // Landscape puts the notch/Dynamic Island on the leading
                         // edge; without this the close and lyrics buttons hide
                         // under it. Both insets are 0 in portrait.
-                        .padding(.leading, geometry.safeAreaInsets.leading)
-                        .padding(.trailing, geometry.safeAreaInsets.trailing)
+                        .padding(.leading, leadingInset)
+                        .padding(.trailing, trailingInset)
                         .contentShape(Rectangle())
                         .gesture(dismissDrag(screenHeight: geometry.size.height))
                     if landscape {
-                        landscapeLayout(in: geometry, topInset: topInset, bottomInset: bottomInset)
+                        landscapeLayout(in: geometry, topInset: topInset, bottomInset: bottomInset, leadingInset: leadingInset, trailingInset: trailingInset)
                     } else {
                         portraitLayout(in: geometry, topInset: topInset, bottomInset: bottomInset)
                     }
@@ -826,9 +831,9 @@ struct NowPlayingView: View {
         }
     }
 
-    private func landscapeLayout(in geometry: GeometryProxy, topInset: CGFloat, bottomInset: CGFloat) -> some View {
-        let leadingPad = max(20, geometry.safeAreaInsets.leading + 10)
-        let trailingPad = max(20, geometry.safeAreaInsets.trailing + 10)
+    private func landscapeLayout(in geometry: GeometryProxy, topInset: CGFloat, bottomInset: CGFloat, leadingInset: CGFloat, trailingInset: CGFloat) -> some View {
+        let leadingPad = max(20, leadingInset + 10)
+        let trailingPad = max(20, trailingInset + 10)
         let usableHeight = max(160, geometry.size.height - topInset - Self.chromeHeight - bottomInset)
         let artSide = min(usableHeight, min(geometry.size.width * 0.38, 320))
 
@@ -1079,6 +1084,14 @@ struct NowPlayingView: View {
     private static var keyWindowTopInset: CGFloat { keyWindowInsets.top }
 
     private static var keyWindowBottomInset: CGFloat { keyWindowInsets.bottom }
+
+    // Landscape puts the notch/Dynamic Island on the leading edge. The reader
+    // ignores the safe area, so geometry.safeAreaInsets underreports these the
+    // same way it does the top inset — fall back to the window's real insets so
+    // the header controls and art column clear the notch.
+    private static var keyWindowLeadingInset: CGFloat { keyWindowInsets.left }
+
+    private static var keyWindowTrailingInset: CGFloat { keyWindowInsets.right }
 
     private static var keyWindowInsets: UIEdgeInsets {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
