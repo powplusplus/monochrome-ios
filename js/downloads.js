@@ -182,7 +182,7 @@ export function addDownloadTask(trackId, track, _filename, api, abortController)
             <div style="flex: 1; min-width: 0;">
                 <div style="font-weight: 500; font-size: 0.9rem; margin-bottom: 0.25rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${trackTitle}</div>
                 <div style="font-size: 0.8rem; color: var(--muted-foreground); margin-bottom: 0.5rem;">${trackArtists}</div>
-                <div class="download-progress-bar" style="height: 4px; background: var(--secondary); border-radius: 2px; overflow: hidden;">
+                <div class="download-progress-bar" style="height: 4px; background: rgba(128, 128, 128, 0.25); border-radius: 2px; overflow: hidden;">
                     <div class="download-progress-fill" style="width: 0%; height: 100%; background: var(--highlight); transition: width 0.2s;"></div>
                 </div>
                 <div class="download-status" style="font-size: 0.75rem; color: var(--muted-foreground); margin-top: 0.25rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">Starting...</div>
@@ -364,6 +364,7 @@ async function bulkDownload({
             let fileFraction = 0;
 
             updateBulkDownloadProgress(notification, i, tracks.length, trackTitle);
+            updateBulkSongProgress(notification, trackTitle, 0);
 
             try {
                 const { blob, extension } = await downloadTrackBlob(track, quality, api, signal, (p) => {
@@ -375,6 +376,7 @@ async function bulkDownload({
 
                     fileFraction = Math.min(fileFraction, 0.99); // Cap at 99% to avoid showing 100% before finalization
                     updateBulkDownloadProgress(notification, i + fileFraction, tracks.length, trackTitle, p);
+                    updateBulkSongProgress(notification, trackTitle, fileFraction, p);
                 });
                 const filename = buildTrackFilename(track, quality, extension);
                 const discNumber = discLayout.resolveDiscNumber(i);
@@ -790,8 +792,18 @@ export async function downloadDiscography(artist, selectedReleases, api, quality
                 for (let i = 0; i < tracks.length; i++) {
                     const track = tracks[i];
                     if (signal.aborted) break;
+                    const discoTrackTitle = getTrackTitle(track);
+                    updateBulkSongProgress(notification, discoTrackTitle, 0);
                     try {
-                        const { blob, extension } = await downloadTrackBlob(track, quality, api, signal, null);
+                        const { blob, extension } = await downloadTrackBlob(track, quality, api, signal, (p) => {
+                            let songFraction = 0;
+                            if (p instanceof DownloadProgress && p.totalBytes && p.receivedBytes) {
+                                songFraction = p.receivedBytes / p.totalBytes;
+                            } else if (p instanceof SegmentedDownloadProgress && p.currentSegment && p.totalSegments) {
+                                songFraction = p.currentSegment / p.totalSegments;
+                            }
+                            updateBulkSongProgress(notification, discoTrackTitle, Math.min(songFraction, 0.99), p);
+                        });
                         const filename = buildTrackFilename(track, quality, extension);
                         const discNumber = discLayout.resolveDiscNumber(i);
                         const discPath = separateByDisc ? `${getDiscFolderName(discNumber)}/${filename}` : filename;
@@ -946,10 +958,16 @@ function createBulkDownloadNotification(type, name, _totalItems) {
                     Downloading ${typeLabel}
                 </div>
                 <div style="font-size: 0.85rem; color: var(--muted-foreground); margin-bottom: 0.5rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(name)}</div>
-                <div class="download-progress-bar" style="height: 4px; background: var(--secondary); border-radius: 2px; overflow: hidden;">
+                <div class="download-progress-bar" style="height: 4px; background: rgba(128, 128, 128, 0.25); border-radius: 2px; overflow: hidden;">
                     <div class="download-progress-fill" style="width: 0%; height: 100%; background: var(--highlight); transition: width 0.2s;"></div>
                 </div>
                 <div class="download-status" style="font-size: 0.75rem; color: var(--muted-foreground); margin-top: 0.25rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">Starting...</div>
+                <div class="download-song-progress" style="margin-top: 0.5rem; display: none;">
+                    <div class="download-song-title" style="font-size: 0.75rem; color: var(--muted-foreground); margin-bottom: 0.25rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"></div>
+                    <div class="download-song-bar" style="height: 4px; background: rgba(128, 128, 128, 0.25); border-radius: 2px; overflow: hidden;">
+                        <div class="download-song-fill" style="width: 0%; height: 100%; background: var(--highlight); transition: width 0.2s;"></div>
+                    </div>
+                </div>
             </div>
             <button class="download-cancel" style="background: transparent; border: none; color: var(--muted-foreground); cursor: pointer; padding: 4px; border-radius: 4px; transition: all 0.2s;">
                 ${SVG_CLOSE(20)}
@@ -1013,9 +1031,41 @@ function updateBulkDownloadProgress(notifEl, current, total, currentItem, progre
     statusEl.textContent = `${Math.floor(current + 1)}/${total} - ${currentItem}`;
 }
 
+/**
+ * Updates the per-song progress bar inside a bulk download notification.
+ * @param {HTMLElement} notifEl
+ * @param {string} title - Title of the track currently downloading
+ * @param {number} fraction - Download progress of this single track, 0..1
+ * @param {FfmpegProgress | ProgressMessage | null} progress
+ */
+function updateBulkSongProgress(notifEl, title, fraction, progress = null) {
+    const wrap = notifEl.querySelector('.download-song-progress');
+    const fill = notifEl.querySelector('.download-song-fill');
+    const titleEl = notifEl.querySelector('.download-song-title');
+    if (!wrap || !fill || !titleEl) return;
+
+    wrap.style.display = 'block';
+    titleEl.textContent = title;
+
+    if (progress instanceof FfmpegProgress && progress.stage === 'encoding') {
+        const pct = Math.round(progress.progress || 0);
+        fill.style.width = `${pct}%`;
+        fill.style.background = '#3b82f6'; // Blue while converting
+        return;
+    }
+
+    const clamped = Math.max(0, Math.min(1, Number.isFinite(fraction) ? fraction : 0));
+    fill.style.width = `${Math.round(clamped * 100)}%`;
+    fill.style.background = 'var(--highlight)';
+}
+
 function completeBulkDownload(notifEl, success = true, message = null, { failedTracks = 0, totalTracks = 0 } = {}) {
     const progressFill = notifEl.querySelector('.download-progress-fill');
     const statusEl = notifEl.querySelector('.download-status');
+
+    // Per-song bar is meaningless once the batch is done.
+    const songProgress = notifEl.querySelector('.download-song-progress');
+    if (songProgress) songProgress.style.display = 'none';
 
     const partial = success && failedTracks > 0;
 

@@ -1,6 +1,27 @@
 :root {
     color-scheme: light dark;
 
+    /* Fallback palette: applied whenever data-theme is missing or unknown
+       (e.g. 'system' before JS resolves it). Prevents unstyled white-on-white
+       rendering in dark mode. Real themes below override every one of these. */
+    --background: #0a0a0a;
+    --foreground: #f5f5f5;
+    --card: #141414;
+    --card-foreground: #f5f5f5;
+    --primary: #f5f5f5;
+    --primary-foreground: #0a0a0a;
+    --secondary: #1f1f1f;
+    --secondary-foreground: #e0e0e0;
+    --muted: #1f1f1f;
+    --muted-foreground: #a0a0a0;
+    --border: #2a2a2a;
+    --input: #1f1f1f;
+    --ring: #f5f5f5;
+    --highlight: #f5f5f5;
+    --highlight-rgb: 245, 245, 245;
+    --active-highlight: var(--highlight);
+    --explicit-badge: #f5f5f5;
+
     --font-family:
         'Inter', 'Noto Sans', 'Noto Sans SC', 'Noto Sans TC', 'Noto Sans HK', 'Noto Sans JP', 'Noto Sans KR',
         'Noto Sans Hebrew', 'Noto Sans Arabic', 'Noto Sans Devanagari', 'Noto Sans Bengali', 'Noto Sans Thai',

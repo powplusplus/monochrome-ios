@@ -8,6 +8,7 @@ struct MonochromeApp: App {
     @StateObject private var auth = AuthSession.shared
     @StateObject private var downloads = DownloadManager.shared
     @StateObject private var parties = PartyService.shared
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
@@ -18,6 +19,11 @@ struct MonochromeApp: App {
                 .environmentObject(downloads)
                 .environmentObject(parties)
                 .onOpenURL { auth.handle($0) }
+                .onChange(of: scenePhase) { phase in
+                    // Warm stream resolution on every return to foreground so the
+                    // first tap plays on already-resolved bytes instead of a cold hop.
+                    if phase == .active { playback.warmForeground() }
+                }
                 .task {
                     library.migrateLegacyIfNeeded()
                     // Both of these exist to move work off the first play: refresh

@@ -240,6 +240,20 @@ struct AlbumSummary: Codable, Identifiable, Hashable {
     var cover: String?
 }
 
+/// Editor's Picks mixes albums and standalone songs in one feed; each case
+/// keeps its native model so a song opens playback instead of an album page.
+enum EditorPick: Identifiable, Hashable {
+    case album(Album)
+    case track(Track)
+
+    var id: String {
+        switch self {
+        case .album(let album): return "album:\(album.id)"
+        case .track(let track): return "track:\(track.id)"
+        }
+    }
+}
+
 struct Playlist: Codable, Identifiable, Hashable {
     var id: String
     var title: String

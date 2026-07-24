@@ -47,6 +47,10 @@ final class PlaybackEngine: ObservableObject {
     /// Signed CDN URLs go stale; past this age we re-resolve instead of handing
     /// AVPlayer a dead URL.
     private let prefetchTTL: TimeInterval = 8 * 60
+    /// On foreground, warms older than this are re-resolved: short enough that a
+    /// signed URL is unlikely to have expired mid-flight, long enough that rapid
+    /// background/foreground toggles don't re-resolve a still-fresh warm.
+    private let foregroundStaleTTL: TimeInterval = 90
     private let prefetchDepth = 2
     private var lastNowPlayingElapsed: Double = -1
 
@@ -109,6 +113,14 @@ final class PlaybackEngine: ObservableObject {
     }
 
     func playPause() {
+        // A resolve is already in flight. Cold provider instances take several
+        // seconds, during which isPlaying is false and currentItem is nil — so
+        // this used to fall through to loadCurrent, which cancels the in-flight
+        // loadTask and restarts resolution from scratch. Spamming the button
+        // reset the resolve on every tap, so the track never finished loading
+        // until the user stopped tapping (or backgrounded and reopened the app).
+        // Leave the running resolve alone; it already autoplays when ready.
+        guard !isLoading else { return }
         if isPlaying { pause() } else if player.currentItem != nil { resume() } else { loadCurrent(autoplay: true) }
     }
 
@@ -340,19 +352,42 @@ final class PlaybackEngine: ObservableObject {
             entry.task.cancel()
             prefetch[id] = nil
         }
-        for track in targets where prefetch[track.id] == nil {
-            let service = musicService
-            let task = Task<PreparedStream, Error> {
-                let stream = try await service.resolveStream(for: track, quality: PlaybackQuality.stored)
-                try Task.checkCancellation()
-                let asset = AVURLAsset(url: stream.url)
-                // Pull the manifest / moov box now so playback starts on bytes we already hold.
-                _ = try? await asset.load(.isPlayable, .duration)
-                return PreparedStream(stream: stream, asset: asset)
-            }
-            prefetch[track.id] = (task, Date())
-            Task { try? await DownloadManager.shared.prefetchArtwork(for: track) }
+        for track in targets { warm(track) }
+    }
+
+    /// Resolve `track` into a warmed, playable asset and hold it in the prefetch
+    /// cache. No-op when a warm is already in flight or ready for that track.
+    private func warm(_ track: Track) {
+        guard prefetch[track.id] == nil else { return }
+        let service = musicService
+        let task = Task<PreparedStream, Error> {
+            let stream = try await service.resolveStream(for: track, quality: PlaybackQuality.stored)
+            try Task.checkCancellation()
+            let asset = AVURLAsset(url: stream.url)
+            // Pull the manifest / moov box now so playback starts on bytes we already hold.
+            _ = try? await asset.load(.isPlayable, .duration)
+            return PreparedStream(stream: stream, asset: asset)
         }
+        prefetch[track.id] = (task, Date())
+        Task { try? await DownloadManager.shared.prefetchArtwork(for: track) }
+    }
+
+    /// Re-warm stream resolution every time the app is foregrounded. Backgrounding
+    /// lets signed CDN URLs and the Amazon Turnstile JWT expire and can suspend the
+    /// warm tasks mid-flight, so the first tap after a reopen otherwise pays a full
+    /// cold resolve — the main source of "could not resolve stream" errors. Pay it
+    /// ahead of the user instead: refresh auth/pool, drop warms old enough that the
+    /// URL may be dead, then warm the current track (when stopped) and the queue.
+    func warmForeground() {
+        Task { await InstanceDirectory.shared.refreshIfStale() }
+        AmazonTurnstileAuth.shared.prewarm()
+        let now = Date()
+        for (id, entry) in prefetch where now.timeIntervalSince(entry.startedAt) > foregroundStaleTTL {
+            entry.task.cancel()
+            prefetch[id] = nil
+        }
+        if let track = currentTrack, loadedTrackID != track.id, !isLoading { warm(track) }
+        prefetchUpcoming()
     }
 
     /// Hands back the warmed task for `track` (possibly still in flight) and stops tracking it.

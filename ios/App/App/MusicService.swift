@@ -41,12 +41,21 @@ final class MusicService {
         return results
     }
 
-    func editorPicks() async throws -> [Album] {
+    func editorPicks() async throws -> [EditorPick] {
         guard let url = URL(string: "https://monochrome.tf/editors-picks.json") else { throw ServiceError.invalidResponse }
         let (data, response) = try await session.data(from: url)
         try validate(response)
         let object = try JSONSerialization.jsonObject(with: data)
-        return ModelMapper.array(object, keys: ["albums", "items"]).compactMap(ModelMapper.album)
+        // The feed mixes "album" and "track" entries; matching on `type` keeps
+        // songs from being coerced into degenerate zero-track albums whose id
+        // then 404s when opened as an album page.
+        return ModelMapper.array(object, keys: ["albums", "items"]).compactMap { item in
+            let type = ModelMapper.string(item, ["type"])?.lowercased()
+            if type == "track" || type == "song" {
+                return ModelMapper.track(item).map(EditorPick.track)
+            }
+            return ModelMapper.album(item).map(EditorPick.album)
+        }
     }
 
     func album(id: String, fallback: Album? = nil) async throws -> Album {

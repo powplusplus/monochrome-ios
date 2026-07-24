@@ -113,10 +113,21 @@
         <script>
             (() => {
                 try {
-                    const theme = localStorage.getItem('monochrome-theme');
+                    const stored = localStorage.getItem('monochrome-theme');
                     const css = localStorage.getItem('custom_theme_css');
                     const palette = localStorage.getItem('monochrome-custom-theme');
-                    if (!theme) return;
+                    // Default to 'system' when nothing is saved (matches themeManager.getTheme()).
+                    const theme = stored || 'system';
+
+                    // 'system' has no CSS block of its own, so resolve it to a real
+                    // palette here (before first paint). Without this the root renders
+                    // with no color variables, i.e. white — even in dark mode.
+                    if (theme === 'system') {
+                        const isDark =
+                            window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+                        document.documentElement.setAttribute('data-theme', isDark ? 'monochrome' : 'white');
+                        return;
+                    }
 
                     document.documentElement.setAttribute('data-theme', theme);
 

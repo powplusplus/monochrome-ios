@@ -166,7 +166,8 @@ struct LiquidTabBar: View {
 
 struct HomeView: View {
     @EnvironmentObject private var library: LibraryRepository
-    @State private var picks: [Album] = []
+    @EnvironmentObject private var playback: PlaybackEngine
+    @State private var picks: [EditorPick] = []
     @State private var isLoading = false
     @State private var message: String?
 
@@ -178,8 +179,15 @@ struct HomeView: View {
                     MediaSection(title: "Editor’s Picks") {
                         ScrollView(.horizontal, showsIndicators: false) {
                             LazyHStack(spacing: 16) {
-                                ForEach(picks) { album in
-                                    NavigationLink(destination: AlbumDetailView(albumID: album.id, initial: album)) { AlbumCard(album: album) }.buttonStyle(.plain)
+                                ForEach(picks) { pick in
+                                    switch pick {
+                                    case .album(let album):
+                                        NavigationLink(destination: AlbumDetailView(albumID: album.id, initial: album)) { AlbumCard(album: album) }.buttonStyle(.plain)
+                                    case .track(let track):
+                                        Button { playback.play(track) } label: { AlbumCard(track: track) }
+                                            .buttonStyle(.plain)
+                                            .contextMenu { TrackContextMenu(track: track) }
+                                    }
                                 }
                             }.padding(.horizontal)
                         }
@@ -1185,33 +1193,29 @@ private struct LyricLineView: View, Equatable {
     }
 }
 
-/// Mimics Apple's Lossless/Hi-Res badge: nested sine strokes sharing a left
-/// origin, each one shorter, tighter, and shallower than the last, fading out
-/// smoothly toward the right so the strokes read as one radiating waveform.
+/// Mimics Apple's Lossless/Hi-Res badge: concentric arcs radiating from a
+/// shared origin on the left edge, each one taller and bowing further right
+/// than the last. The arcs never cross, so they read as one clean ")))"
+/// soundwave instead of the tangle of overlapping sines this used to draw.
 private struct QualityWaveMark: Shape {
-    var layers: Int = 3
+    var arcs: Int = 3
 
     func path(in rect: CGRect) -> Path {
         var path = Path()
-        let midY = rect.midY
-        let steps = 60
-        for layer in 0..<layers {
-            let n = CGFloat(layer)
-            let waveWidth = rect.width * (1 - n * 0.2)
-            let amplitude = (rect.height / 2) * (1 - n * 0.22)
-            // Higher layers oscillate faster ("tighter").
-            let cycles = 1.0 + n * 0.5
+        // Inset by half the stroke width so the round caps stay inside the frame.
+        let r = rect.insetBy(dx: 0.6, dy: 0.6)
+        let originX = r.minX
+        let midY = r.midY
+        for i in 0..<arcs {
+            let scale = CGFloat(i + 1) / CGFloat(arcs)   // 1/3, 2/3, 1
+            let halfHeight = (r.height / 2) * scale
+            let bulge = r.width * scale                  // how far right the arc bows
             var sub = Path()
-            for i in 0...steps {
-                let t = CGFloat(i) / CGFloat(steps)
-                let x = rect.minX + t * waveWidth
-                // Smooth cosine envelope: full at the shared left origin,
-                // tapering to zero at the tip so every stroke lands back on
-                // the midline instead of being pinched off mid-swing.
-                let envelope = cos(t * .pi / 2)
-                let y = midY - sin(t * .pi * cycles) * amplitude * envelope
-                if i == 0 { sub.move(to: CGPoint(x: x, y: y)) } else { sub.addLine(to: CGPoint(x: x, y: y)) }
-            }
+            sub.move(to: CGPoint(x: originX, y: midY - halfHeight))
+            sub.addQuadCurve(
+                to: CGPoint(x: originX, y: midY + halfHeight),
+                control: CGPoint(x: originX + bulge, y: midY)
+            )
             path.addPath(sub)
         }
         return path
@@ -1490,9 +1494,33 @@ struct TrackContextMenu: View {
     var body: some View { Button { playback.play(track) } label: { Label("Play", systemImage: "play.fill") }; Button { playback.playNext(track) } label: { Label("Play Next", systemImage: "text.insert") }; Button { library.toggleFavorite(track) } label: { Label("Like", systemImage: "heart") } }
 }
 
+/// Square media card shared by album and standalone-song entries (e.g. Editor's
+/// Picks) so a song reads as the same tile shape as an album, just backed by
+/// a track's artwork/title/artist instead.
 struct AlbumCard: View {
-    let album: Album
-    var body: some View { VStack(alignment: .leading, spacing: 7) { ArtworkView(url: album.artworkURL).frame(width: 168, height: 168).clipShape(RoundedRectangle(cornerRadius: 11)); Text(album.title).font(.subheadline.weight(.semibold)).foregroundColor(.primary).lineLimit(1); Text(album.artist.name).font(.caption).foregroundColor(.secondary).lineLimit(1) }.frame(width: 168, alignment: .leading) }
+    private let artworkURL: URL?
+    private let title: String
+    private let artistName: String
+
+    init(album: Album) {
+        artworkURL = album.artworkURL
+        title = album.title
+        artistName = album.artist.name
+    }
+
+    init(track: Track) {
+        artworkURL = track.artworkURL
+        title = track.title
+        artistName = track.artist.name
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            ArtworkView(url: artworkURL).frame(width: 168, height: 168).clipShape(RoundedRectangle(cornerRadius: 11))
+            Text(title).font(.subheadline.weight(.semibold)).foregroundColor(.primary).lineLimit(1)
+            Text(artistName).font(.caption).foregroundColor(.secondary).lineLimit(1)
+        }.frame(width: 168, alignment: .leading)
+    }
 }
 
 struct AlbumListRow: View {
