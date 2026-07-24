@@ -3225,17 +3225,32 @@
                 </div>
 
                 <div id="page-podcasts-browse" class="page">
-                    <h2 class="section-title">Browse Podcasts</h2>
-                    <div class="search-tabs">
-                        <button class="search-tab active" data-tab="trending">Trending</button>
-                        <button class="search-tab" data-tab="recent">Recent</button>
-                    </div>
-                    <div class="search-tab-content active" id="podcasts-tab-trending">
-                        <div class="card-grid" id="podcasts-trending-container"></div>
-                    </div>
-                    <div class="search-tab-content" id="podcasts-tab-recent">
-                        <div class="card-grid" id="podcasts-recent-container"></div>
-                    </div>
+                    <h2 class="section-title">Podcasts</h2>
+                    <form class="podcasts-browse-search track-list-search-container" onsubmit="return false;">
+                        <use svg="!lucide/search.svg" class="search-icon" size="18" />
+                        <input
+                            type="search"
+                            id="podcasts-browse-search"
+                            class="track-list-search-input"
+                            placeholder="Search podcasts..."
+                            autocomplete="off"
+                            autocorrect="off"
+                            autocapitalize="off"
+                            spellcheck="false"
+                        />
+                        <button
+                            type="button"
+                            class="search-clear-btn btn-icon"
+                            title="Clear search"
+                            style="display: none"
+                        >
+                            &times;
+                        </button>
+                    </form>
+                    <h3 class="section-title podcasts-browse-heading" id="podcasts-browse-section-title">
+                        Trending
+                    </h3>
+                    <div class="card-grid" id="podcasts-browse-container"></div>
                 </div>
 
                 <div id="page-tracker-artist" class="page">

@@ -6712,6 +6712,17 @@ img[src=''] {
     width: 100%;
 }
 
+.podcasts-browse-search.track-list-search-container {
+    width: 100%;
+    max-width: 420px;
+    margin-bottom: var(--spacing-md);
+}
+
+.podcasts-browse-heading {
+    font-size: 1.1rem;
+    margin-top: 0;
+}
+
 .library-liked-tracks-toolbar-actions {
     display: flex;
     flex-wrap: wrap;

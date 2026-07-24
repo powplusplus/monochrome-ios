@@ -17,6 +17,7 @@ import {
     getShareUrl,
     createModal,
     isPodcastTrack,
+    debounce,
 } from './utils.js';
 import { openLyricsPanel, renderLyricsInFullscreen, clearFullscreenLyricsSync } from './lyrics.js';
 import {
@@ -7190,27 +7191,97 @@ export class UIRenderer {
         }
     }
 
-    async renderPodcastsBrowsePage() {
-        await this.showPage('podcasts-browse');
-        const trendingContainer = document.getElementById('podcasts-trending-container');
-        const recentContainer = document.getElementById('podcasts-recent-container');
-        trendingContainer.innerHTML = this.createSkeletonCards(12, true);
-        recentContainer.innerHTML = this.createSkeletonCards(12, true);
+    setupPodcastsBrowseSearch() {
+        const searchInput = document.getElementById('podcasts-browse-search');
+        if (!searchInput) return;
+
+        this.setupSearchClearButton(searchInput);
+
+        if (searchInput._podcastsBrowseSearchListener) {
+            searchInput.removeEventListener('input', searchInput._podcastsBrowseSearchListener);
+        }
+
+        const runSearch = debounce(async () => {
+            const query = searchInput.value.trim();
+            if (searchInput._podcastsBrowseAbort) {
+                searchInput._podcastsBrowseAbort.abort();
+                searchInput._podcastsBrowseAbort = null;
+            }
+            if (!query) {
+                await this.loadPodcastsBrowseTrending();
+                return;
+            }
+            await this.loadPodcastsBrowseSearch(query);
+        }, 350);
+
+        const listener = () => runSearch();
+        searchInput._podcastsBrowseSearchListener = listener;
+        searchInput.addEventListener('input', listener);
+    }
+
+    renderPodcastsBrowseCards(container, podcasts, emptyMessage) {
+        if (!container) return;
+        if (podcasts.length > 0) {
+            container.innerHTML = podcasts.map((podcast) => this.createPodcastCardHTML(podcast)).join('');
+            this.attachPodcastCardListeners(container, podcasts);
+        } else {
+            container.innerHTML = createPlaceholder(emptyMessage);
+        }
+    }
+
+    async loadPodcastsBrowseTrending() {
+        const container = document.getElementById('podcasts-browse-container');
+        const titleEl = document.getElementById('podcasts-browse-section-title');
+        if (!container) return;
+
+        if (titleEl) titleEl.textContent = 'Trending';
+        container.innerHTML = this.createSkeletonCards(12, true);
 
         try {
             const { podcastsAPI } = await import('./podcasts-api.js');
-            const trendingResult = await podcastsAPI.getTrendingPodcasts({ max: 24 });
-            if (trendingResult.items.length > 0) {
-                trendingContainer.innerHTML = trendingResult.items
-                    .map((podcast) => this.createPodcastCardHTML(podcast))
-                    .join('');
-                this.attachPodcastCardListeners(trendingContainer, trendingResult.items);
-            } else {
-                trendingContainer.innerHTML = createPlaceholder('No trending podcasts found.');
-            }
+            const result = await podcastsAPI.getTrendingPodcasts({ max: 24 });
+            this.renderPodcastsBrowseCards(container, result.items, 'No trending podcasts found.');
         } catch (error) {
             console.error('Failed to load trending podcasts:', error);
-            trendingContainer.innerHTML = createPlaceholder('Failed to load trending podcasts.');
+            container.innerHTML = createPlaceholder('Failed to load trending podcasts.');
+        }
+    }
+
+    async loadPodcastsBrowseSearch(query) {
+        const container = document.getElementById('podcasts-browse-container');
+        const titleEl = document.getElementById('podcasts-browse-section-title');
+        const searchInput = document.getElementById('podcasts-browse-search');
+        if (!container) return;
+
+        if (titleEl) titleEl.textContent = `Results for “${query}”`;
+        container.innerHTML = this.createSkeletonCards(12, true);
+
+        const abort = new AbortController();
+        if (searchInput) searchInput._podcastsBrowseAbort = abort;
+
+        try {
+            const { podcastsAPI } = await import('./podcasts-api.js');
+            const result = await podcastsAPI.searchPodcasts(query, { max: 40, signal: abort.signal });
+            if (abort.signal.aborted) return;
+            if (searchInput && searchInput.value.trim() !== query) return;
+            this.renderPodcastsBrowseCards(container, result.items, 'No podcasts found.');
+        } catch (error) {
+            if (error.name === 'AbortError') return;
+            console.error('Podcast browse search failed:', error);
+            container.innerHTML = createPlaceholder('Failed to search podcasts.');
+        }
+    }
+
+    async renderPodcastsBrowsePage() {
+        await this.showPage('podcasts-browse');
+        this.setupPodcastsBrowseSearch();
+
+        const searchInput = document.getElementById('podcasts-browse-search');
+        const existingQuery = searchInput?.value.trim() || '';
+        if (existingQuery) {
+            await this.loadPodcastsBrowseSearch(existingQuery);
+        } else {
+            await this.loadPodcastsBrowseTrending();
         }
 
         document.title = 'Podcasts - Monochrome Music';

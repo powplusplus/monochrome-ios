@@ -1883,22 +1883,35 @@ struct PodcastListRow: View {
 }
 
 struct PodcastsBrowseView: View {
+    @State private var query = ""
     @State private var podcasts: [Podcast] = []
     @State private var loading = true
+    @State private var didSearch = false
     @State private var errorText: String?
+
+    private var trimmedQuery: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var sectionTitle: String {
+        trimmedQuery.isEmpty ? "Trending" : "Results"
+    }
 
     var body: some View {
         Group {
             if loading && podcasts.isEmpty {
-                ProgressView("Loading podcasts…")
+                ProgressView(trimmedQuery.isEmpty ? "Loading podcasts…" : "Searching…")
             } else if let errorText, podcasts.isEmpty {
                 VStack(spacing: 8) {
-                    Text("Couldn’t load podcasts").font(.headline)
+                    Text(trimmedQuery.isEmpty ? "Couldn’t load podcasts" : "Couldn’t search").font(.headline)
                     Text(errorText).font(.subheadline).foregroundColor(.secondary).multilineTextAlignment(.center)
                 }.padding()
+            } else if podcasts.isEmpty && didSearch {
+                VStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").font(.title).foregroundColor(.secondary)
+                    Text("No podcasts found").font(.headline)
+                    Text("Try a different show name or host.").font(.subheadline).foregroundColor(.secondary)
+                }.frame(maxWidth: .infinity).padding(.vertical, 40)
             } else {
                 List {
-                    Section("Trending") {
+                    Section(sectionTitle) {
                         ForEach(podcasts) { podcast in
                             NavigationLink(destination: PodcastDetailView(podcastID: podcast.id, initial: podcast)) {
                                 PodcastListRow(podcast: podcast)
@@ -1910,19 +1923,60 @@ struct PodcastsBrowseView: View {
             }
         }
         .navigationTitle("Podcasts")
-        .task { await load() }
-        .refreshable { await load() }
+        .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search podcasts")
+        .onChange(of: query) { value in
+            if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                didSearch = false
+                errorText = nil
+            }
+        }
+        .task(id: query) {
+            if trimmedQuery.isEmpty {
+                await loadTrending()
+                return
+            }
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard !Task.isCancelled else { return }
+            await searchPodcasts()
+        }
+        .refreshable {
+            if trimmedQuery.isEmpty {
+                await loadTrending()
+            } else {
+                await searchPodcasts()
+            }
+        }
     }
 
-    private func load() async {
+    private func loadTrending() async {
         loading = true
         do {
             podcasts = try await PodcastsService.shared.trending()
             errorText = nil
+            didSearch = false
         } catch {
             errorText = error.localizedDescription
         }
         loading = false
+    }
+
+    private func searchPodcasts() async {
+        let requested = trimmedQuery
+        guard !requested.isEmpty else { return }
+        loading = true
+        do {
+            podcasts = try await PodcastsService.shared.search(query: requested, max: 40)
+            if requested == trimmedQuery {
+                errorText = nil
+                didSearch = true
+            }
+        } catch {
+            if requested == trimmedQuery {
+                errorText = error.localizedDescription
+                didSearch = true
+            }
+        }
+        if requested == trimmedQuery { loading = false }
     }
 }
 
