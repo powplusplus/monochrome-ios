@@ -793,7 +793,7 @@ struct NowPlayingView: View {
                         .frame(width: 64, height: 64)
                     lyricsPane
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    controls
+                    controls()
                         .padding(.horizontal, sideInset)
                         .padding(.bottom, bottomPad)
                 }
@@ -804,7 +804,7 @@ struct NowPlayingView: View {
                         artwork
                             .frame(width: min(artSide, 300), height: min(artSide, 300))
                             .padding(.top, 6)
-                        controls
+                        controls()
                     }
                     .frame(maxWidth: 520)
                     .padding(.horizontal, sideInset)
@@ -817,7 +817,7 @@ struct NowPlayingView: View {
                         .frame(width: artSide, height: artSide)
                         .padding(.top, 6)
                     Spacer(minLength: 12)
-                    controls
+                    controls()
                         .padding(.horizontal, sideInset)
                         .padding(.bottom, bottomPad)
                 }
@@ -834,29 +834,21 @@ struct NowPlayingView: View {
 
         return HStack(alignment: .center, spacing: 24) {
             if showLyrics {
-                // Art + the full transport stack easily exceed a landscape
-                // phone's height, so scroll the column instead of clipping it.
-                ScrollView(.vertical, showsIndicators: false) {
-                    VStack(spacing: 16) {
-                        artwork
-                            .frame(width: min(artSide * 0.72, 200), height: min(artSide * 0.72, 200))
-                        controls
-                            .frame(maxWidth: 420)
-                    }
-                    .padding(.vertical, 8)
-                }
-                .frame(maxWidth: geometry.size.width * 0.42)
+                // Lyrics is the focus; the art column has no room next to a full
+                // transport stack in landscape, so drop it and let the compact
+                // controls sit flush — everything fits, no scroll.
+                controls(compact: true)
+                    .frame(maxWidth: min(geometry.size.width * 0.42, 420))
                 lyricsPane
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 artwork
                     .frame(width: artSide, height: artSide)
-                ScrollView(.vertical, showsIndicators: false) {
-                    controls
-                        .frame(maxWidth: 460)
-                        .padding(.vertical, 8)
-                }
-                .frame(maxHeight: .infinity)
+                // Compact transport fits the landscape height without scrolling,
+                // so the dismiss/track-swipe gestures never fight a scroll view.
+                controls(compact: true)
+                    .frame(maxWidth: 460)
+                    .frame(maxHeight: .infinity)
             }
         }
         .padding(.leading, leadingPad)
@@ -934,8 +926,8 @@ struct NowPlayingView: View {
             .accessibilityHint("Swipe down to close. Swipe sideways to change track.")
     }
 
-    private var controls: some View {
-        VStack(spacing: 18) {
+    private func controls(compact: Bool = false) -> some View {
+        VStack(spacing: compact ? 11 : 18) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(playback.currentTrack?.title ?? "Not Playing")
@@ -973,8 +965,7 @@ struct NowPlayingView: View {
                 HStack(spacing: 5) {
                     if resolvedQuality == .lossless || resolvedQuality == .hiResLossless {
                         QualityWaveMark()
-                            .stroke(style: StrokeStyle(lineWidth: 1.2, lineCap: .round))
-                            .frame(width: 20, height: 12)
+                            .frame(width: 24, height: 13)
                     }
                     Text(resolvedQuality.title.uppercased())
                     if let detail = playback.currentStreamQualityDetail {
@@ -1018,7 +1009,7 @@ struct NowPlayingView: View {
                                 .tint(Color(UIColor.systemBackground))
                                 .opacity(spinning ? 1 : 0)
                         }
-                        .frame(width: 68, height: 68)
+                        .frame(width: compact ? 54 : 68, height: compact ? 54 : 68)
                     }
                     .allowsHitTesting(!spinning)
                     .accessibilityLabel(spinning ? "Loading track" : (playback.isPlaying ? "Pause" : "Play"))
@@ -1279,33 +1270,39 @@ private struct InstrumentalDotsView: View {
 /// than the last. The arcs never cross, so they read as one clean ")))"
 /// soundwave instead of the tangle of overlapping sines this used to draw.
 private struct QualityWaveMark: Shape {
-    var arcs: Int = 3
+    var turns: Int = 3
 
+    // The Lossless mark is a flat tape coiled into a leaning helix: three bold
+    // lobes that pinch to a point where the tape turns edge-on. Model it as a
+    // filled ribbon between the tape's two projected edges rather than a set of
+    // thin sine strokes.
     func path(in rect: CGRect) -> Path {
-        var path = Path()
-        // Inset by half the stroke width so the round caps stay inside the frame.
-        let r = rect.insetBy(dx: 0.6, dy: 0.6)
+        let r = rect.insetBy(dx: 1.0, dy: 1.0)
         let midY = r.midY
-        let amplitude = r.height / 2
-        // One full sine period spans the width; phase-shifted copies form the
-        // overlapping-ribbon look of the Lossless mark.
-        let samples = 48
-        for i in 0..<arcs {
-            // Stagger each ribbon by a fraction of the period.
-            let phase = (CGFloat(i) / CGFloat(arcs)) * 2 * .pi
-            var sub = Path()
-            for s in 0...samples {
-                let t = CGFloat(s) / CGFloat(samples)
-                let x = r.minX + t * r.width
-                let y = midY - amplitude * sin(2 * .pi * t + phase)
-                if s == 0 {
-                    sub.move(to: CGPoint(x: x, y: y))
-                } else {
-                    sub.addLine(to: CGPoint(x: x, y: y))
-                }
-            }
-            path.addPath(sub)
+        let radius = r.height * 0.34    // vertical swing of the coil centreline
+        let halfBand = r.height * 0.22  // apparent half-width of the flat tape
+        let slant: CGFloat = 0.30       // rightward lean of the coil
+        let samples = 120
+
+        func point(_ t: CGFloat, edge: CGFloat) -> CGPoint {
+            let a = 2 * .pi * CGFloat(turns) * t
+            // centreline swings with sin(a); the tape face projects to
+            // ±halfBand·cos(a), collapsing to a point (the crossing) where the
+            // tape is edge-on to the viewer.
+            let y = midY - radius * sin(a) + edge * halfBand * cos(a)
+            let x = r.minX + t * r.width + slant * (midY - y)
+            return CGPoint(x: x, y: y)
         }
+
+        var path = Path()
+        path.move(to: point(0, edge: +1))
+        for s in 1...samples {
+            path.addLine(to: point(CGFloat(s) / CGFloat(samples), edge: +1))
+        }
+        for s in stride(from: samples, through: 0, by: -1) {
+            path.addLine(to: point(CGFloat(s) / CGFloat(samples), edge: -1))
+        }
+        path.closeSubpath()
         return path
     }
 }
