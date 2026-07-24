@@ -698,14 +698,14 @@ private final class AudioLevelMonitor: @unchecked Sendable {
             }
         )
 
-        var tapRef: Unmanaged<MTAudioProcessingTap>?
+        var tapRef: MTAudioProcessingTap?
         let createStatus = MTAudioProcessingTapCreate(
             kCFAllocatorDefault,
             &callbacks,
             kMTAudioProcessingTapCreationFlag_PostEffects,
             &tapRef
         )
-        guard createStatus == noErr, let created = tapRef?.takeRetainedValue() else { return }
+        guard createStatus == noErr, let created = tapRef else { return }
         guard !Task.isCancelled else { return }
         lock.lock()
         let stillSameGeneration = generation == gen
