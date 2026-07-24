@@ -386,26 +386,12 @@ final class MusicService {
             ]
             guard let url = components.url else { continue }
 
-            // Web HEAD-checks then feeds URL to <audio>. Accept 405/501 (method not allowed).
-            var head = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
-            head.httpMethod = "HEAD"
-            head.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-            applyMonochromeOrigin(to: &head)
-            if let (_, headResponse) = try? await session.data(for: head),
-               let http = headResponse as? HTTPURLResponse,
-               (200..<400).contains(http.statusCode) || http.statusCode == 405 || http.statusCode == 501 {
-                return StreamResponse(
-                    url: url,
-                    provider: .deezer,
-                    quality: format,
-                    replayGain: nil,
-                    peak: nil,
-                    isPreview: false,
-                    previewReason: nil,
-                    mediaDuration: track.duration > 0 ? track.duration : nil
-                )
-            }
-
+            // A single Range GET is enough to validate the URL: the CDN answers
+            // 200/206 for a playable file and a 4xx/5xx/error body otherwise.
+            // The old HEAD pre-check doubled every format's latency (HEAD then GET)
+            // for no extra signal — on a dead pool that meant up to eight round
+            // trips of ~12s each before the leg gave up. Accept 405/501 here too:
+            // some CDN mirrors reject the Range method but still serve the file.
             var probe = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
             probe.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
             probe.setValue("bytes=0-1", forHTTPHeaderField: "Range")
@@ -413,7 +399,9 @@ final class MusicService {
             do {
                 let (body, response) = try await session.data(for: probe)
                 if let http = response as? HTTPURLResponse {
-                    guard (200..<400).contains(http.statusCode) else {
+                    let ok = (200..<400).contains(http.statusCode)
+                        || http.statusCode == 405 || http.statusCode == 501
+                    guard ok else {
                         let detail = Self.providerErrorDetail(in: body)
                         latestError = detail.map { ServiceError.unavailable($0) } ?? ServiceError.http(http.statusCode)
                         // 503 is the instance reporting that its whole account pool
@@ -433,6 +421,13 @@ final class MusicService {
                     previewReason: nil,
                     mediaDuration: track.duration > 0 ? track.duration : nil
                 )
+            } catch let error as URLError where error.code == .timedOut || error.code == .cannotConnectToHost || error.code == .cannotFindHost || error.code == .networkConnectionLost {
+                // Host unreachable, not this format's fault. Every format targets
+                // the same instance, so retrying the rest just stacks another
+                // ~12s timeout each — the "infinite loading" tail. Give up the
+                // whole leg now and let the caller surface the failure fast.
+                latestError = error
+                break probeLoop
             } catch {
                 latestError = error
             }
@@ -786,8 +781,11 @@ final class MusicService {
         return SyncedLyrics(lines: lines, plainText: plain, provider: "LRCLIB")
     }
 
+    /// Web (monochrome.tf) renders LRC timestamps with no trailing text as "…"
+    /// instead of dropping them, since they mark instrumental/non-vocal gaps
+    /// the sync should still land on. `(.*)`  keeps the match on those lines.
     static func parseLRC(_ subtitles: String) -> [LyricLine] {
-        let pattern = #"\[(\d+):(\d+)(?:\.(\d+))?\]\s*(.+)"#
+        let pattern = #"\[(\d+):(\d+)(?:\.(\d+))?\]\s*(.*)"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
         var lines: [LyricLine] = []
         for raw in subtitles.split(whereSeparator: \.isNewline) {
@@ -806,8 +804,8 @@ final class MusicService {
                 let value = Double(digits) ?? 0
                 fraction = value / pow(10, Double(digits.count))
             }
-            let text = String(line[textRange]).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { continue }
+            let rawText = String(line[textRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = rawText.isEmpty ? "..." : rawText
             lines.append(LyricLine(id: lines.count, time: minutes * 60 + seconds + fraction, text: text))
         }
         return lines

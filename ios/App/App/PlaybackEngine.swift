@@ -52,6 +52,11 @@ final class PlaybackEngine: ObservableObject {
     /// background/foreground toggles don't re-resolve a still-fresh warm.
     private let foregroundStaleTTL: TimeInterval = 90
     private let prefetchDepth = 2
+    /// Seconds of audio to keep buffered ahead of the playhead. Caps progressive
+    /// download to a sliding chunk window so a track starts on its first chunk and
+    /// the rest streams in behind the playhead, rather than AVPlayer greedily
+    /// pulling the whole file up front once bandwidth allows.
+    private let forwardBufferSeconds: TimeInterval = 30
     private var lastNowPlayingElapsed: Double = -1
 
     var currentTrack: Track? {
@@ -64,6 +69,10 @@ final class PlaybackEngine: ObservableObject {
         // We advance the catalog queue ourselves. Leaving AVQueuePlayer on .advance
         // races removeAllItems/insert and can fire stale end notifications.
         player.actionAtItemEnd = .none
+        // Stream in chunks: begin playback as soon as the first chunk is buffered
+        // and let AVPlayer range-request the rest behind the playhead, instead of
+        // stalling until a large lead (or the whole file) has landed.
+        player.automaticallyWaitsToMinimizeStalling = true
         restoreQueue()
         configureRemoteCommands()
         // Ticks at 4 Hz so synced lyrics land on the beat instead of up to half
@@ -257,6 +266,10 @@ final class PlaybackEngine: ObservableObject {
                 currentStreamQualityDetail = stream.qualityDetail
                 let item = AVPlayerItem(asset: asset)
                 item.audioTimePitchAlgorithm = .timeDomain
+                // Bound the look-ahead so the track streams as a sliding window of
+                // chunks. 0 (the default) lets AVPlayer fetch the entire file once
+                // the link is fast enough — the "downloads the whole song first" case.
+                item.preferredForwardBufferDuration = forwardBufferSeconds
                 pendingAutoplay = autoplay
                 itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
                     Task { @MainActor in
@@ -317,6 +330,12 @@ final class PlaybackEngine: ObservableObject {
             } catch {
                 guard !Task.isCancelled else { return }
                 pendingAutoplay = false
+                // resolveStream already retries the cold provider internally
+                // (Amazon 30s→20s window, plus a fresh-JWT retry on 401/428) and
+                // the Deezer leg now fails fast on an unreachable pool. A second
+                // full re-resolve here just stacked another cold Amazon window in
+                // front of the same failure — the "infinite loading" tail. Surface
+                // the error now instead.
                 loadedTrackID = track.id
                 isLoading = false; isPlaying = false; errorMessage = error.localizedDescription
             }
@@ -364,8 +383,12 @@ final class PlaybackEngine: ObservableObject {
             let stream = try await service.resolveStream(for: track, quality: PlaybackQuality.stored)
             try Task.checkCancellation()
             let asset = AVURLAsset(url: stream.url)
-            // Pull the manifest / moov box now so playback starts on bytes we already hold.
-            _ = try? await asset.load(.isPlayable, .duration)
+            // Header-only warm: fetch just enough (manifest / moov box) to confirm the
+            // asset is playable so the first tap starts on bytes we already hold. Don't
+            // load `.duration` here — for progressive files that can range-request deep
+            // into the track, turning a warm into a near-full download. Playback then
+            // streams the rest in chunks bounded by `forwardBufferSeconds`.
+            _ = try? await asset.load(.isPlayable)
             return PreparedStream(stream: stream, asset: asset)
         }
         prefetch[track.id] = (task, Date())

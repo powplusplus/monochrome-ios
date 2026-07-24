@@ -213,58 +213,78 @@ struct SearchView: View {
     @State private var query = ""
     @State private var results = SearchResults()
     @State private var searching = false
-    @State private var message: String?
+    @State private var didSearch = false
+    @State private var errorText: String?
+
+    private var trimmedQuery: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var hasResults: Bool { !(results.tracks.isEmpty && results.albums.isEmpty && results.artists.isEmpty && results.playlists.isEmpty) }
 
     var body: some View {
         NavigationView {
             Group {
-                if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if trimmedQuery.isEmpty {
                     VStack(spacing: 14) {
                         Image(systemName: "sparkle.magnifyingglass").font(.system(size: 42)).foregroundColor(.secondary)
                         Text("Search Monochrome").font(.title2.bold())
                         Text("Find tracks, albums, artists, and playlists.").foregroundColor(.secondary)
                     }.multilineTextAlignment(.center).padding()
-                } else if searching { ProgressView("Searching…") }
-                else {
+                } else if hasResults {
                     List {
                         if !results.tracks.isEmpty { Section("Songs") { ForEach(results.tracks) { TrackRow(track: $0, context: results.tracks) } } }
                         if !results.albums.isEmpty { Section("Albums") { ForEach(results.albums) { album in NavigationLink(destination: AlbumDetailView(albumID: album.id, initial: album)) { AlbumListRow(album: album) } } } }
                         if !results.artists.isEmpty { Section("Artists") { ForEach(results.artists) { artist in Label(artist.name, systemImage: "person.crop.circle") } } }
                         if !results.playlists.isEmpty { Section("Playlists") { ForEach(results.playlists) { playlist in Label(playlist.title, systemImage: "music.note.list") } } }
-                        if results.tracks.isEmpty && results.albums.isEmpty && results.artists.isEmpty && results.playlists.isEmpty {
-                            VStack(spacing: 8) {
-                                Image(systemName: "magnifyingglass").font(.title).foregroundColor(.secondary)
-                                Text("No Results").font(.headline)
-                                Text("Try a different artist, album, song, or playlist.").font(.subheadline).foregroundColor(.secondary)
-                            }.frame(maxWidth: .infinity).padding(.vertical, 40)
-                        }
                     }.listStyle(.insetGrouped)
+                } else if searching || !didSearch {
+                    ProgressView("Searching…")
+                } else if let errorText {
+                    VStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.arrow.triangle.2.circlepath").font(.title).foregroundColor(.secondary)
+                        Text("Couldn’t search").font(.headline)
+                        Text(errorText).font(.subheadline).foregroundColor(.secondary).multilineTextAlignment(.center)
+                    }.frame(maxWidth: .infinity).padding(.horizontal, 32).padding(.vertical, 40)
+                } else {
+                    VStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass").font(.title).foregroundColor(.secondary)
+                        Text("No Results").font(.headline)
+                        Text("Try a different artist, album, song, or playlist.").font(.subheadline).foregroundColor(.secondary)
+                    }.frame(maxWidth: .infinity).padding(.vertical, 40)
                 }
             }
             .navigationTitle("Search")
             .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Artists, albums, songs")
-            .onSubmit(of: .search) { Task { await search() } }
-            .onChange(of: query) { value in if value.isEmpty { results = SearchResults() } }
+            .onChange(of: query) { value in
+                if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    results = SearchResults()
+                    didSearch = false
+                    errorText = nil
+                }
+            }
             .task(id: query) {
-                guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                guard !trimmedQuery.isEmpty else { return }
                 try? await Task.sleep(nanoseconds: 350_000_000)
                 guard !Task.isCancelled else { return }
                 await search()
             }
-            .alert("Search failed", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) { Button("OK", role: .cancel) {} } message: { Text(message ?? "") }
         }.navigationViewStyle(.stack)
     }
 
     private func search() async {
-        let requestedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestedQuery = trimmedQuery
         guard !requestedQuery.isEmpty else { return }
         searching = true
         do {
             let response = try await MusicService.shared.search(requestedQuery)
-            guard requestedQuery == query.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+            guard requestedQuery == trimmedQuery else { return }
             results = response
-        } catch { message = error.localizedDescription }
-        if requestedQuery == query.trimmingCharacters(in: .whitespacesAndNewlines) { searching = false }
+            errorText = nil
+            didSearch = true
+        } catch {
+            guard requestedQuery == trimmedQuery else { return }
+            errorText = error.localizedDescription
+            didSearch = true
+        }
+        if requestedQuery == trimmedQuery { searching = false }
     }
 }
 
@@ -563,8 +583,16 @@ struct NowPlayingView: View {
     private var dismissDrivenBody: some View {
         GeometryReader { geometry in
             let landscape = geometry.size.width > geometry.size.height
-            let topInset = max(geometry.safeAreaInsets.top, Self.keyWindowTopInset)
-            let bottomInset = max(geometry.safeAreaInsets.bottom, Self.keyWindowBottomInset)
+            // The keyWindow fallback only exists to cover status-bar expansion
+            // lag, which is a portrait concern. In landscape the status bar is
+            // hidden and its captured portrait-notch height would otherwise leak
+            // in as a dead ~59pt gap above the header (and steal it from the art).
+            let topInset = landscape
+                ? geometry.safeAreaInsets.top
+                : max(geometry.safeAreaInsets.top, Self.keyWindowTopInset)
+            let bottomInset = landscape
+                ? geometry.safeAreaInsets.bottom
+                : max(geometry.safeAreaInsets.bottom, Self.keyWindowBottomInset)
             let dismissProgress = min(max(dismissOffset / max(geometry.size.height * 0.42, 1), 0), 1)
             ZStack {
                 backdrop
@@ -576,6 +604,11 @@ struct NowPlayingView: View {
                 VStack(spacing: 0) {
                     header
                         .padding(.top, topInset)
+                        // Landscape puts the notch/Dynamic Island on the leading
+                        // edge; without this the close and lyrics buttons hide
+                        // under it. Both insets are 0 in portrait.
+                        .padding(.leading, geometry.safeAreaInsets.leading)
+                        .padding(.trailing, geometry.safeAreaInsets.trailing)
                         .contentShape(Rectangle())
                         .gesture(dismissDrag(screenHeight: geometry.size.height))
                     if landscape {
@@ -801,11 +834,16 @@ struct NowPlayingView: View {
 
         return HStack(alignment: .center, spacing: 24) {
             if showLyrics {
-                VStack(spacing: 16) {
-                    artwork
-                        .frame(width: min(artSide * 0.72, 220), height: min(artSide * 0.72, 220))
-                    controls
-                        .frame(maxWidth: 420)
+                // Art + the full transport stack easily exceed a landscape
+                // phone's height, so scroll the column instead of clipping it.
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(spacing: 16) {
+                        artwork
+                            .frame(width: min(artSide * 0.72, 200), height: min(artSide * 0.72, 200))
+                        controls
+                            .frame(maxWidth: 420)
+                    }
+                    .padding(.vertical, 8)
                 }
                 .frame(maxWidth: geometry.size.width * 0.42)
                 lyricsPane
@@ -1142,23 +1180,31 @@ private struct LyricLineView: View, Equatable {
         lhs.line == rhs.line && lhs.role == rhs.role
     }
 
+    private var isInstrumentalGap: Bool { line.text == "..." }
+
     var body: some View {
         Button {
             onSeek(line.time)
         } label: {
-            Text(line.text)
-                // Fixed size for every role. Swapping the font on the active
-                // line re-wraps the text and changes the row height, which
-                // shoves the whole column mid-scroll; scaleEffect is a GPU
-                // transform that leaves layout untouched.
-                .font(.system(size: 26, weight: .semibold, design: .rounded))
-                .foregroundStyle(foreground)
-                .shadow(color: role == .active ? Color.white.opacity(0.28) : .clear, radius: 14)
-                .multilineTextAlignment(.leading)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .scaleEffect(scale, anchor: .leading)
-                .opacity(opacity)
-                .animation(.easeInOut(duration: 0.45), value: role)
+            Group {
+                if isInstrumentalGap {
+                    InstrumentalDotsView(isActive: role == .active)
+                } else {
+                    Text(line.text)
+                }
+            }
+            // Fixed size for every role. Swapping the font on the active
+            // line re-wraps the text and changes the row height, which
+            // shoves the whole column mid-scroll; scaleEffect is a GPU
+            // transform that leaves layout untouched.
+            .font(.system(size: 26, weight: .semibold, design: .rounded))
+            .foregroundStyle(foreground)
+            .shadow(color: role == .active ? Color.white.opacity(0.28) : .clear, radius: 14)
+            .multilineTextAlignment(.leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .scaleEffect(scale, anchor: .leading)
+            .opacity(opacity)
+            .animation(.easeInOut(duration: 0.45), value: role)
         }
         .buttonStyle(.plain)
     }
@@ -1193,6 +1239,41 @@ private struct LyricLineView: View, Equatable {
     }
 }
 
+/// Apple Music's karaoke view marks instrumental gaps with three dots that
+/// fade in and out in a rolling wave rather than a static "...". Only the
+/// active line animates — past/upcoming rows sit dim and still so the
+/// pulsing doesn't scatter across the whole lyric column.
+private struct InstrumentalDotsView: View {
+    var isActive: Bool
+
+    private let period: Double = 1.1
+    private let stagger: Double = 0.16
+
+    var body: some View {
+        TimelineView(.animation(paused: !isActive)) { timeline in
+            HStack(spacing: 10) {
+                ForEach(0..<3, id: \.self) { index in
+                    Circle()
+                        .fill(Color.white)
+                        .frame(width: 9, height: 9)
+                        .opacity(isActive ? opacity(at: timeline.date, dot: index) : 0.4)
+                }
+            }
+            .frame(height: 26)
+        }
+    }
+
+    /// Triangle wave per dot, staggered so the fade sweeps left to right
+    /// like a rolling "…" rather than all three dots blinking in unison.
+    private func opacity(at date: Date, dot index: Int) -> Double {
+        let t = date.timeIntervalSinceReferenceDate - Double(index) * stagger
+        var phase = t.truncatingRemainder(dividingBy: period) / period
+        if phase < 0 { phase += 1 }
+        let wave = phase < 0.5 ? phase * 2 : (1 - phase) * 2
+        return 0.25 + wave * 0.75
+    }
+}
+
 /// Mimics Apple's Lossless/Hi-Res badge: concentric arcs radiating from a
 /// shared origin on the left edge, each one taller and bowing further right
 /// than the last. The arcs never cross, so they read as one clean ")))"
@@ -1204,18 +1285,25 @@ private struct QualityWaveMark: Shape {
         var path = Path()
         // Inset by half the stroke width so the round caps stay inside the frame.
         let r = rect.insetBy(dx: 0.6, dy: 0.6)
-        let originX = r.minX
         let midY = r.midY
+        let amplitude = r.height / 2
+        // One full sine period spans the width; phase-shifted copies form the
+        // overlapping-ribbon look of the Lossless mark.
+        let samples = 48
         for i in 0..<arcs {
-            let scale = CGFloat(i + 1) / CGFloat(arcs)   // 1/3, 2/3, 1
-            let halfHeight = (r.height / 2) * scale
-            let bulge = r.width * scale                  // how far right the arc bows
+            // Stagger each ribbon by a fraction of the period.
+            let phase = (CGFloat(i) / CGFloat(arcs)) * 2 * .pi
             var sub = Path()
-            sub.move(to: CGPoint(x: originX, y: midY - halfHeight))
-            sub.addQuadCurve(
-                to: CGPoint(x: originX, y: midY + halfHeight),
-                control: CGPoint(x: originX + bulge, y: midY)
-            )
+            for s in 0...samples {
+                let t = CGFloat(s) / CGFloat(samples)
+                let x = r.minX + t * r.width
+                let y = midY - amplitude * sin(2 * .pi * t + phase)
+                if s == 0 {
+                    sub.move(to: CGPoint(x: x, y: y))
+                } else {
+                    sub.addLine(to: CGPoint(x: x, y: y))
+                }
+            }
             path.addPath(sub)
         }
         return path
