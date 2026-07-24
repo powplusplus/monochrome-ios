@@ -174,3 +174,36 @@ describe('LosslessAPI stream source fallback', () => {
         expect(api.getTrack).not.toHaveBeenCalled();
     });
 });
+
+describe('LosslessAPI Lucida without ISRC', () => {
+    let api;
+
+    beforeEach(() => {
+        api = new LosslessAPI({});
+        api.streamCache?.clear?.();
+        amazonMusicSettings.isEnabled.mockReturnValue(true);
+        lucidaQobuzSettings.isEnabled.mockReturnValue(true);
+        vi.spyOn(api, 'getTrackMetadata').mockResolvedValue({
+            id: '123',
+            title: 'Song',
+            artist: { name: 'Artist' },
+        });
+        vi.spyOn(api, 'getAmazonMusicStreamUrl').mockResolvedValue(null);
+        vi.spyOn(api, 'getQobuzStreamUrl').mockResolvedValue({
+            url: 'https://audio.example/qobuz.flac',
+            provider: 'qobuz',
+        });
+        vi.spyOn(api, 'getDeezerStreamUrl').mockResolvedValue(null);
+        vi.spyOn(api, 'getTrack').mockResolvedValue(null);
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    test('falls back to Lucida via artist title when ISRC missing', async () => {
+        const result = await api.getStreamUrl('123', 'LOSSLESS');
+        expect(result.provider).toBe('qobuz');
+        expect(api.getQobuzStreamUrl).toHaveBeenCalledWith('Artist Song', 'LOSSLESS');
+    });
+});

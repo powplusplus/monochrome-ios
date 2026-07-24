@@ -8,6 +8,7 @@ import {
     getShareUrl,
     escapeHtml,
     isPodcastTrack,
+    isRealVideoTrack,
 } from './utils.js';
 import {
     lastFMStorage,
@@ -744,7 +745,7 @@ export async function initializePlayerEvents(player, audioPlayer, scrobbler, ui)
             activeEl.muted = !activeEl.muted;
             localStorage.setItem('muted', activeEl.muted);
 
-            const inactiveEl = player.currentTrack?.type === 'video' ? player.audio : player.video;
+            const inactiveEl = isRealVideoTrack(player.currentTrack) ? player.audio : player.video;
             if (inactiveEl) inactiveEl.muted = activeEl.muted;
 
             updateVolumeUI();
@@ -831,7 +832,7 @@ function initializeSmoothSliders(player) {
                     activeEl.muted = false;
                     localStorage.setItem('muted', false);
 
-                    const inactiveEl = player.currentTrack?.type === 'video' ? player.audio : player.video;
+                    const inactiveEl = isRealVideoTrack(player.currentTrack) ? player.audio : player.video;
                     if (inactiveEl) inactiveEl.muted = false;
                 }
                 player.setVolume(position);
@@ -860,7 +861,7 @@ function initializeSmoothSliders(player) {
                 activeEl.muted = false;
                 localStorage.setItem('muted', false);
 
-                const inactiveEl = player.currentTrack?.type === 'video' ? player.audio : player.video;
+                const inactiveEl = isRealVideoTrack(player.currentTrack) ? player.audio : player.video;
                 if (inactiveEl) inactiveEl.muted = false;
             }
             player.setVolume(position);
@@ -930,7 +931,7 @@ function initializeSmoothSliders(player) {
                 activeEl.muted = false;
                 localStorage.setItem('muted', false);
 
-                const inactiveEl = player.currentTrack?.type === 'video' ? player.audio : player.video;
+                const inactiveEl = isRealVideoTrack(player.currentTrack) ? player.audio : player.video;
                 if (inactiveEl) inactiveEl.muted = false;
             }
             player.setVolume(position);
@@ -950,7 +951,7 @@ function initializeSmoothSliders(player) {
             activeEl.muted = false;
             localStorage.setItem('muted', false);
 
-            const inactiveEl = player.currentTrack?.type === 'video' ? player.audio : player.video;
+            const inactiveEl = isRealVideoTrack(player.currentTrack) ? player.audio : player.video;
             if (inactiveEl) inactiveEl.muted = false;
         }
         player.setVolume(position);
@@ -966,7 +967,7 @@ function initializeSmoothSliders(player) {
                     activeEl.muted = false;
                     localStorage.setItem('muted', false);
 
-                    const inactiveEl = player.currentTrack?.type === 'video' ? player.audio : player.video;
+                    const inactiveEl = isRealVideoTrack(player.currentTrack) ? player.audio : player.video;
                     if (inactiveEl) inactiveEl.muted = false;
                 }
                 player.setVolume(position);
@@ -987,7 +988,7 @@ function initializeSmoothSliders(player) {
                 activeEl.muted = false;
                 localStorage.setItem('muted', false);
 
-                const inactiveEl = player.currentTrack?.type === 'video' ? player.audio : player.video;
+                const inactiveEl = isRealVideoTrack(player.currentTrack) ? player.audio : player.video;
                 if (inactiveEl) inactiveEl.muted = false;
             }
 
@@ -1010,7 +1011,7 @@ function initializeSmoothSliders(player) {
                 activeEl.muted = false;
                 localStorage.setItem('muted', false);
 
-                const inactiveEl = player.currentTrack?.type === 'video' ? player.audio : player.video;
+                const inactiveEl = isRealVideoTrack(player.currentTrack) ? player.audio : player.video;
                 if (inactiveEl) inactiveEl.muted = false;
             }
 
@@ -1996,6 +1997,11 @@ async function updateContextMenuLikeState(contextMenu, contextTrack) {
             item.style.display = 'none';
         }
 
+        // Subtitles / quality: only for real video (music video or video podcast)
+        if (item.dataset.action === 'video-subtitles' || item.dataset.action === 'video-quality') {
+            item.style.display = isRealVideoTrack(contextTrack) ? 'block' : 'none';
+        }
+
         // Update labels for Like/Save
         if (item.dataset.action === 'toggle-like') {
             const labelPrefix = isLiked ? 'labelUnlike' : 'label';
@@ -2480,6 +2486,84 @@ export function initializeTrackInteractions(player, api, mainContent, contextMen
                 contextMenu.innerHTML = `<ul>${subMenuHTML}</ul>`;
                 return;
             }
+        }
+
+        if (action === 'video-subtitles' || action === 'video-quality') {
+            const controls = player.videoControls;
+            if (!controls || !isRealVideoTrack(track)) {
+                showNotification(action === 'video-subtitles' ? 'No subtitles available' : 'No quality options');
+                return;
+            }
+
+            // Ensure this track is playing so menus bind to the active video element.
+            if (player.currentTrack?.id !== track.id) {
+                await player.setQueue([track], 0);
+                await player.playTrackFromQueue();
+            }
+            const { UIRenderer } = await import('./ui.js');
+            if (UIRenderer?.instance && isRealVideoTrack(track)) {
+                const overlay = document.getElementById('fullscreen-cover-overlay');
+                if (overlay?.style.display !== 'flex') {
+                    UIRenderer.instance.showFullscreenCover(
+                        track,
+                        player.getNextTrack(),
+                        UIRenderer.instance.lyricsManager,
+                        player.activeElement
+                    );
+                }
+            }
+
+            if (!contextMenu._originalHTML) {
+                contextMenu._originalHTML = contextMenu.innerHTML;
+            }
+
+            let options =
+                action === 'video-subtitles' ? controls.getSubtitleOptions() : controls.getQualityOptions();
+            if (action === 'video-subtitles' && options.length <= 1) {
+                await controls.attachSubtitles(track);
+                options = controls.getSubtitleOptions();
+            }
+            if (action === 'video-quality' && options.length === 0) {
+                await controls.setupQualityForCurrentPlayback(track);
+                options = controls.getQualityOptions();
+            }
+
+            if (action === 'video-subtitles' && options.every((o) => o.id === 'off')) {
+                showNotification('No subtitles for this episode');
+                return;
+            }
+
+            let subMenuHTML =
+                '<li data-action="back-to-main-menu" style="font-weight: bold; border-bottom: 1px solid var(--border); margin-bottom: 0.5rem; padding: 0.75rem 1rem; cursor: pointer;">← Back</li>';
+            options.forEach((opt) => {
+                const selectAction = action === 'video-subtitles' ? 'select-subtitle' : 'select-video-quality';
+                const mark = opt.active ? '✓ ' : '';
+                subMenuHTML += `<li data-action="${selectAction}" data-option-id="${opt.id}" style="padding: 0.75rem 1rem; cursor: pointer;">${mark}${escapeHtml(opt.label)}</li>`;
+            });
+            contextMenu.innerHTML = `<ul>${subMenuHTML}</ul>`;
+            return;
+        }
+
+        if (action === 'select-subtitle') {
+            player.videoControls?.setSubtitleTrack(target.dataset.optionId);
+            showNotification('Subtitles updated');
+            if (contextMenu._originalHTML) {
+                contextMenu.innerHTML = contextMenu._originalHTML;
+                contextMenu._originalHTML = null;
+            }
+            contextMenu.style.display = 'none';
+            return;
+        }
+
+        if (action === 'select-video-quality') {
+            player.videoControls?.setQuality(target.dataset.optionId);
+            showNotification('Video quality updated');
+            if (contextMenu._originalHTML) {
+                contextMenu.innerHTML = contextMenu._originalHTML;
+                contextMenu._originalHTML = null;
+            }
+            contextMenu.style.display = 'none';
+            return;
         }
 
         if (action === 'back-to-main-menu') {

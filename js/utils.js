@@ -60,6 +60,57 @@ export const isPodcastTrack = (track) => {
     return !!(track.id && String(track.id).startsWith('podcast_'));
 };
 
+/** True when enclosure MIME / URL is a video media file. */
+export const isVideoEnclosure = (enclosureType, enclosureUrl) => {
+    const mime = String(enclosureType || '').toLowerCase();
+    if (mime.startsWith('video/')) return true;
+    // Some feeds label mp4 as application/mp4 without the video/ prefix.
+    if (mime === 'application/mp4' || mime === 'application/x-mp4') return true;
+    const path = String(enclosureUrl || '')
+        .toLowerCase()
+        .split('?')[0]
+        .split('#')[0];
+    return /\.(mp4|m4v|webm|mov)$/.test(path);
+};
+
+/** Infer container/codec token from podcast enclosure MIME / URL. */
+export const enclosureFormatToken = (enclosureType, enclosureUrl) => {
+    const mime = String(enclosureType || '').toLowerCase();
+    const path = String(enclosureUrl || '')
+        .toLowerCase()
+        .split('?')[0]
+        .split('#')[0];
+    if (isVideoEnclosure(enclosureType, enclosureUrl)) return 'VIDEO';
+    if (mime.includes('flac') || path.endsWith('.flac')) return 'FLAC';
+    if (mime.includes('wav') || path.endsWith('.wav') || path.endsWith('.aiff')) return 'WAV';
+    if (mime.includes('opus') || path.endsWith('.opus')) return 'OPUS';
+    if (mime.includes('ogg') || path.endsWith('.ogg')) return 'OPUS';
+    if (mime.includes('mpeg') || mime.includes('mp3') || path.endsWith('.mp3')) return 'MP3';
+    if (
+        mime.includes('aac') ||
+        mime.includes('m4a') ||
+        mime === 'audio/mp4' ||
+        path.endsWith('.m4a') ||
+        path.endsWith('.aac')
+    ) {
+        return 'AAC';
+    }
+    return null;
+};
+
+/**
+ * Real video playback (music video or video podcast) — drives `#video-player`
+ * / fullscreen video mode. Distinct from decorative `videoCover` artwork.
+ */
+export const isRealVideoTrack = (track) => {
+    if (!track) return false;
+    if (track.type === 'video') return true;
+    if (isPodcastTrack(track) && isVideoEnclosure(track.enclosureType, track.enclosureUrl)) {
+        return true;
+    }
+    return false;
+};
+
 export const getTrackYearDisplay = (track) => {
     const useAlbumYear = trackDateSettings.useAlbumYear();
     const releaseDate = useAlbumYear
@@ -318,6 +369,17 @@ export const createQualityBadgeHTML = (track) => {
             quality.replace(/^UHD_/, 'UHD ').replace(/^HD_/, 'HD ').replace(/_/g, ' ');
         return wrap(
             `<span class="quality-badge quality-hires" title="Amazon Music ${escapeHtml(quality)}">${escapeHtml(label)}</span>`
+        );
+    }
+
+    // Podcasts: show enclosure format (MP3/AAC/…), never a music-tier claim.
+    if (isPodcastTrack(track)) {
+        const format =
+            enclosureFormatToken(track.enclosureType, track.enclosureUrl) ||
+            track.audioQuality ||
+            'PODCAST';
+        return wrap(
+            `<span class="quality-badge" title="Podcast enclosure">${escapeHtml(String(format).toUpperCase())}</span>`
         );
     }
 

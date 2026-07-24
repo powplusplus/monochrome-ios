@@ -9,6 +9,7 @@ import {
     escapeHtml,
     deriveTrackQuality,
     isPodcastTrack,
+    isRealVideoTrack,
 } from './utils.js';
 import {
     queueManager,
@@ -29,6 +30,7 @@ import { getProxyUrl } from './proxy-utils.js';
 import { SVG_CLOCK, SVG_ATMOS, SVG_TRIANGLE_ALERT, SVG_PLAY, SVG_PAUSE } from './icons.js';
 import { UIRenderer } from './ui.js';
 import { MediaSession } from '@capgo/capacitor-media-session';
+import { VideoControlsController } from './video-controls.js';
 
 export class Player {
     static #instance = null;
@@ -69,6 +71,7 @@ export class Player {
             (window.matchMedia?.('(display-mode: standalone)')?.matches || window.navigator?.standalone === true);
 
         this.hls = null;
+        this.videoControls = new VideoControlsController(this);
         // Sleep timer properties
         this.sleepTimer = null;
         this.sleepTimerEndTime = null;
@@ -248,7 +251,7 @@ export class Player {
         const eventsToSync = ['timeupdate', 'seeking', 'seeked', 'volumechange'];
         eventsToSync.forEach((eventName) => {
             this.video.addEventListener(eventName, (e) => {
-                if (this.currentTrack?.type === 'video') {
+                if (isRealVideoTrack(this.currentTrack)) {
                     if (eventName === 'timeupdate' || eventName === 'seeking' || eventName === 'seeked') {
                         try {
                             if (this.video.readyState >= 2 && (this.audio.readyState > 0 || this.audio.src)) {
@@ -919,10 +922,7 @@ export class Player {
             this.hls = null;
         }
 
-        const qualityBtn = document.getElementById('fs-quality-btn');
-        const qualityMenu = document.getElementById('fs-quality-menu');
-        if (qualityBtn) qualityBtn.style.display = 'none';
-        if (qualityMenu) qualityMenu.style.display = 'none';
+        this.videoControls?.resetQualityUi();
 
         if (typeof url === 'string' && (url.includes('.m3u8') || url.includes('application/vnd.apple.mpegurl'))) {
             if (Hls.isSupported()) {
@@ -931,7 +931,11 @@ export class Player {
                 this.hls.attachMedia(video);
                 this.hls.on(Hls.Events.MANIFEST_PARSED, async () => {
                     video.play().catch(() => {});
-                    await this.setupVideoQualitySelector();
+                    if (this.currentTrack) {
+                        await this.videoControls.setupForTrack(this.currentTrack);
+                    } else {
+                        await this.videoControls.setupHlsQuality();
+                    }
                 });
                 this.hls.on(Hls.Events.ERROR, (_event, data) => {
                     if (data.fatal) {
@@ -943,6 +947,7 @@ export class Player {
                 });
             } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
                 video.src = url;
+                if (this.currentTrack) await this.videoControls.setupForTrack(this.currentTrack);
             } else {
                 if (fallbackImg) video.replaceWith(fallbackImg);
             }
@@ -955,77 +960,15 @@ export class Player {
                     video.replaceWith(fallbackImg);
                 }
             };
+            if (this.currentTrack) await this.videoControls.setupForTrack(this.currentTrack);
         }
     }
 
     async setupVideoQualitySelector() {
-        if (!this.hls || !this.hls.levels || this.hls.levels.length === 0) return;
-        const Hls = (await import('hls.js')).default;
-
-        const qualityBtn = document.getElementById('fs-quality-btn');
-        const qualityMenu = document.getElementById('fs-quality-menu');
-        if (!qualityBtn || !qualityMenu) return;
-
-        const levels = this.hls.levels;
-        const qualityLabels = [
-            'Auto',
-            ...levels.map((level) => {
-                const height = level.height || 0;
-                const bandwidth = level.bitrate || 0;
-                if (height >= 1080) return '1080p';
-                if (height >= 720) return '720p';
-                if (height >= 480) return '480p';
-                if (height >= 360) return '360p';
-                if (height >= 180) return '180p';
-                return `${Math.round(bandwidth / 1000)}k`;
-            }),
-        ];
-
-        const updateQualityMenu = () => {
-            const currentLevel = this.hls.currentLevel;
-            qualityMenu.innerHTML = qualityLabels
-                .map((label, i) => {
-                    const isActive = currentLevel === i - 1 || (i === 0 && currentLevel === -1);
-                    return `<button class="fs-quality-option ${isActive ? 'active' : ''}" data-level="${i - 1}">${label}</button>`;
-                })
-                .join('');
-
-            qualityMenu.querySelectorAll('.fs-quality-option').forEach((btn) => {
-                btn.onclick = (e) => {
-                    e.stopPropagation();
-                    const level = parseInt(btn.dataset.level);
-                    this.hls.currentLevel = level;
-                    const labelSpan = qualityBtn.querySelector('.fs-quality-label');
-                    if (labelSpan) labelSpan.textContent = level === -1 ? 'Auto' : qualityLabels[level + 1] || 'Auto';
-                    qualityMenu.style.display = 'none';
-                };
-            });
-        };
-
-        qualityBtn.style.display = 'flex';
-        qualityBtn.onclick = (e) => {
-            e.stopPropagation();
-            const isVisible = qualityMenu.style.display === 'block';
-            qualityMenu.style.display = isVisible ? 'none' : 'block';
-            if (!isVisible) {
-                updateQualityMenu();
-            }
-        };
-
-        this.hls.on(Hls.Events.LEVEL_SWITCHED, () => {
-            updateQualityMenu();
-            const labelSpan = qualityBtn.querySelector('.fs-quality-label');
-            if (labelSpan) {
-                const currentLevel = this.hls.currentLevel;
-                labelSpan.textContent = currentLevel === -1 ? 'Auto' : qualityLabels[currentLevel + 1] || 'Auto';
-            }
-        });
-
-        document.addEventListener('click', () => {
-            qualityMenu.style.display = 'none';
-        });
-
-        qualityMenu.onclick = (e) => e.stopPropagation();
+        if (!this.videoControls) return;
+        if (this.hls?.levels?.length) await this.videoControls.setupHlsQuality();
+        else if (this.shakaInitialized) this.videoControls.setupShakaQuality();
+        else this.videoControls.setupProgressiveQuality();
     }
 
     async playVideo(video) {
@@ -1145,7 +1088,7 @@ export class Player {
         const trackArtistsHTML = getTrackArtistsHTML(track);
         const yearDisplay = getTrackYearDisplay(track);
 
-        if (!track.videoUrl && !track.videoCoverUrl && !track.album?.videoCoverUrl) {
+        if (!track.videoUrl && !track.videoCoverUrl && !track.album?.videoCoverUrl && !isPodcastTrack(track)) {
             this.api.getVideoArtwork(trackTitle, artistName).then((result) => {
                 if (this.currentTrack?.id === track.id && result && (result.videoUrl || result.hlsUrl)) {
                     track.videoCoverUrl = result.videoUrl || result.hlsUrl;
@@ -1164,13 +1107,15 @@ export class Player {
         const trackInfo = document.querySelector('.now-playing-bar .track-info');
         const coverEl = trackInfo?.querySelector('.cover:not(#audio-player):not(#video-player)');
 
-        const isVideoTrack = track.type === 'video';
+        const isVideoTrack = isRealVideoTrack(track);
         const activeElement = isVideoTrack ? this.video : this.audio;
         const inactiveElement = isVideoTrack ? this.audio : this.video;
         if (this.hls) {
             this.hls.destroy();
             this.hls = null;
         }
+        this.videoControls?.clearExternalSubtitles();
+        this.videoControls?.resetQualityUi();
 
         // Retain the initialized Shaka player if we are remaining on the same HTMLMediaElement
         if (this.shakaInitialized && this.shakaPlayer) {
@@ -1311,8 +1256,32 @@ export class Player {
 
                 if (this.playbackSequence !== currentSequence) return;
 
+                if (isVideoTrack && UIRenderer.instance) {
+                    const isInFullscreen =
+                        document.getElementById('fullscreen-cover-overlay')?.style.display === 'flex';
+                    if (!isInFullscreen) {
+                        const lyricsManager = UIRenderer.instance.lyricsManager;
+                        UIRenderer.instance.showFullscreenCover(
+                            track,
+                            this.getNextTrack(),
+                            lyricsManager,
+                            activeElement
+                        );
+                    }
+                }
+
                 this.currentRgValues = null;
                 this.applyReplayGain();
+
+                const isHlsEnclosure =
+                    typeof streamUrl === 'string' &&
+                    (streamUrl.includes('.m3u8') || streamUrl.includes('application/vnd.apple.mpegurl'));
+
+                if (isVideoTrack && isHlsEnclosure) {
+                    await this.setupHlsVideo(activeElement, streamUrl, null);
+                    if (startTime > 0) activeElement.currentTime = startTime;
+                    return;
+                }
 
                 activeElement.src = streamUrl;
                 this.applyAudioEffects();
@@ -1325,6 +1294,7 @@ export class Player {
                 }
                 const played = await this.safePlay(activeElement);
                 if (!played) return;
+                if (isVideoTrack) await this.videoControls.setupForTrack(track);
             } else if (isTracker || (track.audioUrl && !track.isLocal)) {
                 streamUrl = track.audioUrl;
 
@@ -1433,8 +1403,10 @@ export class Player {
                     this.forceQuality(savedAdaptiveQuality);
 
                     this.updateAdaptiveQualityBadge();
+                    await this.videoControls.setupForTrack(track);
                 } else {
                     activeElement.src = streamUrl;
+                    await this.videoControls.setupForTrack(track);
                 }
 
                 this.applyAudioEffects();
@@ -2064,7 +2036,7 @@ export class Player {
     }
 
     get activeElement() {
-        return this.currentTrack?.type === 'video' ? this.video : this.audio;
+        return isRealVideoTrack(this.currentTrack) ? this.video : this.audio;
     }
 
     async handlePlayPause() {
@@ -2541,13 +2513,10 @@ export class Player {
                 let isAtmosPlaying = isTrackAtmos && deviceSupportsAtmos;
                 const q = this.quality || localStorage.getItem('adaptive-playback-quality') || 'auto';
 
+                // HLS path can't know the decoded codec here — never stamp the
+                // user's preferred quality (LOSSLESS/FLAC) as if it were playing.
                 if (!isAtmosPlaying) {
-                    if (q === 'HI_RES_LOSSLESS') text = 'HD FLAC';
-                    else if (q === 'LOSSLESS') text = 'FLAC';
-                    else if (q === 'HIGH') text = 'AAC';
-                    else if (q === 'LOW') text = 'AAC Low';
-                    else if (q === 'auto') text = 'HLS Auto';
-                    else text = 'HLS';
+                    text = q === 'auto' ? 'HLS Auto' : 'HLS';
                 }
 
                 if (isAtmosPlaying) {

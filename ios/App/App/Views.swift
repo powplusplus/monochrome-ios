@@ -9,6 +9,7 @@ struct RootView: View {
             else { CompatibleRootShell() }
         }
         .tint(.pink)
+        .overlay(alignment: .bottom) { PlaylistToastOverlay() }
     }
 }
 
@@ -357,6 +358,7 @@ struct SettingsView: View {
     @EnvironmentObject private var auth: AuthSession
     @AppStorage("native.darkAppearance") private var darkAppearance = true
     @AppStorage("native.playbackQuality") private var playbackQuality = PlaybackQuality.lossless.rawValue
+    @AppStorage("native.downloadQuality") private var downloadQuality = PlaybackQuality.hiResLossless.rawValue
     @AppStorage("native.gapless") private var gapless = true
     @AppStorage("native.amazonEnabled") private var amazonEnabled = true
     @AppStorage("native.amazonApiBaseURL") private var amazonApiBaseURL = "https://amz.geeked.wtf"
@@ -379,10 +381,15 @@ struct SettingsView: View {
                             Text(quality.title).tag(quality.rawValue)
                         }
                     }
+                    Picker("Download quality", selection: $downloadQuality) {
+                        ForEach(PlaybackQuality.allCases) { quality in
+                            Text(quality.title).tag(quality.rawValue)
+                        }
+                    }
                     Toggle("Gapless transitions", isOn: $gapless)
                     Picker("Playback speed", selection: $playback.playbackRate) { Text("0.75×").tag(Float(0.75)); Text("1×").tag(Float(1)); Text("1.25×").tag(Float(1.25)); Text("1.5×").tag(Float(1.5)); Text("2×").tag(Float(2)) }
                 }
-                Section(header: Text("Sources"), footer: Text("Amazon Music first. If Amazon cannot resolve a stream URL, Lucida (Qobuz) is tried next, then Deezer. TIDAL is catalog only.")) {
+                Section(header: Text("Sources"), footer: Text("Amazon Music first. If Amazon cannot resolve — or AVPlayer rejects its URL — Lucida (Qobuz) is tried next (ISRC or artist/title search), then Deezer. TIDAL is catalog only.")) {
                     Toggle("Amazon Music", isOn: $amazonEnabled)
                     if amazonEnabled {
                         TextField("Amazon API base URL", text: $amazonApiBaseURL)
@@ -409,16 +416,9 @@ struct SettingsView: View {
                         Button("Sync playlists now") { Task { await library.syncWithCloud() } }
                             .disabled(library.cloudSyncState == .syncing)
                     }
-                    HStack { Text("Legacy migration"); Spacer(); migrationLabel }
-                    Button("Retry legacy migration") { library.migrateLegacyIfNeeded(force: true) }.disabled(library.migrationState == .running)
                 }
-                Section { Text("Native SwiftUI · iOS 15+").foregroundColor(.secondary) } footer: { Text("Core listening uses native SwiftUI.") }
             }.navigationTitle("Settings")
         }.navigationViewStyle(.stack).preferredColorScheme(darkAppearance ? .dark : nil)
-    }
-
-    @ViewBuilder private var migrationLabel: some View {
-        switch library.migrationState { case .notStarted: Text("Pending").foregroundColor(.secondary); case .running: ProgressView(); case .complete: Text("Complete").foregroundColor(.green); case .failed: Text("Needs attention").foregroundColor(.orange) }
     }
 
     @ViewBuilder private var cloudSyncLabel: some View {
@@ -485,6 +485,8 @@ struct TrackRow: View {
     @EnvironmentObject private var library: LibraryRepository
     @EnvironmentObject private var downloads: DownloadManager
     @ObservedObject private var podcastProgress = PodcastProgressStore.shared
+    @State private var showCreatePlaylist = false
+    @State private var newPlaylistName = ""
 
     private var resumeEntry: PodcastProgressStore.Entry? {
         guard track.isPodcast else { return nil }
@@ -500,6 +502,12 @@ struct TrackRow: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(track.title).lineLimit(1).foregroundColor(.primary)
                         HStack(spacing: 4) {
+                            if track.isVideoPodcast {
+                                Image(systemName: "video.fill")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .accessibilityLabel("Video episode")
+                            }
                             if track.explicit { Text("E").font(.caption2.bold()).padding(.horizontal, 3).background(Color.secondary.opacity(0.25)).cornerRadius(2) }
                             Text(track.artist.name).lineLimit(1)
                         }.font(.caption).foregroundColor(.secondary)
@@ -525,7 +533,21 @@ struct TrackRow: View {
             }
             .buttonStyle(.plain)
 
-            if !track.isPodcast, downloads.isDownloading(track) || downloads.isDownloaded(track) {
+            if !track.isPodcast {
+                Button {
+                    if !library.quickAddToPlaylist(track) {
+                        showCreatePlaylist = true
+                    }
+                } label: {
+                    Image(systemName: "text.badge.plus")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Add to playlist")
+
                 AppStoreDownloadButton(
                     state: downloadState(for: track),
                     size: 28,
@@ -540,6 +562,11 @@ struct TrackRow: View {
             Button { playback.playNext(track) } label: { Label("Play Next", systemImage: "text.insert") }
             Button { playback.append(track) } label: { Label("Add to Queue", systemImage: "text.badge.plus") }
             if !track.isPodcast {
+                Button {
+                    if !library.quickAddToPlaylist(track) {
+                        showCreatePlaylist = true
+                    }
+                } label: { Label("Add to Playlist", systemImage: "music.note.list") }
                 Button { library.toggleFavorite(track) } label: { Label(library.isFavorite(track) ? "Unlike" : "Like", systemImage: library.isFavorite(track) ? "heart.slash" : "heart") }
                 if downloads.isDownloaded(track) {
                     Button(role: .destructive) { downloads.removeDownload(track) } label: { Label("Remove Download", systemImage: "trash") }
@@ -550,14 +577,38 @@ struct TrackRow: View {
                 }
             }
         }
+        .alert("New Playlist", isPresented: $showCreatePlaylist) {
+            TextField("Playlist name", text: $newPlaylistName)
+            Button("Create") {
+                let value = newPlaylistName.trimmingCharacters(in: .whitespaces)
+                if !value.isEmpty {
+                    library.createPlaylist(named: value, tracks: [track])
+                    if let created = library.playlists.first {
+                        library.announceAdded(track, to: created.id)
+                    }
+                }
+                newPlaylistName = ""
+            }
+            Button("Cancel", role: .cancel) { newPlaylistName = "" }
+        } message: {
+            Text("Create a playlist to save this song.")
+        }
         .accessibilityLabel("\(track.title), by \(track.artist.name)")
     }
 
     private func downloadState(for track: Track) -> AppStoreDownloadButton.State {
+        if downloads.isDownloaded(track), downloads.progress[track.id] == nil {
+            return .downloaded
+        }
+        if downloads.isPreparing(track) {
+            return .preparing
+        }
         if let fraction = downloads.progress[track.id] {
             return .downloading(max(0.02, min(1, fraction)))
         }
-        if downloads.isDownloaded(track) { return .downloaded }
+        if downloads.isDownloading(track) {
+            return .preparing
+        }
         return .idle
     }
 
@@ -611,6 +662,7 @@ struct PodcastResumeBar: View {
 struct AppStoreDownloadButton: View {
     enum State: Equatable {
         case idle
+        case preparing
         case downloading(Double)
         case downloaded
     }
@@ -626,9 +678,16 @@ struct AppStoreDownloadButton: View {
             ZStack {
                 switch state {
                 case .idle:
-                    Image(systemName: "arrow.down")
-                        .font(.system(size: size * 0.38, weight: .semibold))
+                    Image(systemName: "arrow.down.circle")
+                        .font(.system(size: size * 0.85, weight: .regular))
                         .foregroundStyle(.primary)
+                case .preparing:
+                    Circle()
+                        .stroke(Color.primary.opacity(0.22), lineWidth: lineWidth)
+                    IndeterminateDownloadRing(lineWidth: lineWidth)
+                    RoundedRectangle(cornerRadius: max(1.5, squareSize * 0.2), style: .continuous)
+                        .fill(Color.primary)
+                        .frame(width: squareSize, height: squareSize)
                 case .downloading(let progress):
                     Circle()
                         .stroke(Color.primary.opacity(0.22), lineWidth: lineWidth)
@@ -636,13 +695,13 @@ struct AppStoreDownloadButton: View {
                         .trim(from: 0, to: max(0.02, min(1, progress)))
                         .stroke(Color.primary, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
                         .rotationEffect(.degrees(-90))
-                        .animation(.linear(duration: 0.15), value: progress)
+                        .animation(.linear(duration: 0.12), value: progress)
                     RoundedRectangle(cornerRadius: max(1.5, squareSize * 0.2), style: .continuous)
                         .fill(Color.primary)
                         .frame(width: squareSize, height: squareSize)
                 case .downloaded:
-                    Image(systemName: "checkmark")
-                        .font(.system(size: size * 0.36, weight: .bold))
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: size * 0.85, weight: .regular))
                         .foregroundStyle(.primary)
                 }
             }
@@ -657,10 +716,109 @@ struct AppStoreDownloadButton: View {
         .accessibilityLabel({
             switch state {
             case .idle: return "Download"
-            case .downloading: return "Cancel Download"
+            case .preparing, .downloading: return "Cancel Download"
             case .downloaded: return "Downloaded"
             }
         }())
+    }
+}
+
+private struct IndeterminateDownloadRing: View {
+    var lineWidth: CGFloat = 2.5
+    @State private var spinning = false
+
+    var body: some View {
+        Circle()
+            .trim(from: 0, to: 0.28)
+            .stroke(Color.primary, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+            .rotationEffect(.degrees(spinning ? 360 : 0))
+            .animation(.linear(duration: 0.85).repeatForever(autoreverses: false), value: spinning)
+            .onAppear { spinning = true }
+    }
+}
+
+struct PlaylistToastOverlay: View {
+    @EnvironmentObject private var library: LibraryRepository
+    @State private var showPicker = false
+
+    var body: some View {
+        VStack {
+            Spacer()
+            if let toast = library.playlistToast {
+                HStack(spacing: 12) {
+                    Image(systemName: "music.note.list")
+                        .foregroundStyle(.pink)
+                    Text("Added to \(toast.playlistTitle)")
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    Button("Change") {
+                        library.holdPlaylistToast()
+                        showPicker = true
+                    }
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.pink)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(.horizontal, 16)
+                .padding(.bottom, 96)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .sheet(isPresented: $showPicker, onDismiss: {
+                    if let toast = library.playlistToast {
+                        library.announceAdded(toast.track, to: toast.playlistID)
+                    }
+                }) {
+                    PlaylistPickSheet(
+                        selectedID: toast.playlistID,
+                        onPick: { id in
+                            library.changeToastPlaylist(to: id)
+                            showPicker = false
+                        },
+                        onDismiss: { showPicker = false }
+                    )
+                    .environmentObject(library)
+                }
+            }
+        }
+        .animation(.spring(response: 0.35, dampingFraction: 0.86), value: library.playlistToast)
+        .allowsHitTesting(library.playlistToast != nil)
+    }
+}
+
+private struct PlaylistPickSheet: View {
+    @EnvironmentObject private var library: LibraryRepository
+    let selectedID: String
+    let onPick: (String) -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        NavigationView {
+            List {
+                ForEach(library.playlists) { playlist in
+                    Button {
+                        onPick(playlist.id)
+                    } label: {
+                        HStack {
+                            Text(playlist.title).foregroundColor(.primary)
+                            Spacer()
+                            if playlist.id == selectedID {
+                                Image(systemName: "checkmark").foregroundColor(.pink)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Add to Playlist")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", action: onDismiss)
+                }
+            }
+        }
+        .navigationViewStyle(.stack)
     }
 }
 
@@ -1142,11 +1300,21 @@ struct NowPlayingView: View {
     }
 
     private var artwork: some View {
-        ArtworkView(url: playback.currentTrack?.artworkURL)
-            .aspectRatio(1, contentMode: .fit)
-            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.10), lineWidth: 0.5))
-            .shadow(color: .black.opacity(0.42), radius: 28, y: 16)
+        Group {
+            if playback.currentTrack?.isVideoPodcast == true {
+                PlayerVideoView(player: playback.player)
+                    .aspectRatio(16 / 9, contentMode: .fit)
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.10), lineWidth: 0.5))
+                    .shadow(color: .black.opacity(0.42), radius: 28, y: 16)
+            } else {
+                ArtworkView(url: playback.currentTrack?.artworkURL)
+                    .aspectRatio(1, contentMode: .fit)
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.10), lineWidth: 0.5))
+                    .shadow(color: .black.opacity(0.42), radius: 28, y: 16)
+            }
+        }
             .offset(x: artDragOffset)
             .opacity(1 - min(abs(artDragOffset) / 180, 0.35))
             .gesture(artworkSwipe)
@@ -1188,7 +1356,7 @@ struct NowPlayingView: View {
                 .foregroundColor(.secondary)
             }
 
-            if playback.currentStreamProvider == .qobuz || resolvedQuality != nil {
+            if playback.currentStreamProvider == .qobuz || qualityBadge != nil {
                 VStack(spacing: 4) {
                     if playback.currentStreamProvider == .qobuz {
                         Text("Lucida")
@@ -1200,13 +1368,13 @@ struct NowPlayingView: View {
                             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
                             .accessibilityLabel("Streaming via Lucida")
                     }
-                    if let resolvedQuality {
+                    if let badge = qualityBadge {
                         HStack(spacing: 5) {
-                            if resolvedQuality == .lossless || resolvedQuality == .hiResLossless {
+                            if badge.tier == .lossless || badge.tier == .hiResLossless {
                                 QualityWaveMark()
                                     .frame(width: 24, height: 13)
                             }
-                            Text(resolvedQuality.title.uppercased())
+                            Text(badge.label)
                             if let detail = playback.currentStreamQualityDetail {
                                 Text(detail)
                                     .foregroundStyle(.secondary)
@@ -1214,12 +1382,12 @@ struct NowPlayingView: View {
                         }
                         .accessibilityElement(children: .combine)
                         .accessibilityLabel(
-                            playback.currentStreamQualityDetail.map { "\(resolvedQuality.title), \($0) bit depth over kilohertz" }
-                                ?? resolvedQuality.title
+                            playback.currentStreamQualityDetail.map { "\(badge.label), \($0) bit depth over kilohertz" }
+                                ?? badge.label
                         )
                         .font(.caption2.weight(.semibold))
                         .kerning(1.0)
-                        .foregroundStyle(resolvedQuality == .hiResLossless ? Color(red: 0.85, green: 0.68, blue: 0.24) : .secondary)
+                        .foregroundStyle(badge.tier == .hiResLossless ? Color(red: 0.85, green: 0.68, blue: 0.24) : .secondary)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 4)
                         .background(.thinMaterial, in: Capsule())
@@ -1298,22 +1466,33 @@ struct NowPlayingView: View {
         }
     }
 
-    /// What the badge shows: the tier the provider actually handed us, else the
-    /// tier the catalog claims for the track, else the tier we asked for. An
-    /// unmappable token used to blank the badge entirely, which read as the
-    /// feature being missing rather than as one unknown string.
-    private var resolvedQuality: PlaybackQuality? {
+    /// Honest badge only: stream we got, else catalog claim. Never the user's
+    /// quality preference — that used to paint "Lossless (HiFi)" on MP3 podcasts.
+    private var qualityBadge: (tier: PlaybackQuality?, label: String)? {
         guard let track = playback.currentTrack else { return nil }
-        if let raw = playback.currentStreamQuality, let quality = PlaybackQuality(providerToken: raw) {
-            return quality
+        if let raw = playback.currentStreamQuality, !raw.isEmpty {
+            let tier = PlaybackQuality(providerToken: raw)
+            let label = PlaybackQuality.badgeLabel(forToken: raw)
+                ?? tier?.title.uppercased()
+                ?? raw.uppercased()
+            return (tier, label)
         }
-        return track.catalogQuality ?? .stored
+        if let catalog = track.catalogQuality {
+            let token = track.audioQuality ?? catalog.rawValue
+            let label = PlaybackQuality.badgeLabel(forToken: token) ?? catalog.title.uppercased()
+            return (catalog, label)
+        }
+        return nil
     }
 
 
     private func time(_ seconds: Double) -> String {
         let value = Int(seconds.isFinite ? seconds : 0)
-        return String(format: "%d:%02d", value / 60, value % 60)
+        let h = value / 3600
+        let m = (value % 3600) / 60
+        let s = value % 60
+        if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
+        return String(format: "%d:%02d", m, s)
     }
 
     /// GeometryReader can lag behind status-bar expansions (hotspot/call).
@@ -1597,7 +1776,10 @@ struct TrackCollectionView: View {
 
     private var collectionDownloadState: AppStoreDownloadButton.State {
         if let fraction = downloads.collectionProgress(for: tracks) {
-            return .downloading(fraction)
+            if fraction <= 0.02, tracks.contains(where: { downloads.isPreparing($0) }) {
+                return .preparing
+            }
+            return .downloading(max(0.02, fraction))
         }
         if downloads.allDownloaded(tracks) {
             return .downloaded
@@ -1747,7 +1929,7 @@ struct TrackCollectionView: View {
         switch collectionDownloadState {
         case .idle:
             Task { await downloads.downloadAll(tracks) }
-        case .downloading:
+        case .preparing, .downloading:
             downloads.cancelAll(in: tracks)
         case .downloaded:
             break
@@ -1773,7 +1955,7 @@ struct ProviderSettingsView: View {
             Picker("Preferred catalog provider", selection: $provider) {
                 ForEach(Provider.musicCases) { Text($0.title).tag($0.rawValue) }
             }
-            Text("Catalog search uses TIDAL metadata. Full audio resolves Amazon → Lucida → Deezer like web Monochrome — not TIDAL stream manifests. Podcasts play enclosure audio directly.")
+            Text("Catalog search uses TIDAL metadata. Full audio resolves Amazon → Lucida → Deezer like web Monochrome — not TIDAL stream manifests. Podcasts play enclosure media directly (video episodes show in now playing).")
                 .font(.footnote)
                 .foregroundColor(.secondary)
         }
@@ -2289,5 +2471,26 @@ struct SkipButtonStyle: ButtonStyle {
             .offset(x: configuration.isPressed ? direction.nudge : 0)
             .opacity(configuration.isPressed ? 0.6 : 1)
             .animation(.spring(response: 0.26, dampingFraction: 0.5), value: configuration.isPressed)
+    }
+}
+
+/// Renders `AVPlayer` video frames without AVKit chrome — now-playing controls stay ours.
+private struct PlayerVideoView: UIViewRepresentable {
+    let player: AVPlayer
+
+    func makeUIView(context: Context) -> PlayerUIView {
+        let view = PlayerUIView()
+        view.playerLayer.player = player
+        view.playerLayer.videoGravity = .resizeAspect
+        return view
+    }
+
+    func updateUIView(_ uiView: PlayerUIView, context: Context) {
+        uiView.playerLayer.player = player
+    }
+
+    final class PlayerUIView: UIView {
+        override class var layerClass: AnyClass { AVPlayerLayer.self }
+        var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
     }
 }

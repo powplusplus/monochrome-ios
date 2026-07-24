@@ -42,9 +42,12 @@ enum PlaybackQuality: String, CaseIterable, Identifiable, Codable {
         switch token {
         case "LOW", "LOW_QUALITY", "SD_LOW", "MP3_64", "MP3_128", "MP3_MISC", "HEAACV1", "AAC_LOW":
             self = .low
-        case "HIGH", "HIGH_QUALITY", "NORMAL", "SD", "SD_HIGH", "MP3_320", "AACLC", "AAC", "MP4A":
+        case "HIGH", "HIGH_QUALITY", "NORMAL", "SD", "SD_HIGH", "MP3_320", "AACLC", "AAC", "MP4A",
+             "MP3", "MPEG", "M4A", "OPUS", "OGG", "PODCAST", "VIDEO":
+            // Lossy containers (incl. podcast enclosures). Tier = high so we never
+            // paint the lossless wave mark; badgeLabel shows the real codec/format.
             self = .high
-        case "LOSSLESS", "HIFI", "CD", "FLAC", "MP4_RA_FLAC":
+        case "LOSSLESS", "HIFI", "CD", "FLAC", "MP4_RA_FLAC", "WAV", "WAVE", "AIFF":
             self = .lossless
         case "HI_RES_LOSSLESS", "HIRES_LOSSLESS", "HIRESLOSSLESS", "HIFI_PLUS", "HI_RES_FLAC",
              "HI_RES", "HIRES", "MASTER", "MASTER_QUALITY", "MQA", "FLAC_HIRES", "UHD":
@@ -58,6 +61,60 @@ enum PlaybackQuality: String, CaseIterable, Identifiable, Codable {
             default: return nil
             }
         }
+    }
+
+    /// Format-accurate badge text when the token is a container/codec, not a tier.
+    /// Keeps MP3 podcasts from reading as generic "High" / never as "Lossless".
+    static func badgeLabel(forToken raw: String) -> String? {
+        let token = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+        switch token {
+        case "MP3", "MPEG", "AUDIO_MPEG": return "MP3"
+        case "AAC", "M4A", "MP4A", "AACLC": return "AAC"
+        case "OPUS", "OGG": return "OPUS"
+        case "WAV", "WAVE", "AIFF": return "WAV"
+        case "FLAC": return "FLAC"
+        case "VIDEO", "MP4", "M4V": return "VIDEO"
+        case "PODCAST": return "PODCAST"
+        default: return nil
+        }
+    }
+
+    /// Infer a container/codec token from MIME + URL path. `nil` when unknown —
+    /// callers must not invent a tier (esp. not the user's quality preference).
+    static func mediaFormatToken(mimeType: String?, url: URL?) -> String? {
+        let mime = (mimeType ?? "").lowercased()
+        let path = (url?.path ?? "").lowercased()
+        if mime.hasPrefix("video/")
+            || mime == "application/mp4" || mime == "application/x-mp4"
+            || path.hasSuffix(".mp4") || path.hasSuffix(".m4v")
+            || path.hasSuffix(".webm") || path.hasSuffix(".mov") {
+            return "VIDEO"
+        }
+        if mime.contains("flac") || path.hasSuffix(".flac") { return "FLAC" }
+        if mime.contains("wav") || path.hasSuffix(".wav")
+            || mime.contains("aiff") || path.hasSuffix(".aiff") {
+            return "WAV"
+        }
+        if mime.contains("opus") || path.hasSuffix(".opus") { return "OPUS" }
+        if mime.contains("ogg") || path.hasSuffix(".ogg") { return "OPUS" }
+        if mime.contains("mpeg") || mime.contains("mp3") || path.hasSuffix(".mp3") {
+            return "MP3"
+        }
+        if mime.contains("aac") || mime.contains("m4a") || mime == "audio/mp4"
+            || path.hasSuffix(".m4a") || path.hasSuffix(".aac") {
+            return "AAC"
+        }
+        return nil
+    }
+
+    /// Podcast enclosure → honest stream token. Unknown container stays `PODCAST`
+    /// (lossy/unknown) rather than blanking the badge or borrowing the user pref.
+    static func enclosureToken(mimeType: String?, url: URL?) -> String {
+        mediaFormatToken(mimeType: mimeType, url: url) ?? "PODCAST"
     }
 
     /// Descending audio fidelity, mirroring web `QUALITY_PRIORITY`.
@@ -134,6 +191,18 @@ enum PlaybackQuality: String, CaseIterable, Identifiable, Codable {
 
     static func store(_ quality: PlaybackQuality) {
         UserDefaults.standard.set(quality.rawValue, forKey: "native.playbackQuality")
+    }
+
+    /// Offline download quality — separate from streaming. Defaults to hi-res lossless
+    /// (web `download-quality` / `HI_RES_LOSSLESS`).
+    static var downloadStored: PlaybackQuality {
+        let raw = UserDefaults.standard.string(forKey: "native.downloadQuality")
+        if let raw, let value = PlaybackQuality(rawValue: raw) { return value }
+        return .hiResLossless
+    }
+
+    static func storeDownload(_ quality: PlaybackQuality) {
+        UserDefaults.standard.set(quality.rawValue, forKey: "native.downloadQuality")
     }
 }
 
@@ -226,10 +295,18 @@ struct Track: Codable, Identifiable, Hashable {
     var isrc: String?
     var provider: Provider
     var streamURL: URL?
+    /// PodcastIndex `enclosureType` (e.g. `video/mp4`) — video episodes play visually.
+    var enclosureType: String?
+    /// Provider that filled the offline file (Amazon/Qobuz/Deezer). Drives Lucida badge on local play.
+    var offlineProvider: Provider? = nil
+    /// Quality token written with the offline file.
+    var offlineQuality: String? = nil
+    var offlineQualityDetail: String? = nil
 
     init(id: String, title: String, artist: Artist, album: AlbumSummary? = nil, duration: Double = 0,
          explicit: Bool = false, audioQuality: String? = nil, mediaTags: [String]? = nil, isrc: String? = nil,
-         provider: Provider = .tidal, streamURL: URL? = nil) {
+         provider: Provider = .tidal, streamURL: URL? = nil, enclosureType: String? = nil,
+         offlineProvider: Provider? = nil, offlineQuality: String? = nil, offlineQualityDetail: String? = nil) {
         self.id = id
         self.title = title
         self.artist = artist
@@ -241,6 +318,10 @@ struct Track: Codable, Identifiable, Hashable {
         self.isrc = isrc
         self.provider = provider
         self.streamURL = streamURL
+        self.enclosureType = enclosureType
+        self.offlineProvider = offlineProvider
+        self.offlineQuality = offlineQuality
+        self.offlineQualityDetail = offlineQualityDetail
     }
 
     var artworkURL: URL? { Artwork.url(album?.cover, size: 640) }
@@ -249,6 +330,19 @@ struct Track: Codable, Identifiable, Hashable {
     /// Podcast episodes use `podcast_{id}` (web/iOS) and play via `streamURL` enclosure.
     var isPodcast: Bool {
         provider == .podcast || id.hasPrefix("podcast_") || id.hasPrefix("podcast:")
+    }
+
+    /// Video podcast episode — enclosure is a video media file.
+    var isVideoPodcast: Bool {
+        guard isPodcast else { return false }
+        let mime = (enclosureType ?? "").lowercased()
+        if mime.hasPrefix("video/") { return true }
+        if mime == "application/mp4" || mime == "application/x-mp4" { return true }
+        guard let path = streamURL?.absoluteString.lowercased()
+            .split(separator: "?").first
+            .map(String.init) else { return false }
+        return path.hasSuffix(".mp4") || path.hasSuffix(".m4v")
+            || path.hasSuffix(".webm") || path.hasSuffix(".mov")
     }
 
     /// Highest tier the *catalog* claims for this track. Used as the badge's

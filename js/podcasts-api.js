@@ -248,7 +248,27 @@ export class PodcastsAPI {
             feedId: item.feedId || null,
             feedTitle: item.feedTitle || '',
             feedImage: item.feedImage || '',
+            transcriptUrl: item.transcriptUrl || '',
+            transcripts: Array.isArray(item.transcripts)
+                ? item.transcripts.map((t) => ({
+                      url: t.url || t.transcriptUrl || '',
+                      type: t.type || '',
+                      language: t.language || t.lang || '',
+                  })).filter((t) => t.url)
+                : [],
+            chaptersUrl: item.chaptersUrl || '',
         };
+    }
+
+    async getEpisodeById(id, options = {}) {
+        try {
+            const data = await this.fetchWithRetry(`/episodes/byid?id=${id}&pretty`, options);
+            if (!data?.episode) return null;
+            return this.transformEpisode(data.episode);
+        } catch (error) {
+            console.error('Get episode by ID failed:', error);
+            return null;
+        }
     }
 }
 

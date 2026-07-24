@@ -1,6 +1,5 @@
 import CoreData
 import Foundation
-import WebKit
 
 @MainActor
 final class LibraryRepository: ObservableObject {
@@ -9,16 +8,16 @@ final class LibraryRepository: ObservableObject {
     @Published private(set) var favorites: [Track] = []
     @Published private(set) var history: [Track] = []
     @Published private(set) var playlists: [Playlist] = []
-    @Published private(set) var migrationState: MigrationState = .notStarted
     @Published private(set) var cloudSyncState: CloudSyncState = .idle
+    @Published var playlistToast: PlaylistAddToast?
 
-    enum MigrationState: Equatable { case notStarted, running, complete, failed(String) }
     enum CloudSyncState: Equatable { case idle, syncing, complete, failed(String) }
 
     private let container: NSPersistentContainer
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
-    private var migrationBridge: LegacyMigrationBridge?
+    private let lastPlaylistKey = "native.lastPlaylistID"
+    private var toastDismissTask: Task<Void, Never>?
 
     init(inMemory: Bool = false) {
         let model = NSManagedObjectModel()
@@ -79,37 +78,82 @@ final class LibraryRepository: ObservableObject {
         scheduleCloudUpload()
     }
 
+    func remove(_ track: Track, from playlistID: String) {
+        guard let index = playlists.firstIndex(where: { $0.id == playlistID }) else { return }
+        playlists[index].tracks.removeAll { $0.id == track.id }
+        upsert(playlists[index], key: playlistID, kind: "playlist")
+        save()
+        scheduleCloudUpload()
+    }
+
+    /// Preferred playlist for one-tap add: last chosen, else first.
+    var preferredPlaylist: Playlist? {
+        if let last = UserDefaults.standard.string(forKey: lastPlaylistKey),
+           let match = playlists.first(where: { $0.id == last }) {
+            return match
+        }
+        return playlists.first
+    }
+
+    /// One-tap add → toast with Change. Returns false when no playlists exist.
+    @discardableResult
+    func quickAddToPlaylist(_ track: Track) -> Bool {
+        guard !track.isPodcast else { return false }
+        guard let playlist = preferredPlaylist else { return false }
+        add(track, to: playlist.id)
+        rememberPlaylist(playlist.id)
+        presentToast(track: track, playlist: playlist)
+        return true
+    }
+
+    /// Show toast + remember without re-adding (e.g. after create-with-track).
+    func announceAdded(_ track: Track, to playlistID: String) {
+        guard let playlist = playlists.first(where: { $0.id == playlistID }) else { return }
+        rememberPlaylist(playlistID)
+        presentToast(track: track, playlist: playlist)
+    }
+
+    /// Change destination from toast: move track, remember choice, refresh toast.
+    func changeToastPlaylist(to playlistID: String) {
+        guard let toast = playlistToast,
+              let playlist = playlists.first(where: { $0.id == playlistID }) else { return }
+        if toast.playlistID != playlistID {
+            remove(toast.track, from: toast.playlistID)
+            add(toast.track, to: playlistID)
+        }
+        rememberPlaylist(playlistID)
+        presentToast(track: toast.track, playlist: playlist)
+    }
+
+    func dismissPlaylistToast() {
+        toastDismissTask?.cancel()
+        toastDismissTask = nil
+        playlistToast = nil
+    }
+
+    /// Keep toast up while Change sheet is open.
+    func holdPlaylistToast() {
+        toastDismissTask?.cancel()
+        toastDismissTask = nil
+    }
+
+    private func rememberPlaylist(_ id: String) {
+        UserDefaults.standard.set(id, forKey: lastPlaylistKey)
+    }
+
+    private func presentToast(track: Track, playlist: Playlist) {
+        playlistToast = PlaylistAddToast(track: track, playlistID: playlist.id, playlistTitle: playlist.title)
+        toastDismissTask?.cancel()
+        toastDismissTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run { self?.playlistToast = nil }
+        }
+    }
+
     func removeFavorite(at offsets: IndexSet) {
         for index in offsets { if favorites.indices.contains(index) { delete(key: favorites[index].id, kind: "favorite") } }
         favorites.remove(atOffsets: offsets); save()
-    }
-
-    func migrateLegacyIfNeeded(force: Bool = false) {
-        guard force || !UserDefaults.standard.bool(forKey: "nativeLegacyMigrationComplete") else { migrationState = .complete; return }
-        guard migrationState != .running else { return }
-        migrationState = .running
-        let bridge = LegacyMigrationBridge()
-        migrationBridge = bridge
-        bridge.export { [weak self] result in
-            Task { @MainActor in
-                guard let self else { return }
-                self.migrationBridge = nil
-                switch result {
-                case .success(let snapshot):
-                    do {
-                        try self.importSnapshot(snapshot)
-                        try self.container.viewContext.save()
-                        UserDefaults.standard.set(true, forKey: "nativeLegacyMigrationComplete")
-                        self.load(); self.migrationState = .complete
-                    } catch {
-                        self.container.viewContext.rollback()
-                        self.migrationState = .failed(error.localizedDescription)
-                    }
-                case .failure(let error):
-                    self.migrationState = .failed(error.localizedDescription)
-                }
-            }
-        }
     }
 
     func syncWithCloud() async {
@@ -221,69 +265,10 @@ final class LibraryRepository: ObservableObject {
         return [:]
     }
 
-    private func importSnapshot(_ snapshot: LegacySnapshot) throws {
-        for object in snapshot.favorites {
-            if let track = ModelMapper.track(object) { upsert(track, key: track.id, kind: "favorite") }
-        }
-        for object in snapshot.history {
-            if let track = ModelMapper.track(object) { upsert(track, key: track.id, kind: "history") }
-        }
-        for object in snapshot.playlists {
-            guard let id = ModelMapper.string(object, ["id", "uuid"]), let title = ModelMapper.string(object, ["title", "name"]) else { continue }
-            let tracks = ModelMapper.array(object["tracks"] as Any, keys: ["items"]).compactMap(ModelMapper.track)
-            upsert(Playlist(id: id, title: title, description: ModelMapper.string(object, ["description"]), cover: ModelMapper.string(object, ["cover"]), creator: "You", tracks: tracks), key: id, kind: "playlist")
-        }
-        for (key, value) in snapshot.settings { UserDefaults.standard.set(value, forKey: "legacy.\(key)") }
-    }
 }
 
-struct LegacySnapshot {
-    var favorites: [[String: Any]] = []
-    var history: [[String: Any]] = []
-    var playlists: [[String: Any]] = []
-    var settings: [String: Any] = [:]
-}
-
-final class LegacyMigrationBridge: NSObject, WKNavigationDelegate {
-    private var webView: WKWebView?
-    private var completion: ((Result<LegacySnapshot, Error>) -> Void)?
-
-    func export(completion: @escaping (Result<LegacySnapshot, Error>) -> Void) {
-        self.completion = completion
-        let config = WKWebViewConfiguration()
-        config.websiteDataStore = .default()
-        let view = WKWebView(frame: .zero, configuration: config)
-        view.navigationDelegate = self; webView = view
-        guard let url = URL(string: "https://monochrome.tf/") else { completion(.failure(ServiceError.invalidResponse)); return }
-        view.load(URLRequest(url: url, cachePolicy: .returnCacheDataElseLoad, timeoutInterval: 15))
-    }
-
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        let script = """
-        const out={favorites:[],history:[],playlists:[],settings:{}};
-        try{for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i),v=localStorage.getItem(k);try{out.settings[k]=JSON.parse(v)}catch{out.settings[k]=v}}}catch{}
-        try{const db=await new Promise((ok,no)=>{const r=indexedDB.open('MonochromeDB');r.onsuccess=()=>ok(r.result);r.onerror=()=>no(r.error)});
-        const read=(n)=>new Promise(ok=>{if(!db.objectStoreNames.contains(n))return ok([]);const r=db.transaction(n).objectStore(n).getAll();r.onsuccess=()=>ok(r.result||[]);r.onerror=()=>ok([])});
-        out.favorites=await read('favorites_tracks');out.history=await read('history_tracks');out.playlists=await read('user_playlists')}catch{}
-        return JSON.stringify(out)
-        """
-        Task { @MainActor [weak self, weak webView] in
-            guard let self, let webView else { return }
-            do {
-                let value = try await webView.callAsyncJavaScript(script, arguments: [:], in: nil, contentWorld: .page)
-                guard let string = value as? String, let data = string.data(using: .utf8),
-                      let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                    throw ServiceError.malformed("legacy store")
-                }
-                self.completion?(.success(LegacySnapshot(favorites: dict["favorites"] as? [[String: Any]] ?? [], history: dict["history"] as? [[String: Any]] ?? [], playlists: dict["playlists"] as? [[String: Any]] ?? [], settings: dict["settings"] as? [String: Any] ?? [:])))
-            } catch {
-                self.completion?(.failure(error))
-            }
-            self.webView = nil
-            self.completion = nil
-        }
-    }
-
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { completion?(.failure(error)); self.webView = nil; completion = nil }
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { completion?(.failure(error)); self.webView = nil; completion = nil }
+struct PlaylistAddToast: Equatable {
+    let track: Track
+    let playlistID: String
+    let playlistTitle: String
 }

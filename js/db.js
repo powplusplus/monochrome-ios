@@ -285,6 +285,8 @@ export class MusicDatabase {
                 enclosureUrl: item.enclosureUrl || null,
                 enclosureType: item.enclosureType || null,
                 enclosureLength: item.enclosureLength || null,
+                transcriptUrl: item.transcriptUrl || null,
+                transcripts: item.transcripts || null,
                 audioUrl: item.remoteUrl || item.audioUrl || null,
                 remoteUrl: item.remoteUrl || null,
                 audioQuality: item.audioQuality || null,

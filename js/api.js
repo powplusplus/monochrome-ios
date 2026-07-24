@@ -1823,13 +1823,14 @@ export class LosslessAPI {
         return result;
     }
 
-    // Qobuz via Lucida (https://lucida.to). Experimental, gated by lucidaQobuzSettings
-    // (off by default). Lucida rips a track to a FLAC file before serving it, so the
-    // heavy lifting — rip, download, edge-cache, and HTTP Range streaming — lives in
-    // the /qobuz-lucida/* Cloudflare Functions. Here we only resolve the track to a
+    // Qobuz via Lucida (https://lucida.to). Gated by lucidaQobuzSettings (on by
+    // default). Lucida rips a track to a FLAC file before serving it, so the heavy
+    // lifting — rip, download, edge-cache, and HTTP Range streaming — lives in the
+    // /qobuz-lucida/* Cloudflare Functions. Here we only resolve the track to a
     // stable, seekable stream URL and hand it back to the player like any other.
-    async getQobuzStreamUrl(isrc, quality = 'LOSSLESS') {
-        if (!isrc || !lucidaQobuzSettings.isEnabled()) return null;
+    // `query` is an ISRC or free-text "artist title" search (resolve.js accepts both).
+    async getQobuzStreamUrl(query, quality = 'LOSSLESS') {
+        if (!query || !lucidaQobuzSettings.isEnabled()) return null;
 
         // Source FLAC for lossless tiers; transcode to mp3 for the lossy tiers.
         const downscale = quality === 'HIGH' || quality === 'LOW' || quality === 'NORMAL' ? 'mp3' : 'original';
@@ -1838,7 +1839,7 @@ export class LosslessAPI {
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 15000);
             const res = await fetch(
-                `/qobuz-lucida/resolve?q=${encodeURIComponent(isrc)}&quality=${downscale}`,
+                `/qobuz-lucida/resolve?q=${encodeURIComponent(query)}&quality=${downscale}`,
                 { signal: controller.signal }
             );
             clearTimeout(timeoutId);
@@ -1850,7 +1851,7 @@ export class LosslessAPI {
             const url = json.url.startsWith('http') ? json.url : `${origin}${json.url}`;
             return { url, provider: 'qobuz', rgInfo: null };
         } catch (e) {
-            console.warn(`Lucida Qobuz resolve failed for ISRC ${isrc}:`, e);
+            console.warn(`Lucida Qobuz resolve failed for ${query}:`, e);
             return null;
         }
     }
@@ -2777,8 +2778,17 @@ export class LosslessAPI {
             });
         };
         const tryQobuz = async () => {
-            if (qobuzResult?.url || !track?.isrc) return;
-            qobuzResult = await this.getQobuzStreamUrl(track.isrc, quality);
+            if (qobuzResult?.url) return;
+            const isrc = track?.isrc?.trim?.() || track?.isrc;
+            if (isrc) {
+                qobuzResult = await this.getQobuzStreamUrl(isrc, quality);
+                if (qobuzResult?.url) return;
+            }
+            const artist = track?.artist?.name || track?.artists?.[0]?.name || '';
+            const title = track?.title || '';
+            if (artist && title) {
+                qobuzResult = await this.getQobuzStreamUrl(`${artist} ${title}`, quality);
+            }
         };
         const tryDeezer = async () => {
             if (deezerResult?.url || !track?.isrc) return;
@@ -2908,9 +2918,7 @@ export class LosslessAPI {
 
         notifyAudioSourceMissing();
         throw new Error(
-            track?.isrc
-                ? 'Could not resolve stream URL from Amazon Music, Qobuz, or Deezer'
-                : 'Could not resolve stream URL: Amazon Music failed and track has no ISRC for Qobuz/Deezer lookup'
+            'Could not resolve stream URL from Amazon Music, Qobuz, or Deezer'
         );
     }
 
@@ -3009,8 +3017,18 @@ export class LosslessAPI {
             if (amazonMusicSettings?.isEnabled()) {
                 amazonResult = await getAmazonForDownload();
             }
-            if (!amazonResult?.url && track?.isrc) {
-                qobuzResult = await this.getQobuzStreamUrl(track.isrc, cleanQuality);
+            if (!amazonResult?.url) {
+                const isrc = track?.isrc?.trim?.() || track?.isrc;
+                if (isrc) {
+                    qobuzResult = await this.getQobuzStreamUrl(isrc, cleanQuality);
+                }
+                if (!qobuzResult?.url) {
+                    const artist = track?.artist?.name || track?.artists?.[0]?.name || '';
+                    const title = track?.title || '';
+                    if (artist && title) {
+                        qobuzResult = await this.getQobuzStreamUrl(`${artist} ${title}`, cleanQuality);
+                    }
+                }
             }
             if (!amazonResult?.url && !qobuzResult?.url && track?.isrc) {
                 deezerResult = await this.getDeezerStreamUrl(track.isrc, cleanQuality);

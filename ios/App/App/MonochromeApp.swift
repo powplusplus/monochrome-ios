@@ -25,7 +25,6 @@ struct MonochromeApp: App {
                     if phase == .active { playback.warmForeground() }
                 }
                 .task {
-                    library.migrateLegacyIfNeeded()
                     // Both of these exist to move work off the first play: refresh
                     // the instance pool before the first search runs against it,
                     // and solve Amazon's Cloudflare gate while the user browses.

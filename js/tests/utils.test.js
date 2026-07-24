@@ -45,6 +45,36 @@ describe('utils.js', () => {
         });
     });
 
+    describe('isVideoEnclosure / isRealVideoTrack', () => {
+        test('detects video MIME and file extensions', () => {
+            expect(utils.isVideoEnclosure('video/mp4')).toBe(true);
+            expect(utils.isVideoEnclosure('application/mp4')).toBe(true);
+            expect(utils.isVideoEnclosure('audio/mpeg')).toBe(false);
+            expect(utils.isVideoEnclosure('', 'https://cdn.example/ep.mp4')).toBe(true);
+            expect(utils.isVideoEnclosure('', 'https://cdn.example/ep.mp4?token=1')).toBe(true);
+            expect(utils.isVideoEnclosure('', 'https://cdn.example/ep.mp3')).toBe(false);
+        });
+
+        test('treats video podcasts as real video tracks', () => {
+            expect(utils.isRealVideoTrack({ type: 'video' })).toBe(true);
+            expect(
+                utils.isRealVideoTrack({
+                    isPodcast: true,
+                    enclosureType: 'video/mp4',
+                    enclosureUrl: 'https://cdn.example/ep.mp4',
+                })
+            ).toBe(true);
+            expect(
+                utils.isRealVideoTrack({
+                    isPodcast: true,
+                    enclosureType: 'audio/mpeg',
+                    enclosureUrl: 'https://cdn.example/ep.mp3',
+                })
+            ).toBe(false);
+            expect(utils.isRealVideoTrack({ id: 'tidal_1' })).toBe(false);
+        });
+    });
+
     describe('sanitizeForFilename', () => {
         test('replaces invalid characters with underscores', () => {
             expect(utils.sanitizeForFilename('a/b:c*d?e"f<g>h|i')).toBe('a_b_c_d_e_f_g_h_i');
@@ -118,6 +148,27 @@ describe('utils.js', () => {
         test('returns null for unknown format', () => {
             const view = new DataView(new Uint8Array([0, 0, 0, 0]).buffer);
             expect(utils.detectAudioFormat(view)).toBeNull();
+        });
+    });
+
+    describe('enclosureFormatToken', () => {
+        test('detects mp3 from mime and url', () => {
+            expect(utils.enclosureFormatToken('audio/mpeg', 'https://x/ep.mp3')).toBe('MP3');
+            expect(utils.enclosureFormatToken('', 'https://x/ep.mp3?token=1')).toBe('MP3');
+        });
+
+        test('detects aac/m4a and flac', () => {
+            expect(utils.enclosureFormatToken('audio/mp4', 'https://x/ep.m4a')).toBe('AAC');
+            expect(utils.enclosureFormatToken('audio/flac', 'https://x/ep.flac')).toBe('FLAC');
+        });
+
+        test('detects video enclosures', () => {
+            expect(utils.enclosureFormatToken('video/mp4', 'https://x/ep.mp4')).toBe('VIDEO');
+            expect(utils.enclosureFormatToken('application/mp4', 'https://x/ep')).toBe('VIDEO');
+        });
+
+        test('returns null when unknown', () => {
+            expect(utils.enclosureFormatToken('', 'https://x/ep')).toBeNull();
         });
     });
 

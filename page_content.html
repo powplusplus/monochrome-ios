@@ -182,6 +182,8 @@
                 <li data-action="open-in-harmony" data-type-filter="album">Open in Harmony</li>
                 <li data-action="track-info" data-type-filter="track,video">Track info</li>
                 <li data-action="open-original-url" data-type-filter="track,video">Open original URL</li>
+                <li data-action="video-subtitles">Subtitles</li>
+                <li data-action="video-quality">Video quality</li>
                 <li data-action="download">Download</li>
                 <li class="separator"></li>
                 <li
@@ -606,6 +608,29 @@
                                             <path d="M21 13v1a4 4 0 0 1-4 4H3"></path>
                                         </svg>
                                     </button>
+                                    <button
+                                        id="fs-captions-btn"
+                                        class="fs-captions-btn"
+                                        title="Subtitles"
+                                        style="display: none"
+                                    >
+                                        <svg
+                                            xmlns="http://www.w3.org/2000/svg"
+                                            width="20"
+                                            height="20"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            stroke-linecap="round"
+                                            stroke-linejoin="round"
+                                            stroke-width="2"
+                                            class="lucide lucide-captions"
+                                            viewBox="0 0 24 24"
+                                        >
+                                            <rect width="18" height="14" x="3" y="5" rx="2" ry="2"></rect>
+                                            <path d="M7 15h4M15 15h2M7 11h2M13 11h4"></path>
+                                        </svg>
+                                    </button>
+                                    <div id="fs-captions-menu" class="fs-quality-menu" style="display: none"></div>
                                     <button
                                         id="fs-quality-btn"
                                         class="fs-quality-btn"

@@ -17,6 +17,8 @@ import {
     getShareUrl,
     createModal,
     isPodcastTrack,
+    isRealVideoTrack,
+    enclosureFormatToken,
     debounce,
 } from './utils.js';
 import { openLyricsPanel, renderLyricsInFullscreen, clearFullscreenLyricsSync } from './lyrics.js';
@@ -507,18 +509,20 @@ export class UIRenderer {
         if (contentBlockingSettings?.isHardcodedBlockedTrack(track)) return '';
         const isUnavailable = track.isUnavailable;
         const isBlocked = contentBlockingSettings?.shouldHideTrack(track);
-        const isVideo = track.type === 'video';
+        const isPodcast = isPodcastTrack(track);
+        const isVideo = isRealVideoTrack(track);
+        const isMusicVideo = track.type === 'video' && !isPodcast;
 
         let trackImageHTML = '';
         if (showCover) {
-            if (isVideo && this.currentPage === 'playlist') {
+            if (isMusicVideo && this.currentPage === 'playlist') {
                 const videoCoverUrl = this.api.getVideoCoverUrl(track.imageId);
                 if (videoCoverUrl) {
                     trackImageHTML = `<img crossorigin="anonymous" referrerpolicy="no-referrer" src="${videoCoverUrl}" alt="" class="track-item-cover" loading="lazy">`;
                 } else {
                     trackImageHTML = `<div class="track-item-cover video-icon-placeholder" style="display: flex; align-items: center; justify-content: center; background: var(--secondary);">${SVG_VIDEO(20, { style: 'opacity: 0.7;' })}</div>`;
                 }
-            } else if (isVideo && (this.currentPage === 'search' || this.currentPage === 'library')) {
+            } else if (isMusicVideo && (this.currentPage === 'search' || this.currentPage === 'library')) {
                 const videoCoverUrl = this.api.getVideoCoverUrl(track.imageId);
                 if (videoCoverUrl) {
                     trackImageHTML = `<img crossorigin="anonymous" referrerpolicy="no-referrer" src="${videoCoverUrl}" alt="" class="track-item-cover" loading="lazy">`;
@@ -546,7 +550,7 @@ export class UIRenderer {
         }
 
         const videoIcon = isVideo
-            ? `<span class="video-item-icon" title="Music Video" style="display: inline-flex; align-items: center; margin-right: 4px; color: var(--muted-foreground);">${SVG_VIDEO(14)}</span>`
+            ? `<span class="video-item-icon" title="${isPodcast ? 'Video Episode' : 'Music Video'}" style="display: inline-flex; align-items: center; margin-right: 4px; color: var(--muted-foreground);">${SVG_VIDEO(14)}</span>`
             : '';
         const trackNumberHTML = `<div class="track-number">${showCover ? trackImageHTML : displayIndex}</div>`;
         const checkboxHTML = `<div class="track-checkbox" data-action="toggle-select">${SVG_CHECKBOX(18)}</div>`;
@@ -561,7 +565,6 @@ export class UIRenderer {
 
         const yearDisplay = getTrackYearDisplay(track);
 
-        const isPodcast = isPodcastTrack(track);
         const podcastProgress = track.podcastProgress;
         const podcastProgressPct =
             podcastProgress && podcastProgress.duration > 0
@@ -1323,7 +1326,7 @@ export class UIRenderer {
         const artist = document.getElementById('fullscreen-track-artist');
         const nextTrackEl = document.getElementById('fullscreen-next-track');
 
-        const isRealVideo = track.type === 'video';
+        const isRealVideo = isRealVideoTrack(track);
         const visualizerContainer = document.getElementById('visualizer-container');
         overlay.classList.toggle('is-video-mode', isRealVideo);
 
@@ -1338,7 +1341,7 @@ export class UIRenderer {
             }
 
             const fsLikeBtn = document.getElementById('fs-like-btn');
-            if (fsLikeBtn) {
+            if (fsLikeBtn && !isPodcastTrack(track)) {
                 await this.updateLikeState(fsLikeBtn.parentElement, 'video', track.id);
             }
 
@@ -1371,6 +1374,10 @@ export class UIRenderer {
             const qualityMenu = document.getElementById('fs-quality-menu');
             if (qualityBtn) qualityBtn.style.display = 'none';
             if (qualityMenu) qualityMenu.style.display = 'none';
+            const captionsBtn = document.getElementById('fs-captions-btn');
+            const captionsMenu = document.getElementById('fs-captions-menu');
+            if (captionsBtn) captionsBtn.style.display = 'none';
+            if (captionsMenu) captionsMenu.style.display = 'none';
 
             const videoCoverUrl = track.videoUrl || track.videoCoverUrl || track.album?.videoCoverUrl || null;
             const coverUrl = videoCoverUrl || this.api.getCoverUrl(track.album?.cover, '1280');
@@ -1672,7 +1679,7 @@ export class UIRenderer {
             this.fullscreenMainContentOverflow = null;
         }
 
-        if (this.player?.currentTrack?.type === 'video') {
+        if (isRealVideoTrack(this.player?.currentTrack)) {
             const coverContainer = document.querySelector('.now-playing-bar .track-info');
             const videoPlayer = document.getElementById('video-player');
             const imgCover = coverContainer?.querySelector('.cover:not(#audio-player):not(#video-player)');
@@ -1800,7 +1807,7 @@ export class UIRenderer {
         const overlay = document.getElementById('fullscreen-cover-overlay');
         const visualizerBtn = document.getElementById('fs-visualizer-btn');
         const toggleBtn = document.getElementById('toggle-ui-btn');
-        const isVideoTrack = this.player?.currentTrack?.type === 'video';
+        const isVideoTrack = isRealVideoTrack(this.player?.currentTrack);
         const enabled = !isVideoTrack && visualizerSettings.isEnabled() && !this.fullscreenVisualizerSuppressed;
 
         if (!overlay) return;
@@ -1876,7 +1883,7 @@ export class UIRenderer {
         const toggleUI = async (e) => {
             if (e) e.stopPropagation();
             if (!overlay.classList.contains('visualizer-active')) {
-                const isVideoTrack = this.player?.currentTrack?.type === 'video';
+                const isVideoTrack = isRealVideoTrack(this.player?.currentTrack);
                 if (isVideoTrack) {
                     overlay.classList.remove('ui-hidden');
                     isUIHidden = false;
@@ -7491,6 +7498,10 @@ export class UIRenderer {
             enclosureUrl: episode.enclosureUrl,
             enclosureType: episode.enclosureType,
             enclosureLength: episode.enclosureLength,
+            audioQuality:
+                enclosureFormatToken(episode.enclosureType, episode.enclosureUrl) || 'PODCAST',
+            transcriptUrl: episode.transcriptUrl || '',
+            transcripts: episode.transcripts || [],
             episodeNumber: episode.episode,
             episodeType: episode.episodeType,
             season: episode.season,

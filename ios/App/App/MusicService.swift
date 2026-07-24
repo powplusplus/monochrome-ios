@@ -113,16 +113,25 @@ final class MusicService {
         return candidates.first
     }
 
-    func resolveStream(for track: Track, quality: PlaybackQuality = .stored) async throws -> StreamResponse {
+    func resolveStream(for track: Track, quality: PlaybackQuality = .stored, skipping skipped: Set<Provider> = []) async throws -> StreamResponse {
         // Podcasts play the enclosure URL directly — never run music providers.
+        // Quality token comes from the enclosure MIME/extension (MP3/AAC/…), not
+        // the user's streaming preference — badge must match what actually plays.
         if track.isPodcast, let url = track.streamURL {
-            return StreamResponse(url: url, provider: .podcast, quality: "PODCAST", replayGain: nil, peak: nil,
+            let token = track.audioQuality
+                ?? PlaybackQuality.enclosureToken(mimeType: track.enclosureType, url: url)
+            return StreamResponse(url: url, provider: .podcast, quality: token, replayGain: nil, peak: nil,
                                   mediaDuration: track.duration > 0 ? track.duration : nil)
         }
         // Catalog payloads often include a webpage `url` (e.g. tidal.com/track/…) that
         // was historically mapped into streamURL. Only short-circuit for real media.
+        // Stamp format from the URL/catalog — never the requested preference tier.
         if let url = track.streamURL, Self.isDirectMediaURL(url) {
-            return StreamResponse(url: url, provider: track.provider, quality: quality.rawValue, replayGain: nil, peak: nil)
+            let token = track.audioQuality
+                ?? PlaybackQuality.mediaFormatToken(mimeType: track.enclosureType, url: url)
+                ?? track.catalogQuality?.rawValue
+                ?? "UNKNOWN"
+            return StreamResponse(url: url, provider: track.provider, quality: token, replayGain: nil, peak: nil)
         }
 
         // Match web Monochrome `getStreamUrl` (js/api.js):
@@ -136,43 +145,58 @@ final class MusicService {
         // currently answering `Upstream API error`, that was a flat multi-second
         // stall in front of the one provider that still works. Fetch only what
         // the leg about to run actually needs.
+        //
+        // `skipping` lets PlaybackEngine drop a provider that already handed us a
+        // URL AVPlayer rejected (signed CDN expire, CENC decode fail) and continue
+        // down the chain — without that, Amazon "success" permanently blocked Lucida.
         var enriched = track.duration > 0 ? track : await enrichTrackMetadata(track)
         var amazonError: Error?
-        do {
-            return try await resolveAmazonStream(for: enriched, quality: quality)
-        } catch {
-            amazonError = error
-            // Fall through to Lucida, then Deezer, when Amazon cannot resolve.
+        if !skipped.contains(.amazon) {
+            do {
+                return try await resolveAmazonStream(for: enriched, quality: quality)
+            } catch {
+                amazonError = error
+                // Fall through to Lucida, then Deezer, when Amazon cannot resolve.
+            }
         }
-        // Lucida + Deezer key off the ISRC, so pay for the lookup here instead.
+        // Lucida + Deezer key off the ISRC (or artist/title for Lucida), so pay for
+        // the lookup here instead.
         if enriched.isrc?.isEmpty != false {
             enriched = await enrichTrackMetadata(enriched)
         }
         var lucidaError: Error?
-        do {
-            return try await resolveLucidaStream(for: enriched, quality: quality)
-        } catch {
-            lucidaError = error
+        if !skipped.contains(.qobuz) {
+            do {
+                return try await resolveLucidaStream(for: enriched, quality: quality)
+            } catch {
+                lucidaError = error
+            }
         }
-        do {
-            return try await resolveDeezerStream(for: enriched, quality: quality)
-        } catch {
-            let amazonDetail = (amazonError as? LocalizedError)?.errorDescription
-                ?? amazonError?.localizedDescription
-                ?? "Amazon Music unavailable"
-            let lucidaDetail = (lucidaError as? LocalizedError)?.errorDescription
-                ?? lucidaError?.localizedDescription
-                ?? "Lucida unavailable"
-            let deezerDetail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            if enriched.isrc?.isEmpty == false {
+        if !skipped.contains(.deezer) {
+            do {
+                return try await resolveDeezerStream(for: enriched, quality: quality)
+            } catch {
+                let amazonDetail = (amazonError as? LocalizedError)?.errorDescription
+                    ?? amazonError?.localizedDescription
+                    ?? (skipped.contains(.amazon) ? "Amazon skipped" : "Amazon Music unavailable")
+                let lucidaDetail = (lucidaError as? LocalizedError)?.errorDescription
+                    ?? lucidaError?.localizedDescription
+                    ?? (skipped.contains(.qobuz) ? "Lucida skipped" : "Lucida unavailable")
+                let deezerDetail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 throw ServiceError.unavailable(
                     "Could not resolve stream URL from Amazon Music, Lucida, or Deezer. Amazon: \(amazonDetail) Lucida: \(lucidaDetail) Deezer: \(deezerDetail)"
                 )
             }
-            throw ServiceError.unavailable(
-                "Could not resolve stream URL: \(amazonDetail). Track has no ISRC for Lucida/Deezer lookup."
-            )
         }
+        let amazonDetail = (amazonError as? LocalizedError)?.errorDescription
+            ?? amazonError?.localizedDescription
+            ?? (skipped.contains(.amazon) ? "Amazon skipped" : "Amazon Music unavailable")
+        let lucidaDetail = (lucidaError as? LocalizedError)?.errorDescription
+            ?? lucidaError?.localizedDescription
+            ?? (skipped.contains(.qobuz) ? "Lucida skipped" : "Lucida unavailable")
+        throw ServiceError.unavailable(
+            "Could not resolve stream URL. Amazon: \(amazonDetail) Lucida: \(lucidaDetail)"
+        )
     }
 
     /// Pull ISRC / duration when search cards omit them. The ISRC is what the
@@ -377,13 +401,22 @@ final class MusicService {
 
     /// Qobuz-via-Lucida (web `/qobuz-lucida/*`). Resolve is cheap; first play of an
     /// uncached track pays the rip cost inside `/play`. Used only when Amazon
-    /// cannot resolve a stream URL.
+    /// cannot resolve a stream URL. ISRC preferred; falls back to "artist title"
+    /// search when the catalog card omitted the ISRC (common on search results).
     private func resolveLucidaStream(for track: Track, quality: PlaybackQuality) async throws -> StreamResponse {
         guard PlaybackSourceSettings.lucidaEnabled else {
             throw ServiceError.unavailable("Lucida fallback disabled")
         }
-        guard let isrc = track.isrc?.trimmingCharacters(in: .whitespacesAndNewlines), !isrc.isEmpty else {
-            throw ServiceError.unavailable("Lucida lookup needs ISRC")
+        let isrc = track.isrc?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let title = track.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let artist = track.artist.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let query: String
+        if !isrc.isEmpty {
+            query = isrc
+        } else if !title.isEmpty, !artist.isEmpty {
+            query = "\(artist) \(title)"
+        } else {
+            throw ServiceError.unavailable("Lucida lookup needs ISRC or title and artist")
         }
         let base = PlaybackSourceSettings.lucidaBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let downscale: String = {
@@ -394,7 +427,7 @@ final class MusicService {
         }()
         var components = URLComponents(string: base + "/qobuz-lucida/resolve")
         components?.queryItems = [
-            URLQueryItem(name: "q", value: isrc),
+            URLQueryItem(name: "q", value: query),
             URLQueryItem(name: "quality", value: downscale),
         ]
         guard let url = components?.url else {

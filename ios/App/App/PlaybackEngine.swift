@@ -64,6 +64,10 @@ final class PlaybackEngine: ObservableObject {
     /// the rest streams in behind the playhead, rather than AVPlayer greedily
     /// pulling the whole file up front once bandwidth allows.
     private let forwardBufferSeconds: TimeInterval = 30
+    /// Providers whose stream URL already failed AVPlayer for the current track.
+    /// Cleared on a successful readyToPlay / new user-initiated play. Lets Amazon
+    /// "success" that AVPlayer rejects fall through to Lucida automatically.
+    private var skippedProviders: Set<Provider> = []
     private var lastNowPlayingElapsed: Double = -1
     private var pendingPodcastSeek: Double?
     private var lastPodcastProgressSave: Date = .distantPast
@@ -134,6 +138,7 @@ final class PlaybackEngine: ObservableObject {
 
     func play(_ track: Track, in context: [Track]? = nil) {
         savePodcastProgressIfNeeded(force: true)
+        skippedProviders = []
         let tracks = context ?? [track]
         queue = tracks
         currentIndex = tracks.firstIndex(where: { $0.id == track.id }) ?? 0
@@ -196,6 +201,7 @@ final class PlaybackEngine: ObservableObject {
 
     func next() {
         savePodcastProgressIfNeeded(force: true)
+        skippedProviders = []
         guard !queue.isEmpty else { return }
         if repeatMode == .one { seek(to: 0); resume(); return }
         if shuffleEnabled, queue.count > 1 {
@@ -217,6 +223,7 @@ final class PlaybackEngine: ObservableObject {
             return
         }
         savePodcastProgressIfNeeded(force: true)
+        skippedProviders = []
         guard !queue.isEmpty else { return }
         if let index = currentIndex, index > 0 { currentIndex = index - 1 }
         else if repeatMode == .all { currentIndex = queue.count - 1 }
@@ -289,28 +296,47 @@ final class PlaybackEngine: ObservableObject {
         lastNowPlayingElapsed = -1
         updateNowPlaying()
         let warm = usePrefetch ? takePrefetch(for: track) : nil
+        let skipProviders = skippedProviders
         loadTask = Task {
             do {
                 let stream: StreamResponse
                 let asset: AVURLAsset
                 var wasPrefetched = false
-                if let local = DownloadManager.shared.localPlayURL(for: track) {
+                var fromLocalFile = false
+                if skipProviders.isEmpty, let local = DownloadManager.shared.localPlayURL(for: track) {
+                    let offline = DownloadManager.shared.offlineEntry(for: track)
+                    // Prefer recorded offline / catalog / enclosure format — never the
+                    // download-quality preference (that lied "Lossless" for MP3 podcasts).
+                    let honestQuality = offline?.offlineQuality
+                        ?? track.offlineQuality
+                        ?? track.audioQuality
+                        ?? (track.isPodcast
+                            ? PlaybackQuality.enclosureToken(mimeType: track.enclosureType, url: track.streamURL ?? local)
+                            : nil)
+                        ?? track.catalogQuality?.rawValue
+                        ?? "UNKNOWN"
                     stream = StreamResponse(
                         url: local,
-                        provider: track.provider,
-                        quality: track.audioQuality ?? PlaybackQuality.stored.rawValue,
+                        provider: offline?.offlineProvider ?? track.offlineProvider ?? .tidal,
+                        quality: honestQuality,
                         replayGain: nil,
                         peak: nil,
                         isPreview: false,
-                        mediaDuration: track.duration > 0 ? track.duration : nil
+                        mediaDuration: track.duration > 0 ? track.duration : nil,
+                        qualityDetail: offline?.offlineQualityDetail ?? track.offlineQualityDetail
                     )
                     asset = AVURLAsset(url: local)
-                } else if let warm, let prepared = try? await warm.value {
+                    fromLocalFile = true
+                } else if skipProviders.isEmpty, let warm, let prepared = try? await warm.value {
                     stream = prepared.stream
                     asset = prepared.asset
                     wasPrefetched = true
                 } else {
-                    stream = try await musicService.resolveStream(for: track, quality: PlaybackQuality.stored)
+                    stream = try await musicService.resolveStream(
+                        for: track,
+                        quality: PlaybackQuality.stored,
+                        skipping: skipProviders
+                    )
                     asset = AVURLAsset(url: stream.url)
                 }
                 guard !Task.isCancelled else { return }
@@ -319,11 +345,11 @@ final class PlaybackEngine: ObservableObject {
                 currentStreamProvider = stream.provider
                 let item = AVPlayerItem(asset: asset)
                 item.audioTimePitchAlgorithm = .timeDomain
-                // Bound the look-ahead so the track streams as a sliding window of
-                // chunks. 0 (the default) lets AVPlayer fetch the entire file once
-                // the link is fast enough — the "downloads the whole song first" case.
-                item.preferredForwardBufferDuration = forwardBufferSeconds
+                // Local files are already on disk — a 30s look-ahead made Downloaded
+                // tracks feel like a network start. Remote keeps the sliding chunk cap.
+                item.preferredForwardBufferDuration = fromLocalFile ? 0 : forwardBufferSeconds
                 pendingAutoplay = autoplay
+                let failedProvider = stream.provider
                 itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
                     Task { @MainActor in
                         guard let self, self.player.currentItem === item else { return }
@@ -331,6 +357,7 @@ final class PlaybackEngine: ObservableObject {
                         case .readyToPlay:
                             self.isLoading = false
                             self.loadedTrackID = track.id
+                            self.skippedProviders = []
                             self.attachMeter(to: item)
                             self.applyPendingPodcastSeekIfNeeded()
                             if self.pendingAutoplay {
@@ -346,6 +373,20 @@ final class PlaybackEngine: ObservableObject {
                                 self.loadCurrent(autoplay: autoplay, usePrefetch: false)
                                 return
                             }
+                            // Amazon/Deezer handed a URL AVPlayer rejected — keep walking
+                            // Amazon → Lucida → Deezer so Lucida actually auto-falls back.
+                            if !fromLocalFile,
+                               (failedProvider == .amazon || failedProvider == .deezer),
+                               self.skippedProviders.count < 3 {
+                                var next = self.skippedProviders
+                                next.insert(failedProvider)
+                                if next != self.skippedProviders {
+                                    self.skippedProviders = next
+                                    self.loadCurrent(autoplay: autoplay, usePrefetch: false)
+                                    return
+                                }
+                            }
+                            self.skippedProviders = []
                             self.isLoading = false
                             self.loadedTrackID = track.id
                             self.isPlaying = false
@@ -368,6 +409,7 @@ final class PlaybackEngine: ObservableObject {
                 if item.status == .readyToPlay {
                     isLoading = false
                     loadedTrackID = track.id
+                    skippedProviders = []
                     attachMeter(to: item)
                     applyPendingPodcastSeekIfNeeded()
                     if pendingAutoplay {
@@ -397,6 +439,7 @@ final class PlaybackEngine: ObservableObject {
                 // full re-resolve here just stacked another cold Amazon window in
                 // front of the same failure — the "infinite loading" tail. Surface
                 // the error now instead.
+                skippedProviders = []
                 loadedTrackID = track.id
                 isLoading = false; isPlaying = false; errorMessage = error.localizedDescription
             }
@@ -846,24 +889,59 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     }
 
     func fileURL(for track: Track) -> URL {
+        playableFileURL(forID: track.id) ?? legacyAudioURL(forID: track.id)
+    }
+
+    /// Prefer a sniff-renamed playable file (`.flac`/`.m4a`/`.mp3`) over the legacy
+    /// `.audio` stub — AVPlayer probes unknown extensions slowly or fails outright.
+    private func playableFileURL(forID id: String) -> URL? {
+        let base = downloadsDirectory.appendingPathComponent(safeFileName(for: id))
+        for ext in ["flac", "m4a", "mp3", "mp4", "wav", "audio"] {
+            let url = base.appendingPathExtension(ext)
+            if FileManager.default.fileExists(atPath: url.path) { return url }
+        }
+        return nil
+    }
+
+    private func legacyAudioURL(forID id: String) -> URL {
         downloadsDirectory
-            .appendingPathComponent(safeFileName(for: track.id))
+            .appendingPathComponent(safeFileName(for: id))
             .appendingPathExtension("audio")
     }
 
     func isDownloaded(_ track: Track) -> Bool {
-        FileManager.default.fileExists(atPath: fileURL(for: track).path)
+        localPlayURL(for: track) != nil
+    }
+
+    /// Catalog row for an offline track (provider/quality written at download time).
+    func offlineEntry(for track: Track) -> Track? {
+        if let match = offlineTracks.first(where: { $0.id == track.id }) { return match }
+        return offlineTracks.first(where: { $0.playbackID == track.playbackID })
     }
 
     /// Playable local file when present — prefer over network resolve.
     func localPlayURL(for track: Track) -> URL? {
-        let url = fileURL(for: track)
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        return url
+        if let url = playableFileURL(forID: track.id) { return url }
+        if let match = offlineEntry(for: track), match.id != track.id,
+           let url = playableFileURL(forID: match.id) {
+            return url
+        }
+        // Bare playbackID filename (older downloads without `tidal:` prefix).
+        if track.id != track.playbackID, let url = playableFileURL(forID: track.playbackID) {
+            return url
+        }
+        return nil
     }
 
     func isDownloading(_ track: Track) -> Bool {
         progress[track.id] != nil || workTasks[track.id] != nil
+    }
+
+    /// True while resolving stream URL before bytes flow (ring should spin, not fill).
+    func isPreparing(_ track: Track) -> Bool {
+        guard workTasks[track.id] != nil else { return false }
+        guard let value = progress[track.id] else { return true }
+        return value <= 0
     }
 
     /// Aggregate 0...1 for a playlist/mix collection.
@@ -893,7 +971,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         if workTasks[track.id] != nil { return }
 
         activeTracks[track.id] = track
-        progress[track.id] = 0
+        setProgress(track.id, 0)
         let work = Task { [weak self] in
             guard let self else { return }
             defer {
@@ -902,15 +980,22 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
             }
             do {
                 try Task.checkCancellation()
-                let stream = try await MusicService.shared.resolveStream(for: track, quality: PlaybackQuality.stored)
+                let stream = try await MusicService.shared.resolveStream(
+                    for: track,
+                    quality: PlaybackQuality.downloadStored
+                )
                 try Task.checkCancellation()
                 try await self.persist(stream.url, for: track)
-                self.remember(track)
-                self.progress[track.id] = nil
+                var saved = track
+                saved.offlineProvider = stream.provider
+                saved.offlineQuality = stream.quality
+                saved.offlineQualityDetail = stream.qualityDetail
+                self.remember(saved)
+                self.setProgress(track.id, nil)
             } catch is CancellationError {
-                self.progress[track.id] = nil
+                self.setProgress(track.id, nil)
             } catch {
-                self.progress[track.id] = nil
+                self.setProgress(track.id, nil)
             }
         }
         workTasks[track.id] = work
@@ -943,7 +1028,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
                 finisher.resume(throwing: CancellationError())
             }
         }
-        progress[track.id] = nil
+        setProgress(track.id, nil)
     }
 
     func cancelAll(in tracks: [Track]) {
@@ -953,9 +1038,13 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
 
     func removeDownload(_ track: Track) {
         cancel(track)
-        let url = fileURL(for: track)
-        try? FileManager.default.removeItem(at: url)
-        offlineTracks.removeAll { $0.id == track.id }
+        for ext in ["flac", "m4a", "mp3", "mp4", "wav", "audio"] {
+            let url = downloadsDirectory
+                .appendingPathComponent(safeFileName(for: track.id))
+                .appendingPathExtension(ext)
+            try? FileManager.default.removeItem(at: url)
+        }
+        offlineTracks.removeAll { $0.id == track.id || $0.playbackID == track.playbackID }
         persistCatalog()
     }
 
@@ -970,26 +1059,68 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
 
     private func persist(_ source: URL, for track: Track) async throws {
         try FileManager.default.createDirectory(at: downloadsDirectory, withIntermediateDirectories: true)
-        let target = fileURL(for: track)
-        if FileManager.default.fileExists(atPath: target.path) {
-            try FileManager.default.removeItem(at: target)
+        // Drop any prior extension variants for this track id.
+        for ext in ["flac", "m4a", "mp3", "mp4", "wav", "audio"] {
+            let stale = downloadsDirectory
+                .appendingPathComponent(safeFileName(for: track.id))
+                .appendingPathExtension(ext)
+            if FileManager.default.fileExists(atPath: stale.path) {
+                try? FileManager.default.removeItem(at: stale)
+            }
         }
 
+        let staged: URL
         if source.isFileURL {
-            // Amazon CENC path already decrypted to a local clear file during resolve.
-            progress[track.id] = 0.95
-            try FileManager.default.copyItem(at: source, to: target)
-            progress[track.id] = 1
-            return
+            // Local clear file (e.g. Amazon CENC) — animate ring instead of jumping to done.
+            setProgress(track.id, 0.15)
+            try await Task.yield()
+            staged = source
+        } else {
+            staged = try await downloadRemote(source, track: track)
+            try Task.checkCancellation()
         }
 
-        let staged = try await downloadRemote(source, track: track)
-        try Task.checkCancellation()
+        let sniffed = Self.sniffAudioExtension(at: staged)
+        let fallbackExt = source.pathExtension.lowercased()
+        let ext = sniffed
+            ?? (["flac", "m4a", "mp3", "mp4", "wav"].contains(fallbackExt) ? fallbackExt : nil)
+            ?? "audio"
+        let target = downloadsDirectory
+            .appendingPathComponent(safeFileName(for: track.id))
+            .appendingPathExtension(ext)
         if FileManager.default.fileExists(atPath: target.path) {
             try FileManager.default.removeItem(at: target)
         }
-        try FileManager.default.moveItem(at: staged, to: target)
-        progress[track.id] = 1
+        if source.isFileURL {
+            try FileManager.default.copyItem(at: staged, to: target)
+            for step in [0.45, 0.7, 0.9, 1.0] {
+                try Task.checkCancellation()
+                setProgress(track.id, step)
+                try await Task.sleep(nanoseconds: 45_000_000)
+            }
+        } else {
+            try FileManager.default.moveItem(at: staged, to: target)
+            setProgress(track.id, 1)
+            try await Task.sleep(nanoseconds: 80_000_000)
+        }
+    }
+
+    /// Map file magic bytes → AVPlayer-friendly extension. `.audio` stubs force a
+    /// slow/uncertain probe that made offline play feel like a network start.
+    private static func sniffAudioExtension(at url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        let data = handle.readData(ofLength: 12)
+        guard data.count >= 4 else { return nil }
+        if data.starts(with: [0x66, 0x4C, 0x61, 0x43]) { return "flac" } // fLaC
+        if data.starts(with: [0x49, 0x44, 0x33]) { return "mp3" } // ID3
+        if data.count >= 2, data[0] == 0xFF, (data[1] & 0xE0) == 0xE0 { return "mp3" }
+        if data.count >= 8 {
+            let brand = data.subdata(in: 4..<8)
+            if brand == Data("ftyp".utf8) { return "m4a" }
+        }
+        if data.starts(with: [0x52, 0x49, 0x46, 0x46]) { return "wav" } // RIFF
+        return nil
     }
 
     private func downloadRemote(_ url: URL, track: Track) async throws -> URL {
@@ -997,9 +1128,20 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
             let task = session.downloadTask(with: url)
             trackByTaskID[task.taskIdentifier] = track
             finishers[task.taskIdentifier] = cont
-            progress[track.id] = max(progress[track.id] ?? 0, 0.01)
+            setProgress(track.id, max(progress[track.id] ?? 0, 0.01))
             task.resume()
         }
+    }
+
+    /// Reassign dict so `@Published` always notifies (in-place subscript may not).
+    private func setProgress(_ trackID: String, _ value: Double?) {
+        var next = progress
+        if let value {
+            next[trackID] = value
+        } else {
+            next.removeValue(forKey: trackID)
+        }
+        progress = next
     }
 
     private func remember(_ track: Track) {
@@ -1021,8 +1163,15 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     }
 
     private func pruneMissingFiles() {
-        offlineTracks.removeAll { !FileManager.default.fileExists(atPath: fileURL(for: $0).path) }
+        offlineTracks.removeAll { localPlayURL(for: $0) == nil }
         persistCatalog()
+        // Migrate legacy `.audio` files to sniffed extensions so next play is instant.
+        for track in offlineTracks {
+            guard let url = playableFileURL(forID: track.id), url.pathExtension == "audio" else { continue }
+            guard let ext = Self.sniffAudioExtension(at: url), ext != "audio" else { continue }
+            let renamed = url.deletingPathExtension().appendingPathExtension(ext)
+            try? FileManager.default.moveItem(at: url, to: renamed)
+        }
     }
 
     // MARK: - URLSessionDownloadDelegate
@@ -1035,6 +1184,15 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         didFinishDownloadingTo location: URL
     ) {
         let taskID = downloadTask.taskIdentifier
+        if let http = downloadTask.response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            Task { @MainActor in
+                self.trackByTaskID[taskID] = nil
+                if let cont = self.finishers.removeValue(forKey: taskID) {
+                    cont.resume(throwing: URLError(.badServerResponse))
+                }
+            }
+            return
+        }
         let staging = FileManager.default.temporaryDirectory
             .appendingPathComponent("monochrome-dl-\(taskID)-\(UUID().uuidString)")
             .appendingPathExtension("audio")
@@ -1076,7 +1234,11 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         Task { @MainActor in
             guard let track = self.trackByTaskID[taskID] else { return }
             if let fraction {
-                self.progress[track.id] = max(0.01, min(0.99, fraction))
+                self.setProgress(track.id, max(0.01, min(0.99, fraction)))
+            } else {
+                // Unknown length — keep a soft pulse so the ring visibly advances.
+                let current = self.progress[track.id] ?? 0.01
+                self.setProgress(track.id, min(0.9, current + 0.02))
             }
         }
     }

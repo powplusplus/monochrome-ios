@@ -111,6 +111,8 @@ actor PodcastsService {
             if let n = dict["explicit"] as? NSNumber { return n.intValue != 0 }
             return false
         }()
+        let enclosureType = string(dict, ["enclosureType"])
+        let qualityToken = PlaybackQuality.enclosureToken(mimeType: enclosureType, url: url)
         return Track(
             id: "podcast_\(rawID)",
             title: title,
@@ -118,11 +120,12 @@ actor PodcastsService {
             album: AlbumSummary(id: string(dict, ["feedId"]) ?? "", title: feedTitle, cover: cover),
             duration: duration,
             explicit: explicit,
-            audioQuality: nil,
+            audioQuality: qualityToken,
             mediaTags: nil,
             isrc: nil,
             provider: .podcast,
-            streamURL: url
+            streamURL: url,
+            enclosureType: enclosureType
         )
     }
 
