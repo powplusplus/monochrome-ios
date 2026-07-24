@@ -2765,15 +2765,9 @@ export class LosslessAPI {
         let qobuzResult = null;
         let deezerResult = null;
 
-        // When the experimental Lucida-Qobuz provider is on, always try Qobuz first so
-        // it actually wins; otherwise 50/50 roll between Amazon and Qobuz when Amazon
-        // Music is enabled.
-        const preferAmazonFirst = lucidaQobuzSettings.isEnabled()
-            ? false
-            : amazonMusicSettings?.isEnabled()
-              ? Math.random() >= 0.5
-              : false;
-
+        // Amazon Music first when enabled. Lucida-Qobuz is a fallback only — first
+        // Lucida play of an uncached track can take 10–35s, so it must not win the
+        // race over a working Amazon stream. Order: Amazon → Lucida → Deezer.
         const tryAmazon = async () => {
             if (amazonResult?.url) return;
             amazonResult = await this.getAmazonMusicStreamUrl(id, actualQuality, {
@@ -2791,15 +2785,11 @@ export class LosslessAPI {
             deezerResult = await this.getDeezerStreamUrl(track.isrc, quality);
         };
 
-        if (preferAmazonFirst) {
+        if (amazonMusicSettings?.isEnabled()) {
             await tryAmazon();
-            if (!amazonResult?.url) await tryQobuz();
-            if (!amazonResult?.url && !qobuzResult?.url) await tryDeezer();
-        } else {
-            await tryQobuz();
-            if (!qobuzResult?.url) await tryAmazon();
-            if (!qobuzResult?.url && !amazonResult?.url) await tryDeezer();
         }
+        if (!amazonResult?.url) await tryQobuz();
+        if (!amazonResult?.url && !qobuzResult?.url) await tryDeezer();
 
         if (amazonResult?.url) {
             let streamUrl = amazonResult.url;
@@ -3015,23 +3005,24 @@ export class LosslessAPI {
                 }
             };
 
-            if (track?.isrc) {
+            // Same priority as getStreamUrl: Amazon → Lucida → Deezer.
+            if (amazonMusicSettings?.isEnabled()) {
+                amazonResult = await getAmazonForDownload();
+            }
+            if (!amazonResult?.url && track?.isrc) {
                 qobuzResult = await this.getQobuzStreamUrl(track.isrc, cleanQuality);
             }
-            if (!qobuzResult?.url) {
-                amazonResult = await getAmazonForDownload();
-                if (!amazonResult?.url && track?.isrc) {
-                    deezerResult = await this.getDeezerStreamUrl(track.isrc, cleanQuality);
-                }
+            if (!amazonResult?.url && !qobuzResult?.url && track?.isrc) {
+                deezerResult = await this.getDeezerStreamUrl(track.isrc, cleanQuality);
             }
 
-            const externalResult = qobuzResult?.url ? qobuzResult : amazonResult?.url ? amazonResult : deezerResult;
+            const externalResult = amazonResult?.url ? amazonResult : qobuzResult?.url ? qobuzResult : deezerResult;
             if (externalResult?.url) {
                 externalStreamUrl = externalResult.url;
                 externalRgInfo = externalResult.rgInfo;
                 externalStreamType = externalResult.playbackType || null;
                 externalProvider =
-                    externalResult.provider || (qobuzResult?.url ? 'qobuz' : amazonResult?.url ? 'amazon' : 'deezer');
+                    externalResult.provider || (amazonResult?.url ? 'amazon' : qobuzResult?.url ? 'qobuz' : 'deezer');
                 externalDecryptionKey = externalResult.decryptionKey || null;
                 externalKeyId = externalResult.keyId || null;
                 externalMimeType = externalResult.mimeType || null;

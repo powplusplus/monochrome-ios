@@ -16,6 +16,7 @@ import {
     decodeHtml,
     getShareUrl,
     createModal,
+    isPodcastTrack,
 } from './utils.js';
 import { openLyricsPanel, renderLyricsInFullscreen, clearFullscreenLyricsSync } from './lyrics.js';
 import {
@@ -407,7 +408,9 @@ export class UIRenderer {
         if (track) {
             const isLocal = track.isLocal;
             const isTracker = track.isTracker || (track.id && String(track.id).startsWith('tracker-'));
-            const shouldHideLikes = isLocal || isTracker;
+            const isPodcast = isPodcastTrack(track);
+            const shouldHideLikes = isLocal || isTracker || isPodcast;
+            const shouldHidePlaylist = isLocal || isPodcast;
 
             if (likeBtn) {
                 if (shouldHideLikes) {
@@ -419,7 +422,7 @@ export class UIRenderer {
             }
 
             if (addPlaylistBtn) {
-                if (isLocal) {
+                if (shouldHidePlaylist) {
                     addPlaylistBtn.style.setProperty('display', 'none', 'important');
                 } else {
                     addPlaylistBtn.style.removeProperty('display');
@@ -427,7 +430,7 @@ export class UIRenderer {
                 }
             }
             if (mobileAddPlaylistBtn) {
-                if (isLocal) {
+                if (shouldHidePlaylist) {
                     mobileAddPlaylistBtn.style.setProperty('display', 'none', 'important');
                 } else {
                     mobileAddPlaylistBtn.style.removeProperty('display');
@@ -435,7 +438,7 @@ export class UIRenderer {
                 }
             }
             if (lyricsBtn) {
-                if (isLocal) lyricsBtn.style.display = 'none';
+                if (isLocal || isPodcast) lyricsBtn.style.display = 'none';
                 else lyricsBtn.style.removeProperty('display');
             }
 
@@ -448,7 +451,7 @@ export class UIRenderer {
                 }
             }
             if (fsAddPlaylistBtn) {
-                if (shouldHideLikes) fsAddPlaylistBtn.style.display = 'none';
+                if (shouldHideLikes || isPodcast) fsAddPlaylistBtn.style.display = 'none';
                 else fsAddPlaylistBtn.style.display = 'flex';
             }
         } else {
@@ -557,6 +560,20 @@ export class UIRenderer {
 
         const yearDisplay = getTrackYearDisplay(track);
 
+        const isPodcast = isPodcastTrack(track);
+        const podcastProgress = track.podcastProgress;
+        const podcastProgressPct =
+            podcastProgress && podcastProgress.duration > 0
+                ? Math.min(100, Math.round((podcastProgress.position / podcastProgress.duration) * 100))
+                : 0;
+        const podcastResumeHTML =
+            isPodcast && podcastProgress && podcastProgress.position >= 5
+                ? `<div class="podcast-resume-row" title="Resume at ${formatTime(podcastProgress.position)}">
+                    <div class="podcast-resume-bar"><div class="podcast-resume-fill" style="width:${podcastProgressPct}%"></div></div>
+                    <span class="podcast-resume-label">${formatTime(podcastProgress.position)} left off</span>
+                   </div>`
+                : '';
+
         const actionsHTML = isUnavailable
             ? ''
             : `
@@ -570,7 +587,7 @@ export class UIRenderer {
             : '';
 
         const likeType = isVideo ? 'video' : 'track';
-        const showRowLike = inlineLike && !isUnavailable && !isBlocked;
+        const showRowLike = inlineLike && !isUnavailable && !isBlocked && !isPodcast;
         const inlineLikeHTML = showRowLike
             ? `<div class="track-item-inline-like">
                 <button type="button" class="like-btn track-row-like-btn" data-action="toggle-like" data-type="${likeType}" title="Add to Liked">
@@ -582,6 +599,7 @@ export class UIRenderer {
         const classList = [
             'track-item',
             isVideo ? 'video-track-item' : '',
+            isPodcast ? 'podcast-episode-item' : '',
             isCurrentTrack ? 'playing' : '',
             isUnavailable ? 'unavailable' : '',
             isBlocked ? 'blocked' : '',
@@ -595,6 +613,7 @@ export class UIRenderer {
             <div class="${classList}"
                  data-track-id="${track.id}"
                  ${isVideo ? 'data-type="video"' : 'data-type="track"'}
+                 ${isPodcast ? 'data-is-podcast="true"' : ''}
                  ${track.isLocal ? 'data-is-local="true"' : ''}
                  ${isUnavailable ? 'title="This track is currently unavailable"' : ''}
                  ${blockedTitle}>
@@ -609,6 +628,7 @@ export class UIRenderer {
                             ${qualityBadge}
                         </div>
                         <div class="artist">${getTrackArtistsHTML(track)}${yearDisplay}</div>
+                        ${podcastResumeHTML}
                     </div>
                 </div>
                 ${inlineLikeHTML}
@@ -7266,19 +7286,32 @@ export class UIRenderer {
 
             const podcastTitle = this.podcastState.podcastTitle || 'Unknown Podcast';
             const tracks = result.items.map((ep) => this.transformPodcastEpisodeToTrack(ep, podcastTitle));
+            await this.attachPodcastProgress(tracks);
             await this.renderListWithTracks(episodesContainer, tracks, true);
 
             const playBtn = document.getElementById('play-podcasts-btn');
             if (playBtn && result.items.length > 0) {
-                playBtn.onclick = () => {
+                playBtn.onclick = async () => {
                     const tracksToPlay = this.podcastState.episodes.map((ep) =>
                         this.transformPodcastEpisodeToTrack(ep, podcastTitle)
                     );
+                    await this.attachPodcastProgress(tracksToPlay);
+                    // Resume most recently listened unfinished episode, else start first
+                    let startIndex = 0;
+                    let latestUpdated = 0;
+                    tracksToPlay.forEach((t, i) => {
+                        const p = t.podcastProgress;
+                        if (p && p.position >= 5 && p.updatedAt > latestUpdated) {
+                            latestUpdated = p.updatedAt;
+                            startIndex = i;
+                        }
+                    });
                     if (this.player) {
-                        this.player.setQueue(tracksToPlay, 0);
+                        this.player.setQueue(tracksToPlay, startIndex);
                         this.player.playTrackFromQueue();
                     }
                 };
+                playBtn.title = 'Play / Resume';
             }
         } catch (error) {
             console.error('Failed to load podcast episodes:', error);
@@ -7286,6 +7319,27 @@ export class UIRenderer {
         }
 
         this.podcastState.isLoading = false;
+    }
+
+    async attachPodcastProgress(tracks) {
+        if (!tracks?.length) return tracks;
+        const all = await db.getAllPodcastProgress();
+        const byId = new Map(all.map((p) => [String(p.id), p]));
+        for (const track of tracks) {
+            if (!isPodcastTrack(track)) continue;
+            const progress = byId.get(String(track.id));
+            if (progress && progress.position >= 5) {
+                const duration = progress.duration || track.duration || 0;
+                if (duration > 0 && (progress.position / duration >= 0.95 || duration - progress.position < 15)) {
+                    track.podcastProgress = null;
+                } else {
+                    track.podcastProgress = progress;
+                }
+            } else {
+                track.podcastProgress = null;
+            }
+        }
+        return tracks;
     }
 
     async renderPodcastSearchResults(query) {

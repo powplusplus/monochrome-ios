@@ -2209,6 +2209,35 @@ input[type='search']::-webkit-search-cancel-button {
     line-height: 1;
 }
 
+.source-quality-stack {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 0.12rem;
+    margin-left: 0.5rem;
+    vertical-align: middle;
+}
+
+.source-quality-stack .quality-badge,
+.source-quality-stack .quality-hires,
+.source-quality-stack .quality-atmos {
+    margin-left: 0;
+}
+
+.lucida-source-badge {
+    border: 1px solid var(--secondary);
+    color: var(--muted-foreground);
+    background: var(--secondary);
+    font-size: 0.5rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 0.1rem 0.28rem;
+    border-radius: var(--radius-xs);
+    line-height: 1;
+}
+
 .quality-atmos {
     border: 1px solid var(--secondary);
     color: var(--muted-foreground);
@@ -2584,6 +2613,36 @@ body.multi-select-mode .track-item:hover {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+.podcast-resume-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.2rem;
+    min-width: 0;
+}
+
+.podcast-resume-bar {
+    flex: 1;
+    height: 3px;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--muted-foreground) 25%, transparent);
+    overflow: hidden;
+    max-width: 120px;
+}
+
+.podcast-resume-fill {
+    height: 100%;
+    background: var(--primary);
+    border-radius: 2px;
+}
+
+.podcast-resume-label {
+    font-size: 0.75rem;
+    color: var(--muted-foreground);
+    white-space: nowrap;
+    flex-shrink: 0;
 }
 
 .track-item--inline-like {

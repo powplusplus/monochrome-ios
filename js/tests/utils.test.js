@@ -36,6 +36,15 @@ describe('utils.js', () => {
         });
     });
 
+    describe('isPodcastTrack', () => {
+        test('detects podcast flag and podcast_ id prefix', () => {
+            expect(utils.isPodcastTrack({ isPodcast: true })).toBe(true);
+            expect(utils.isPodcastTrack({ id: 'podcast_123' })).toBe(true);
+            expect(utils.isPodcastTrack({ id: 'tidal_1' })).toBe(false);
+            expect(utils.isPodcastTrack(null)).toBe(false);
+        });
+    });
+
     describe('sanitizeForFilename', () => {
         test('replaces invalid characters with underscores', () => {
             expect(utils.sanitizeForFilename('a/b:c*d?e"f<g>h|i')).toBe('a_b_c_d_e_f_g_h_i');

@@ -1,9 +1,17 @@
 import Foundation
 
 enum Provider: String, Codable, CaseIterable, Identifiable {
-    case tidal, amazon, qobuz, deezer
+    case tidal, amazon, qobuz, deezer, podcast
     var id: String { rawValue }
-    var title: String { rawValue.capitalized }
+    var title: String {
+        switch self {
+        case .podcast: return "Podcast"
+        default: return rawValue.capitalized
+        }
+    }
+
+    /// Catalog/provider picker — exclude podcasts (not a music catalog source).
+    static var musicCases: [Provider] { allCases.filter { $0 != .podcast } }
 }
 
 /// Mirrors web `playback-quality` tokens (mapped to Amazon UHD/HD/SD and Deezer formats).
@@ -168,6 +176,20 @@ enum PlaybackSourceSettings {
         }
         set { UserDefaults.standard.set(newValue, forKey: "native.deezerApiBaseURL") }
     }
+
+    /// Qobuz-via-Lucida fallback. ON by default — same as web `lucidaQobuzSettings`.
+    static var lucidaEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "native.lucidaEnabled") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "native.lucidaEnabled") }
+    }
+
+    static var lucidaBaseURL: String {
+        get {
+            let value = UserDefaults.standard.string(forKey: "native.lucidaBaseURL")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (value?.isEmpty == false) ? value! : "https://monochrome.tf"
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "native.lucidaBaseURL") }
+    }
 }
 
 struct Artist: Codable, Identifiable, Hashable {
@@ -224,6 +246,11 @@ struct Track: Codable, Identifiable, Hashable {
     var artworkURL: URL? { Artwork.url(album?.cover, size: 640) }
     var playbackID: String { id.split(separator: ":").last.map(String.init) ?? id }
 
+    /// Podcast episodes use `podcast_{id}` (web/iOS) and play via `streamURL` enclosure.
+    var isPodcast: Bool {
+        provider == .podcast || id.hasPrefix("podcast_") || id.hasPrefix("podcast:")
+    }
+
     /// Highest tier the *catalog* claims for this track. Used as the badge's
     /// fallback while the stream is still resolving, like web's
     /// `deriveTrackQuality`.
@@ -276,6 +303,10 @@ struct Podcast: Codable, Identifiable, Hashable {
     var title: String
     var publisher: String?
     var cover: String?
+    var description: String?
+    var episodeCount: Int?
+
+    var artworkURL: URL? { Artwork.url(cover, size: 640) }
 }
 
 struct Profile: Codable, Identifiable, Hashable {
@@ -298,6 +329,7 @@ struct SearchResults {
     var albums: [Album] = []
     var artists: [Artist] = []
     var playlists: [Playlist] = []
+    var podcasts: [Podcast] = []
 }
 
 struct StreamResponse: Codable {

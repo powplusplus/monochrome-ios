@@ -1,7 +1,7 @@
 export class MusicDatabase {
     constructor() {
         this.dbName = 'MonochromeDB';
-        this.version = 11;
+        this.version = 12;
         this.db = null;
     }
 
@@ -72,6 +72,11 @@ export class MusicDatabase {
                 if (!db.objectStoreNames.contains('pinned_items')) {
                     const store = db.createObjectStore('pinned_items', { keyPath: 'id' });
                     store.createIndex('pinnedAt', 'pinnedAt', { unique: false });
+                }
+                // v12: per-episode podcast resume (integer seconds)
+                if (!db.objectStoreNames.contains('podcast_progress')) {
+                    const store = db.createObjectStore('podcast_progress', { keyPath: 'id' });
+                    store.createIndex('updatedAt', 'updatedAt', { unique: false });
                 }
             };
         });
@@ -611,15 +616,18 @@ export class MusicDatabase {
     // User Playlists API
     async createPlaylist(name, tracks = [], cover = '', description = '') {
         const id = crypto.randomUUID();
+        const playlistTracks = tracks
+            .filter((t) => !this._isPodcastItem(t))
+            .map((t) => this._minifyItem(t.type || 'track', { ...t, addedAt: Date.now() }));
         const playlist = {
             id: id,
             name: name,
-            tracks: tracks.map((t) => this._minifyItem(t.type || 'track', { ...t, addedAt: Date.now() })),
+            tracks: playlistTracks,
             cover: cover,
             description: description,
             createdAt: Date.now(),
             updatedAt: Date.now(),
-            numberOfTracks: tracks.length,
+            numberOfTracks: playlistTracks.length,
             images: [], // Initialize images
         };
         this._updatePlaylistMetadata(playlist);
@@ -632,7 +640,16 @@ export class MusicDatabase {
         return playlist;
     }
 
+    _isPodcastItem(item) {
+        if (!item) return false;
+        if (item.isPodcast) return true;
+        return !!(item.id && String(item.id).startsWith('podcast_'));
+    }
+
     async addTrackToPlaylist(playlistId, track) {
+        if (this._isPodcastItem(track)) {
+            throw new Error('Podcasts cannot be added to playlists');
+        }
         const playlist = await this.performTransaction('user_playlists', 'readonly', (store) => store.get(playlistId));
         if (!playlist) throw new Error('Playlist not found');
         playlist.tracks = playlist.tracks || [];
@@ -657,6 +674,7 @@ export class MusicDatabase {
 
         let addedCount = 0;
         for (const track of tracks) {
+            if (this._isPodcastItem(track)) continue;
             if (!playlist.tracks.some((t) => t.id === track.id)) {
                 const trackWithDate = { ...track, addedAt: Date.now() };
                 playlist.tracks.push(this._minifyItem(track.type || 'track', trackWithDate));
@@ -673,6 +691,56 @@ export class MusicDatabase {
         }
 
         return playlist;
+    }
+
+    /**
+     * Persist podcast episode resume position (integer seconds).
+     * @param {string} episodeId podcast_* track id
+     * @param {number} positionSec floor(currentTime)
+     * @param {number} durationSec floor(duration)
+     * @param {{ title?: string, podcastTitle?: string, cover?: string }} [meta]
+     */
+    async savePodcastProgress(episodeId, positionSec, durationSec, meta = {}) {
+        if (!episodeId) return;
+        const position = Math.max(0, Math.floor(Number(positionSec) || 0));
+        const duration = Math.max(0, Math.floor(Number(durationSec) || 0));
+        const entry = {
+            id: String(episodeId),
+            position,
+            duration,
+            title: meta.title || null,
+            podcastTitle: meta.podcastTitle || null,
+            cover: meta.cover || null,
+            updatedAt: Date.now(),
+        };
+        await this.performTransaction('podcast_progress', 'readwrite', (store) => store.put(entry));
+        return entry;
+    }
+
+    async getPodcastProgress(episodeId) {
+        if (!episodeId) return null;
+        return await this.performTransaction('podcast_progress', 'readonly', (store) => store.get(String(episodeId)));
+    }
+
+    async getAllPodcastProgress() {
+        return (await this.performTransaction('podcast_progress', 'readonly', (store) => store.getAll())) || [];
+    }
+
+    async clearPodcastProgress(episodeId) {
+        if (!episodeId) return;
+        await this.performTransaction('podcast_progress', 'readwrite', (store) => store.delete(String(episodeId)));
+    }
+
+    /** Resume start time in seconds, or 0 if none / finished. */
+    async getPodcastResumePosition(episodeId, fallbackDuration = 0) {
+        const progress = await this.getPodcastProgress(episodeId);
+        if (!progress || progress.position < 5) return 0;
+        const duration = progress.duration || fallbackDuration || 0;
+        if (duration > 0 && (progress.position / duration >= 0.95 || duration - progress.position < 15)) {
+            await this.clearPodcastProgress(episodeId);
+            return 0;
+        }
+        return progress.position;
     }
 
     async removeTrackFromPlaylist(playlistId, trackId, trackType = null) {

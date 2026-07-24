@@ -13,6 +13,8 @@
 		A10000000000000000000013 /* MusicService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000003 /* MusicService.swift */; };
 		A10000000000000000000018 /* AmazonCencDecryptor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000008 /* AmazonCencDecryptor.swift */; };
 		A10000000000000000000019 /* AmazonTurnstileAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000009 /* AmazonTurnstileAuth.swift */; };
+		A1000000000000000000001A /* PodcastsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000A /* PodcastsService.swift */; };
+		A1000000000000000000001B /* PodcastProgressStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000B /* PodcastProgressStore.swift */; };
 		A10000000000000000000014 /* LibraryRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000004 /* LibraryRepository.swift */; };
 		A10000000000000000000015 /* AuthSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000005 /* AuthSession.swift */; };
 		A10000000000000000000016 /* PlaybackEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000006 /* PlaybackEngine.swift */; };
@@ -44,6 +46,8 @@
 		A10000000000000000000007 /* Views.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Views.swift; sourceTree = "<group>"; };
 		A10000000000000000000008 /* AmazonCencDecryptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AmazonCencDecryptor.swift; sourceTree = "<group>"; };
 		A10000000000000000000009 /* AmazonTurnstileAuth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AmazonTurnstileAuth.swift; sourceTree = "<group>"; };
+		A1000000000000000000000A /* PodcastsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PodcastsService.swift; sourceTree = "<group>"; };
+		A1000000000000000000000B /* PodcastProgressStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PodcastProgressStore.swift; sourceTree = "<group>"; };
 		A20000000000000000000001 /* AppTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000002 /* AppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		504EC30E1FED79650016851F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -100,6 +104,8 @@
 				A10000000000000000000007 /* Views.swift */,
 				A10000000000000000000008 /* AmazonCencDecryptor.swift */,
 				A10000000000000000000009 /* AmazonTurnstileAuth.swift */,
+				A1000000000000000000000A /* PodcastsService.swift */,
+				A1000000000000000000000B /* PodcastProgressStore.swift */,
 				504EC30E1FED79650016851F /* Assets.xcassets */,
 				504EC3101FED79650016851F /* LaunchScreen.storyboard */,
 				504EC3131FED79650016851F /* Info.plist */,
@@ -222,6 +228,8 @@
 				A10000000000000000000017 /* Views.swift in Sources */,
 				A10000000000000000000018 /* AmazonCencDecryptor.swift in Sources */,
 				A10000000000000000000019 /* AmazonTurnstileAuth.swift in Sources */,
+				A1000000000000000000001A /* PodcastsService.swift in Sources */,
+				A1000000000000000000001B /* PodcastProgressStore.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

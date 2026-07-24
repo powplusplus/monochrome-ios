@@ -8,6 +8,7 @@ import {
     createQualityBadgeHTML,
     escapeHtml,
     deriveTrackQuality,
+    isPodcastTrack,
 } from './utils.js';
 import {
     queueManager,
@@ -128,8 +129,11 @@ export class Player {
         this._maxRecentlyPlayed = 100;
 
         this.playbackSequence = 0;
+        this._lastPodcastProgressSave = 0;
+        this._lastPodcastProgressPosition = -1;
 
         window.addEventListener('beforeunload', async () => {
+            await this.savePodcastProgress(true);
             await this.saveQueueState();
             import('./listening-tracker.js')
                 .then(({ listeningTracker }) => {
@@ -141,6 +145,9 @@ export class Player {
 
         document.addEventListener('visibilitychange', async () => {
             const el = this.activeElement;
+            if (document.visibilityState === 'hidden') {
+                await this.savePodcastProgress(true);
+            }
             if (document.visibilityState === 'hidden' && !el.paused) {
                 void audioContextManager.resume();
             }
@@ -452,6 +459,52 @@ export class Player {
         if (window.renderQueueFunction) {
             await window.renderQueueFunction();
         }
+    }
+
+    /**
+     * Persist podcast episode position (integer seconds). Separate from song history.
+     * @param {boolean} [force=false] skip 2s throttle
+     */
+    async savePodcastProgress(force = false) {
+        const track = this.currentTrack;
+        if (!isPodcastTrack(track)) return;
+
+        const el = this.activeElement;
+        if (!el || !Number.isFinite(el.duration) || el.duration <= 0) return;
+
+        const position = Math.floor(el.currentTime || 0);
+        const duration = Math.floor(el.duration);
+
+        // Finished (or nearly) → clear so next play starts from beginning
+        if (position >= 5 && (position / duration >= 0.95 || duration - position < 15)) {
+            await db.clearPodcastProgress(track.id);
+            this._lastPodcastProgressPosition = -1;
+            window.dispatchEvent(
+                new CustomEvent('podcast-progress-changed', { detail: { id: track.id, cleared: true } })
+            );
+            return;
+        }
+
+        if (position < 5) return;
+
+        if (!force) {
+            if (position === this._lastPodcastProgressPosition) return;
+            if (Date.now() - this._lastPodcastProgressSave < 2000) return;
+        }
+
+        this._lastPodcastProgressSave = Date.now();
+        this._lastPodcastProgressPosition = position;
+
+        await db.savePodcastProgress(track.id, position, duration, {
+            title: track.title,
+            podcastTitle: track.album?.title || track.artist?.name || null,
+            cover: track.album?.cover || track.cover || null,
+        });
+        window.dispatchEvent(
+            new CustomEvent('podcast-progress-changed', {
+                detail: { id: track.id, position, duration },
+            })
+        );
     }
 
     async setupMediaSession() {
@@ -1031,6 +1084,7 @@ export class Player {
         const { preserveGestureToken = false } = options;
         if (!isRetry) {
             this.isFallbackRetry = false;
+            await this.savePodcastProgress(true);
         }
 
         const currentSequence = ++this.playbackSequence;
@@ -1051,6 +1105,13 @@ export class Player {
             await this.playNext();
             return;
         }
+
+        // Podcasts resume from last second unless caller passed an explicit startTime
+        let effectiveStartTime = startTime;
+        if (!isRetry && startTime === 0 && isPodcastTrack(track)) {
+            effectiveStartTime = await db.getPodcastResumePosition(track.id, track.duration || 0);
+        }
+        startTime = effectiveStartTime;
 
         this.setLoadingState(true);
 
@@ -1422,11 +1483,28 @@ export class Player {
                 if (resolvedStreamInfo.provider === 'amazon' && resolvedStreamInfo.quality) {
                     track.amazonMusicQualitySelected = resolvedStreamInfo.quality;
                     track.amazonMusicQualityDisplay = resolvedStreamInfo.qualityDisplay;
+                    track.lucidaSource = false;
                     if (this.currentTrack?.id === track.id) {
                         this.currentTrack.amazonMusicQualitySelected = resolvedStreamInfo.quality;
                         this.currentTrack.amazonMusicQualityDisplay = resolvedStreamInfo.qualityDisplay;
+                        this.currentTrack.lucidaSource = false;
                     }
                     this.updateNowPlayingTitle(track);
+                } else if (resolvedStreamInfo.provider === 'qobuz') {
+                    track.lucidaSource = true;
+                    track.amazonMusicQualitySelected = null;
+                    track.amazonMusicQualityDisplay = null;
+                    if (this.currentTrack?.id === track.id) {
+                        this.currentTrack.lucidaSource = true;
+                        this.currentTrack.amazonMusicQualitySelected = null;
+                        this.currentTrack.amazonMusicQualityDisplay = null;
+                    }
+                    this.updateNowPlayingTitle(track);
+                } else {
+                    track.lucidaSource = false;
+                    if (this.currentTrack?.id === track.id) {
+                        this.currentTrack.lucidaSource = false;
+                    }
                 }
 
                 const deezerHiResFallback =
@@ -1954,6 +2032,9 @@ export class Player {
         if (el.currentTime > 3) {
             el.currentTime = 0;
             this.updateMediaSessionPositionState();
+            if (isPodcastTrack(this.currentTrack)) {
+                void db.clearPodcastProgress(this.currentTrack.id);
+            }
         } else if (this.currentQueueIndex > 0) {
             this.currentQueueIndex--;
             const currentQueue = this.shuffleActive ? this.shuffledQueue : this.queue;
@@ -2007,6 +2088,7 @@ export class Player {
             });
         } else {
             el.pause();
+            await this.savePodcastProgress(true);
             await this.saveQueueState();
         }
     }
@@ -2016,6 +2098,7 @@ export class Player {
         const newTime = Math.max(0, el.currentTime - seconds);
         el.currentTime = newTime;
         this.updateMediaSessionPositionState();
+        void this.savePodcastProgress(true);
     }
 
     seekForward(seconds = 10) {
@@ -2024,6 +2107,7 @@ export class Player {
         const newTime = Math.min(duration, el.currentTime + seconds);
         el.currentTime = newTime;
         this.updateMediaSessionPositionState();
+        void this.savePodcastProgress(true);
     }
 
     async toggleShuffle() {

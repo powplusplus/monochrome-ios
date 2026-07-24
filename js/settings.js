@@ -6271,6 +6271,15 @@ export async function initializeSettings(scrobbler, player, api, ui) {
         });
     }
 
+    const sidebarShowPodcastsToggle = document.getElementById('sidebar-show-podcasts-toggle');
+    if (sidebarShowPodcastsToggle) {
+        sidebarShowPodcastsToggle.checked = sidebarSectionSettings.shouldShowPodcasts();
+        sidebarShowPodcastsToggle.addEventListener('change', (e) => {
+            sidebarSectionSettings.setShowPodcasts(e.target.checked);
+            sidebarSectionSettings.applySidebarVisibility();
+        });
+    }
+
     const sidebarShowDonateToggle = document.getElementById('sidebar-show-donate-toggle');
     if (sidebarShowDonateToggle) {
         sidebarShowDonateToggle.checked = sidebarSectionSettings.shouldShowDonate();

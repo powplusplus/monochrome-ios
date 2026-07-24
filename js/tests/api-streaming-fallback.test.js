@@ -1,5 +1,5 @@
 import { describe, expect, test, vi, beforeEach, afterEach } from 'vitest';
-import { amazonMusicSettings } from '../storage.js';
+import { amazonMusicSettings, lucidaQobuzSettings } from '../storage.js';
 
 vi.mock('../utils.js', () => ({
     RATE_LIMIT_ERROR_MESSAGE: 'rate limited',
@@ -25,6 +25,10 @@ vi.mock('../storage.js', async (importOriginal) => {
             getTurnstileBypassToken: vi.fn(() => 'bypass'),
             getTurnstileSiteKey: vi.fn(() => 'test-key'),
             getApiBaseUrl: vi.fn(() => 'https://amz.example'),
+        },
+        lucidaQobuzSettings: {
+            isEnabled: vi.fn(() => true),
+            setEnabled: vi.fn(),
         },
     };
 });
@@ -82,6 +86,7 @@ describe('LosslessAPI stream source fallback', () => {
         api = new LosslessAPI({});
         api.streamCache?.clear?.();
         amazonMusicSettings.isEnabled.mockReturnValue(true);
+        lucidaQobuzSettings.isEnabled.mockReturnValue(true);
         vi.spyOn(api, 'getTrackMetadata').mockResolvedValue({ id: '123', isrc: 'TESTISRC123' });
         vi.spyOn(api, 'getAmazonMusicStreamUrl').mockResolvedValue(null);
         vi.spyOn(api, 'getQobuzStreamUrl').mockResolvedValue(null);
@@ -93,8 +98,7 @@ describe('LosslessAPI stream source fallback', () => {
         vi.restoreAllMocks();
     });
 
-    test('uses Amazon Music before Qobuz when the 50/50 roll prefers Amazon', async () => {
-        vi.spyOn(Math, 'random').mockReturnValue(0.75);
+    test('uses Amazon Music before Lucida when Amazon resolves', async () => {
         api.getAmazonMusicStreamUrl.mockResolvedValue({
             url: 'blob:https://app.example/amazon',
             provider: 'amazon',
@@ -106,6 +110,10 @@ describe('LosslessAPI stream source fallback', () => {
                 albumReplayGain: 0,
                 albumPeakAmplitude: 1,
             },
+        });
+        api.getQobuzStreamUrl.mockResolvedValue({
+            url: 'https://audio.example/qobuz.flac',
+            provider: 'qobuz',
         });
 
         const result = await api.getStreamUrl('123', 'LOSSLESS');
@@ -121,8 +129,7 @@ describe('LosslessAPI stream source fallback', () => {
         expect(api.getTrack).not.toHaveBeenCalled();
     });
 
-    test('keeps using Qobuz when the 50/50 roll prefers Qobuz and it resolves', async () => {
-        vi.spyOn(Math, 'random').mockReturnValue(0.25);
+    test('falls back to Lucida when Amazon cannot resolve a stream URL', async () => {
         api.getQobuzStreamUrl.mockResolvedValue({
             url: 'https://audio.example/qobuz.flac',
             rgInfo: {
@@ -136,13 +143,13 @@ describe('LosslessAPI stream source fallback', () => {
         const result = await api.getStreamUrl('123', 'LOSSLESS');
 
         expect(result.url).toBe('https://audio.example/qobuz.flac');
+        expect(result.provider).toBe('qobuz');
+        expect(api.getAmazonMusicStreamUrl).toHaveBeenCalled();
         expect(api.getQobuzStreamUrl).toHaveBeenCalled();
-        expect(api.getAmazonMusicStreamUrl).not.toHaveBeenCalled();
         expect(api.getTrack).not.toHaveBeenCalled();
     });
 
-    test('falls back to Deezer when Amazon and Qobuz both miss', async () => {
-        vi.spyOn(Math, 'random').mockReturnValue(0.25);
+    test('falls back to Deezer when Amazon and Lucida both miss', async () => {
         api.getDeezerStreamUrl.mockResolvedValue({
             url: 'https://audio.example/deezer.flac',
             format: 'FLAC',
@@ -155,12 +162,12 @@ describe('LosslessAPI stream source fallback', () => {
             provider: 'deezer',
             deezerFormat: 'FLAC',
         });
+        expect(api.getAmazonMusicStreamUrl).toHaveBeenCalled();
+        expect(api.getQobuzStreamUrl).toHaveBeenCalled();
         expect(api.getTrack).not.toHaveBeenCalled();
     });
 
-    test('throws when Amazon, Qobuz, and Deezer all miss', async () => {
-        vi.spyOn(Math, 'random').mockReturnValue(0.25);
-
+    test('throws when Amazon, Lucida, and Deezer all miss', async () => {
         await expect(api.getStreamUrl('123', 'LOSSLESS')).rejects.toThrow(
             'Could not resolve stream URL from Amazon Music, Qobuz, or Deezer'
         );

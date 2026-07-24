@@ -42,6 +42,7 @@ final class LibraryRepository: ObservableObject {
     }
 
     func toggleFavorite(_ track: Track) {
+        guard !track.isPodcast else { return }
         if favorites.contains(where: { $0.id == track.id }) {
             favorites.removeAll { $0.id == track.id }; delete(key: track.id, kind: "favorite")
         } else {
@@ -61,7 +62,8 @@ final class LibraryRepository: ObservableObject {
     }
 
     func createPlaylist(named name: String, tracks: [Track] = []) {
-        let playlist = Playlist(id: UUID().uuidString, title: name, description: nil, cover: tracks.first?.album?.cover, creator: "You", tracks: tracks)
+        let filtered = tracks.filter { !$0.isPodcast }
+        let playlist = Playlist(id: UUID().uuidString, title: name, description: nil, cover: filtered.first?.album?.cover, creator: "You", tracks: filtered)
         playlists.insert(playlist, at: 0)
         upsert(playlist, key: playlist.id, kind: "playlist")
         save()
@@ -69,6 +71,7 @@ final class LibraryRepository: ObservableObject {
     }
 
     func add(_ track: Track, to playlistID: String) {
+        guard !track.isPodcast else { return }
         guard let index = playlists.firstIndex(where: { $0.id == playlistID }) else { return }
         if !playlists[index].tracks.contains(where: { $0.id == track.id }) { playlists[index].tracks.append(track) }
         upsert(playlists[index], key: playlistID, kind: "playlist")

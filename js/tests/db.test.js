@@ -32,6 +32,31 @@ describe('MusicDatabase', () => {
         expect(openedDb.objectStoreNames.contains('favorites_tracks')).toBe(true);
         expect(openedDb.objectStoreNames.contains('history_tracks')).toBe(true);
         expect(openedDb.objectStoreNames.contains('user_playlists')).toBe(true);
+        expect(openedDb.objectStoreNames.contains('podcast_progress')).toBe(true);
+    });
+
+    test('podcast progress saves to the second and resume rejects finished', async () => {
+        await db.open();
+        await db.savePodcastProgress('podcast_1', 125, 600, { title: 'Ep' });
+        const progress = await db.getPodcastProgress('podcast_1');
+        expect(progress.position).toBe(125);
+        expect(progress.duration).toBe(600);
+
+        expect(await db.getPodcastResumePosition('podcast_1')).toBe(125);
+
+        await db.savePodcastProgress('podcast_1', 590, 600);
+        expect(await db.getPodcastResumePosition('podcast_1')).toBe(0);
+        expect(await db.getPodcastProgress('podcast_1')).toBeUndefined();
+    });
+
+    test('rejects podcasts from playlists', async () => {
+        const podcast = { id: 'podcast_99', title: 'Ep', isPodcast: true, enclosureUrl: 'https://x' };
+        const playlist = await db.createPlaylist('Mix', [podcast]);
+        expect(playlist.tracks.length).toBe(0);
+
+        await expect(db.addTrackToPlaylist(playlist.id, podcast)).rejects.toThrow(
+            'Podcasts cannot be added to playlists'
+        );
     });
 
     test('toggleFavorite adds and removes items', async () => {

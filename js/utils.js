@@ -53,6 +53,13 @@ export const formatTime = (seconds) => {
     return `${m}:${String(s).padStart(2, '0')}`;
 };
 
+/** Podcast episodes use `isPodcast` / `podcast_*` ids — not playlist-eligible. */
+export const isPodcastTrack = (track) => {
+    if (!track) return false;
+    if (track.isPodcast) return true;
+    return !!(track.id && String(track.id).startsWith('podcast_'));
+};
+
 export const getTrackYearDisplay = (track) => {
     const useAlbumYear = trackDateSettings.useAlbumYear();
     const releaseDate = useAlbumYear
@@ -289,23 +296,42 @@ export const normalizeQualityToken = (value) => {
 };
 
 export const createQualityBadgeHTML = (track) => {
-    if (!qualityBadgeSettings.isEnabled()) return '';
+    if (!qualityBadgeSettings.isEnabled() && !track?.lucidaSource) return '';
+
+    const lucidaBox = track?.lucidaSource
+        ? '<span class="lucida-source-badge" title="Streaming via Lucida">Lucida</span>'
+        : '';
+
+    const wrap = (badge) =>
+        lucidaBox || badge
+            ? `<span class="source-quality-stack">${lucidaBox}${badge}</span>`
+            : '';
+
+    if (!qualityBadgeSettings.isEnabled()) {
+        return wrap('');
+    }
 
     if (track?.amazonMusicQualitySelected) {
         const quality = String(track.amazonMusicQualitySelected);
         const label =
             track.amazonMusicQualityDisplay ||
             quality.replace(/^UHD_/, 'UHD ').replace(/^HD_/, 'HD ').replace(/_/g, ' ');
-        return `<span class="quality-badge quality-hires" title="Amazon Music ${escapeHtml(quality)}">${escapeHtml(label)}</span>`;
+        return wrap(
+            `<span class="quality-badge quality-hires" title="Amazon Music ${escapeHtml(quality)}">${escapeHtml(label)}</span>`
+        );
     }
 
     const quality = deriveTrackQuality(track);
     if (quality === 'DOLBY_ATMOS') {
-        return `<span class="quality-badge quality-atmos" title="Dolby Atmos">${SVG_ATMOS(20)}</span>`;
+        return wrap(`<span class="quality-badge quality-atmos" title="Dolby Atmos">${SVG_ATMOS(20)}</span>`);
     } else if (quality === 'HI_RES_LOSSLESS') {
-        return '<span class="quality-badge quality-hires" title="Hi-Res Lossless">HD</span>';
+        return wrap('<span class="quality-badge quality-hires" title="Hi-Res Lossless">HD</span>');
+    } else if (quality === 'LOSSLESS' && track?.lucidaSource) {
+        // Lucida FLAC is CD-quality lossless; still show a badge so the Lucida
+        // box has something to sit above.
+        return wrap('<span class="quality-badge quality-hires" title="Lossless">Lossless</span>');
     }
-    return '';
+    return wrap('');
 };
 
 export const deriveQualityFromTags = (rawTags) => {

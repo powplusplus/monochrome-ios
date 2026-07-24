@@ -25,6 +25,11 @@ final class PlaybackEngine: ObservableObject {
     @Published private(set) var loadedTrackID: String?
     /// `24/96` when the provider reports bit depth and sample rate.
     @Published private(set) var currentStreamQualityDetail: String?
+    /// Active stream provider — drives the Lucida badge above the lossless indicator.
+    @Published private(set) var currentStreamProvider: Provider?
+    /// Loudness for playlist now-playing bars. Separate store so ~30 Hz meter
+    /// ticks do not rebuild every `TrackRow` via `PlaybackEngine.objectWillChange`.
+    let audioMeter = AudioMeterStore()
 
     let player = AVQueuePlayer()
     private let musicService: MusicService
@@ -35,6 +40,8 @@ final class PlaybackEngine: ObservableObject {
     private var pendingAutoplay = false
     private var fadeTask: Task<Void, Never>?
     private let fadeDuration: TimeInterval = 0.25
+    private let levelMonitor = AudioLevelMonitor()
+    private var meterAttachTask: Task<Void, Never>?
 
     /// A stream that has already been resolved and whose asset header has been fetched.
     /// `AVURLAsset` is not `Sendable`, but this one is only ever touched on the main actor.
@@ -58,6 +65,9 @@ final class PlaybackEngine: ObservableObject {
     /// pulling the whole file up front once bandwidth allows.
     private let forwardBufferSeconds: TimeInterval = 30
     private var lastNowPlayingElapsed: Double = -1
+    private var pendingPodcastSeek: Double?
+    private var lastPodcastProgressSave: Date = .distantPast
+    private var lastPodcastProgressPosition: Int = -1
 
     var currentTrack: Track? {
         guard let currentIndex, queue.indices.contains(currentIndex) else { return nil }
@@ -75,6 +85,14 @@ final class PlaybackEngine: ObservableObject {
         player.automaticallyWaitsToMinimizeStalling = true
         restoreQueue()
         configureRemoteCommands()
+        levelMonitor.onLevel = { [weak self] level in
+            Task { @MainActor in
+                guard let self else { return }
+                // Ignore tap leftovers after pause / while a new item is loading.
+                guard self.isPlaying, !self.isLoading else { return }
+                self.audioMeter.setLevel(level)
+            }
+        }
         // Ticks at 4 Hz so synced lyrics land on the beat instead of up to half
         // a second late. The published values and the now-playing centre are
         // still throttled below so the faster clock costs nothing downstream.
@@ -96,6 +114,7 @@ final class PlaybackEngine: ObservableObject {
                     self.lastNowPlayingElapsed = seconds
                     self.updateNowPlaying()
                 }
+                self.savePodcastProgressIfNeeded(force: false)
             }
         }
         endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main) { [weak self] notification in
@@ -114,6 +133,7 @@ final class PlaybackEngine: ObservableObject {
     }
 
     func play(_ track: Track, in context: [Track]? = nil) {
+        savePodcastProgressIfNeeded(force: true)
         let tracks = context ?? [track]
         queue = tracks
         currentIndex = tracks.firstIndex(where: { $0.id == track.id }) ?? 0
@@ -135,7 +155,9 @@ final class PlaybackEngine: ObservableObject {
 
     func pause() {
         isPlaying = false
+        audioMeter.reset()
         updateNowPlaying()
+        savePodcastProgressIfNeeded(force: true)
         fadeTask?.cancel()
         let startVolume = player.volume
         fadeTask = Task { @MainActor [weak self] in
@@ -173,6 +195,7 @@ final class PlaybackEngine: ObservableObject {
     }
 
     func next() {
+        savePodcastProgressIfNeeded(force: true)
         guard !queue.isEmpty else { return }
         if repeatMode == .one { seek(to: 0); resume(); return }
         if shuffleEnabled, queue.count > 1 {
@@ -186,7 +209,14 @@ final class PlaybackEngine: ObservableObject {
     }
 
     func previous() {
-        if elapsed > 4 { seek(to: 0); return }
+        if elapsed > 4 {
+            seek(to: 0)
+            if let track = currentTrack, track.isPodcast {
+                PodcastProgressStore.shared.clear(track.id)
+            }
+            return
+        }
+        savePodcastProgressIfNeeded(force: true)
         guard !queue.isEmpty else { return }
         if let index = currentIndex, index > 0 { currentIndex = index - 1 }
         else if repeatMode == .all { currentIndex = queue.count - 1 }
@@ -194,7 +224,11 @@ final class PlaybackEngine: ObservableObject {
         persistQueue(); loadCurrent(autoplay: true)
     }
 
-    func seek(to seconds: Double) { player.seek(to: CMTime(seconds: max(0, seconds), preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) }
+    func seek(to seconds: Double) {
+        player.seek(to: CMTime(seconds: max(0, seconds), preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        elapsed = max(0, seconds)
+        savePodcastProgressIfNeeded(force: true)
+    }
 
     func remove(at offsets: IndexSet) {
         guard let currentIndex else { queue.remove(atOffsets: offsets); persistQueue(); return }
@@ -213,7 +247,7 @@ final class PlaybackEngine: ObservableObject {
     func handleInterruption(_ notification: Notification) {
         guard let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
-        if type == .began { isPlaying = false }
+        if type == .began { isPlaying = false; audioMeter.reset() }
         else if let rawOptions = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt,
                 AVAudioSession.InterruptionOptions(rawValue: rawOptions).contains(.shouldResume) { resume() }
     }
@@ -233,16 +267,23 @@ final class PlaybackEngine: ObservableObject {
         errorMessage = nil
         currentStreamQuality = nil
         currentStreamQualityDetail = nil
+        currentStreamProvider = nil
+        pendingPodcastSeek = track.isPodcast
+            ? PodcastProgressStore.shared.resumePosition(for: track.id, duration: track.duration)
+            : nil
+        lastPodcastProgressPosition = -1
         // Retire the outgoing item now. Resolving a stream is several network hops,
         // and leaving the previous item playing across them left the scrubber running
         // and the synced lyrics scrolling against audio the rest of the UI had already
         // replaced with the incoming track.
         fadeTask?.cancel()
         itemStatusObservation = nil
+        detachMeter()
         player.pause()
         player.removeAllItems()
         player.volume = 1
         isPlaying = false
+        audioMeter.reset()
         elapsed = 0
         duration = track.duration
         lastNowPlayingElapsed = -1
@@ -253,7 +294,18 @@ final class PlaybackEngine: ObservableObject {
                 let stream: StreamResponse
                 let asset: AVURLAsset
                 var wasPrefetched = false
-                if let warm, let prepared = try? await warm.value {
+                if let local = DownloadManager.shared.localPlayURL(for: track) {
+                    stream = StreamResponse(
+                        url: local,
+                        provider: track.provider,
+                        quality: track.audioQuality ?? PlaybackQuality.stored.rawValue,
+                        replayGain: nil,
+                        peak: nil,
+                        isPreview: false,
+                        mediaDuration: track.duration > 0 ? track.duration : nil
+                    )
+                    asset = AVURLAsset(url: local)
+                } else if let warm, let prepared = try? await warm.value {
                     stream = prepared.stream
                     asset = prepared.asset
                     wasPrefetched = true
@@ -264,6 +316,7 @@ final class PlaybackEngine: ObservableObject {
                 guard !Task.isCancelled else { return }
                 currentStreamQuality = stream.quality
                 currentStreamQualityDetail = stream.qualityDetail
+                currentStreamProvider = stream.provider
                 let item = AVPlayerItem(asset: asset)
                 item.audioTimePitchAlgorithm = .timeDomain
                 // Bound the look-ahead so the track streams as a sliding window of
@@ -278,6 +331,8 @@ final class PlaybackEngine: ObservableObject {
                         case .readyToPlay:
                             self.isLoading = false
                             self.loadedTrackID = track.id
+                            self.attachMeter(to: item)
+                            self.applyPendingPodcastSeekIfNeeded()
                             if self.pendingAutoplay {
                                 self.pendingAutoplay = false
                                 self.resume()
@@ -313,18 +368,24 @@ final class PlaybackEngine: ObservableObject {
                 if item.status == .readyToPlay {
                     isLoading = false
                     loadedTrackID = track.id
+                    attachMeter(to: item)
+                    applyPendingPodcastSeekIfNeeded()
                     if pendingAutoplay {
                         pendingAutoplay = false
                         resume()
                     }
                 }
                 LibraryRepository.shared.recordPlayback(track)
-                ScrobblingCoordinator.shared.nowPlaying(track)
-                Task { try? await DownloadManager.shared.prefetchArtwork(for: track) }
-                // Purely a cache warm for the related-tracks shelf. At default priority
-                // it fans out across the instance pool and competes with the audio
-                // download that the user is actually waiting on.
-                Task(priority: .background) { _ = try? await musicService.recommendations(for: track.playbackID) }
+                if !track.isPodcast {
+                    ScrobblingCoordinator.shared.nowPlaying(track)
+                    Task { try? await DownloadManager.shared.prefetchArtwork(for: track) }
+                    // Purely a cache warm for the related-tracks shelf. At default priority
+                    // it fans out across the instance pool and competes with the audio
+                    // download that the user is actually waiting on.
+                    Task(priority: .background) { _ = try? await musicService.recommendations(for: track.playbackID) }
+                } else {
+                    Task { try? await DownloadManager.shared.prefetchArtwork(for: track) }
+                }
                 updateNowPlaying()
                 prefetchUpcoming()
             } catch {
@@ -402,6 +463,7 @@ final class PlaybackEngine: ObservableObject {
     /// ahead of the user instead: refresh auth/pool, drop warms old enough that the
     /// URL may be dead, then warm the current track (when stopped) and the queue.
     func warmForeground() {
+        savePodcastProgressIfNeeded(force: true)
         Task { await InstanceDirectory.shared.refreshIfStale() }
         AmazonTurnstileAuth.shared.prewarm()
         let now = Date()
@@ -411,6 +473,26 @@ final class PlaybackEngine: ObservableObject {
         }
         if let track = currentTrack, loadedTrackID != track.id, !isLoading { warm(track) }
         prefetchUpcoming()
+    }
+
+    /// Installs a pass-through audio tap so playlist rows can bounce with loudness.
+    /// Called once the item is `.readyToPlay` so audio tracks exist (HLS-safe).
+    private func attachMeter(to item: AVPlayerItem) {
+        meterAttachTask?.cancel()
+        audioMeter.reset()
+        let player = self.player
+        meterAttachTask = Task { [levelMonitor] in
+            await levelMonitor.attach(to: item) {
+                player.currentItem === item
+            }
+        }
+    }
+
+    private func detachMeter() {
+        meterAttachTask?.cancel()
+        meterAttachTask = nil
+        levelMonitor.detach()
+        audioMeter.reset()
     }
 
     /// Hands back the warmed task for `track` (possibly still in flight) and stops tracking it.
@@ -426,8 +508,51 @@ final class PlaybackEngine: ObservableObject {
     private func itemDidFinish() {
         // Ignore end events that arrive while a replacement item is mid-load.
         guard !isLoading else { return }
-        if let track = currentTrack { ScrobblingCoordinator.shared.completed(track, listened: max(elapsed, duration)) }
+        if let track = currentTrack {
+            if track.isPodcast {
+                PodcastProgressStore.shared.clear(track.id)
+            } else {
+                ScrobblingCoordinator.shared.completed(track, listened: max(elapsed, duration))
+            }
+        }
         next()
+    }
+
+    private func applyPendingPodcastSeekIfNeeded() {
+        guard let seekTo = pendingPodcastSeek, seekTo > 0 else {
+            pendingPodcastSeek = nil
+            return
+        }
+        pendingPodcastSeek = nil
+        player.seek(to: CMTime(seconds: seekTo, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        elapsed = seekTo
+    }
+
+    private func savePodcastProgressIfNeeded(force: Bool) {
+        guard let track = currentTrack, track.isPodcast else { return }
+        guard !isLoading else { return }
+        let position = Int(elapsed.rounded(.down))
+        let dur = duration > 0 ? duration : track.duration
+        guard dur > 0 else { return }
+        if position >= 5, Double(position) / dur >= 0.95 || dur - Double(position) < 15 {
+            PodcastProgressStore.shared.clear(track.id)
+            lastPodcastProgressPosition = -1
+            return
+        }
+        guard position >= 5 else { return }
+        if !force {
+            if position == lastPodcastProgressPosition { return }
+            if Date().timeIntervalSince(lastPodcastProgressSave) < 2 { return }
+        }
+        lastPodcastProgressSave = Date()
+        lastPodcastProgressPosition = position
+        PodcastProgressStore.shared.save(
+            episodeID: track.id,
+            position: Double(position),
+            duration: dur,
+            title: track.title,
+            podcastTitle: track.album?.title ?? track.artist.name
+        )
     }
 
     private func configureRemoteCommands() {
@@ -475,47 +600,496 @@ final class PlaybackEngine: ObservableObject {
     }
 }
 
+/// Isolated loudness publisher so meter ticks do not invalidate the whole player UI tree.
+@MainActor
+final class AudioMeterStore: ObservableObject {
+    @Published private(set) var level: Float = 0
+
+    func setLevel(_ value: Float) {
+        if abs(level - value) >= 0.015 || value < 0.04 {
+            level = value
+        }
+    }
+
+    func reset() {
+        if level != 0 { level = 0 }
+    }
+}
+
+/// Pass-through `MTAudioProcessingTap` that publishes a smoothed RMS loudness.
+/// Runs on the audio render thread — keep `process` allocation-free and coalesce
+/// UI callbacks onto the main queue.
+private final class AudioLevelMonitor: @unchecked Sendable {
+    var onLevel: ((Float) -> Void)?
+
+    private let lock = NSLock()
+    private var tap: MTAudioProcessingTap?
+    private weak var attachedItem: AVPlayerItem?
+    private var generation: UInt64 = 0
+    private var isFloat32 = false
+    private var smoothed: Float = 0
+    private var pending: Float = 0
+    private var emitScheduled = false
+
+    func attach(to item: AVPlayerItem, stillCurrent: @MainActor @escaping () -> Bool) async {
+        let gen: UInt64
+        let previousItem: AVPlayerItem?
+        lock.lock()
+        generation &+= 1
+        gen = generation
+        previousItem = attachedItem
+        attachedItem = nil
+        tap = nil
+        isFloat32 = false
+        smoothed = 0
+        pending = 0
+        emitScheduled = false
+        lock.unlock()
+
+        await MainActor.run { previousItem?.audioMix = nil }
+
+        let tracks = (try? await item.asset.load(.tracks)) ?? []
+        guard !Task.isCancelled else { return }
+        lock.lock()
+        let generationMatches = generation == gen
+        lock.unlock()
+        guard generationMatches else { return }
+        guard let audioTrack = tracks.first(where: { $0.mediaType == .audio }) else { return }
+
+        var callbacks = MTAudioProcessingTapCallbacks(
+            version: kMTAudioProcessingTapCallbacksVersion_0,
+            clientInfo: Unmanaged.passUnretained(self).toOpaque(),
+            init: { _, clientInfo, tapStorageOut in
+                tapStorageOut.pointee = clientInfo
+            },
+            finalize: { _ in },
+            prepare: { tap, _, processingFormat in
+                let monitor = Unmanaged<AudioLevelMonitor>
+                    .fromOpaque(MTAudioProcessingTapGetStorage(tap))
+                    .takeUnretainedValue()
+                let format = processingFormat.pointee
+                let isFloat = format.mFormatID == kAudioFormatLinearPCM
+                    && (format.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+                    && format.mBitsPerChannel == 32
+                monitor.lock.lock()
+                monitor.isFloat32 = isFloat
+                monitor.lock.unlock()
+            },
+            unprepare: { tap in
+                let monitor = Unmanaged<AudioLevelMonitor>
+                    .fromOpaque(MTAudioProcessingTapGetStorage(tap))
+                    .takeUnretainedValue()
+                monitor.lock.lock()
+                monitor.isFloat32 = false
+                monitor.lock.unlock()
+            },
+            process: { tap, numberFrames, _, bufferListInOut, numberFramesOut, flagsOut in
+                let status = MTAudioProcessingTapGetSourceAudio(
+                    tap, numberFrames, bufferListInOut, flagsOut, nil, numberFramesOut
+                )
+                if status != noErr {
+                    numberFramesOut.pointee = 0
+                    return
+                }
+                let monitor = Unmanaged<AudioLevelMonitor>
+                    .fromOpaque(MTAudioProcessingTapGetStorage(tap))
+                    .takeUnretainedValue()
+                monitor.ingest(bufferList: bufferListInOut, frames: numberFramesOut.pointee)
+            }
+        )
+
+        var tapRef: Unmanaged<MTAudioProcessingTap>?
+        let createStatus = MTAudioProcessingTapCreate(
+            kCFAllocatorDefault,
+            &callbacks,
+            kMTAudioProcessingTapCreationFlag_PostEffects,
+            &tapRef
+        )
+        guard createStatus == noErr, let created = tapRef?.takeRetainedValue() else { return }
+        guard !Task.isCancelled else { return }
+        lock.lock()
+        let stillSameGeneration = generation == gen
+        lock.unlock()
+        guard stillSameGeneration else { return }
+
+        let parameters = AVMutableAudioMixInputParameters(track: audioTrack)
+        parameters.audioTapProcessor = created
+        let mix = AVMutableAudioMix()
+        mix.inputParameters = [parameters]
+
+        await MainActor.run {
+            guard !Task.isCancelled, stillCurrent() else { return }
+            guard item.status != .failed else { return }
+            self.lock.lock()
+            let ok = self.generation == gen
+            if ok {
+                self.tap = created
+                self.attachedItem = item
+                self.smoothed = 0
+                self.pending = 0
+            }
+            self.lock.unlock()
+            guard ok else { return }
+            item.audioMix = mix
+        }
+    }
+
+    func detach() {
+        lock.lock()
+        generation &+= 1
+        let item = attachedItem
+        attachedItem = nil
+        tap = nil
+        isFloat32 = false
+        smoothed = 0
+        pending = 0
+        emitScheduled = false
+        lock.unlock()
+
+        let finish = {
+            item?.audioMix = nil
+            self.onLevel?(0)
+        }
+        if Thread.isMainThread {
+            finish()
+        } else {
+            DispatchQueue.main.async(execute: finish)
+        }
+    }
+
+    private func ingest(bufferList: UnsafeMutablePointer<AudioBufferList>, frames: CMItemCount) {
+        guard frames > 0 else { return }
+        lock.lock()
+        let allowFloat = isFloat32
+        lock.unlock()
+        guard allowFloat else { return }
+
+        let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
+        var sumSquares: Float = 0
+        var sampleCount = 0
+
+        for buffer in buffers {
+            guard let data = buffer.mData else { continue }
+            let channelCount = max(Int(buffer.mNumberChannels), 1)
+            let byteSamples = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
+            let count = min(Int(frames) * channelCount, byteSamples)
+            guard count > 0 else { continue }
+            let samples = data.assumingMemoryBound(to: Float.self)
+            for i in 0..<count {
+                let sample = samples[i]
+                sumSquares += sample * sample
+            }
+            sampleCount += count
+        }
+
+        guard sampleCount > 0 else { return }
+        // Music RMS sits well below 1.0; gain brings typical peaks near full scale.
+        let rms = sqrt(sumSquares / Float(sampleCount))
+        let normalized = min(1, max(0, rms * 5.2))
+
+        lock.lock()
+        smoothed = smoothed * 0.62 + normalized * 0.38
+        pending = smoothed
+        let shouldSchedule = !emitScheduled
+        if shouldSchedule { emitScheduled = true }
+        lock.unlock()
+
+        guard shouldSchedule else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let value = self.pending
+            self.emitScheduled = false
+            self.lock.unlock()
+            self.onLevel?(value)
+        }
+    }
+}
+
 @MainActor
 final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDelegate {
     static let shared = DownloadManager()
+
+    /// 0...1 while a track is downloading. Missing key = idle / finished.
     @Published private(set) var progress: [String: Double] = [:]
     @Published private(set) var offlineTracks: [Track] = []
-    private var tasks: [Int: Track] = [:]
-    private lazy var session = URLSession(configuration: .background(withIdentifier: "tf.monochrome.downloads"), delegate: self, delegateQueue: nil)
+
+    private var trackByTaskID: [Int: Track] = [:]
+    private var finishers: [Int: CheckedContinuation<URL, Error>] = [:]
+    private var workTasks: [String: Task<Void, Never>] = [:]
+    /// Metadata for in-flight downloads (not yet in `offlineTracks`).
+    private var activeTracks: [String: Track] = [:]
+    /// Bumped by `cancelAll` so an in-flight `downloadAll` stops instead of advancing.
+    private var bulkGeneration = 0
+    private lazy var session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+    private let catalogKey = "native.offlineTracks"
+    private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
+
+    override init() {
+        super.init()
+        loadCatalog()
+        pruneMissingFiles()
+    }
+
+    // MARK: - Paths
+
+    private var downloadsDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("Downloads", isDirectory: true)
+    }
+
+    private func safeFileName(for trackID: String) -> String {
+        trackID.replacingOccurrences(of: ":", with: "_")
+            .replacingOccurrences(of: "/", with: "_")
+    }
+
+    func fileURL(for track: Track) -> URL {
+        downloadsDirectory
+            .appendingPathComponent(safeFileName(for: track.id))
+            .appendingPathExtension("audio")
+    }
+
+    func isDownloaded(_ track: Track) -> Bool {
+        FileManager.default.fileExists(atPath: fileURL(for: track).path)
+    }
+
+    /// Playable local file when present — prefer over network resolve.
+    func localPlayURL(for track: Track) -> URL? {
+        let url = fileURL(for: track)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return url
+    }
+
+    func isDownloading(_ track: Track) -> Bool {
+        progress[track.id] != nil || workTasks[track.id] != nil
+    }
+
+    /// Aggregate 0...1 for a playlist/mix collection.
+    func collectionProgress(for tracks: [Track]) -> Double? {
+        guard !tracks.isEmpty else { return nil }
+        let anyActive = tracks.contains { progress[$0.id] != nil || workTasks[$0.id] != nil }
+        guard anyActive else { return nil }
+        let sum = tracks.reduce(0.0) { partial, track in
+            if isDownloaded(track) { return partial + 1 }
+            if let p = progress[track.id] { return partial + max(0, min(1, p)) }
+            return partial
+        }
+        return sum / Double(tracks.count)
+    }
+
+    func allDownloaded(_ tracks: [Track]) -> Bool {
+        !tracks.isEmpty && tracks.allSatisfy { isDownloaded($0) }
+    }
+
+    // MARK: - Public API
 
     func download(_ track: Track) async {
-        do {
-            let stream = try await MusicService.shared.resolveStream(for: track, quality: PlaybackQuality.stored)
-            let task = session.downloadTask(with: stream.url); tasks[task.taskIdentifier] = track; progress[track.id] = 0; task.resume()
-        } catch { progress[track.id] = nil }
+        if isDownloaded(track) {
+            remember(track)
+            return
+        }
+        if workTasks[track.id] != nil { return }
+
+        activeTracks[track.id] = track
+        progress[track.id] = 0
+        let work = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.workTasks[track.id] = nil
+                self.activeTracks[track.id] = nil
+            }
+            do {
+                try Task.checkCancellation()
+                let stream = try await MusicService.shared.resolveStream(for: track, quality: PlaybackQuality.stored)
+                try Task.checkCancellation()
+                try await self.persist(stream.url, for: track)
+                self.remember(track)
+                self.progress[track.id] = nil
+            } catch is CancellationError {
+                self.progress[track.id] = nil
+            } catch {
+                self.progress[track.id] = nil
+            }
+        }
+        workTasks[track.id] = work
+        await work.value
     }
+
+    func downloadAll(_ tracks: [Track]) async {
+        let generation = bulkGeneration
+        for track in tracks {
+            guard generation == bulkGeneration else { return }
+            if isDownloaded(track) {
+                remember(track)
+                continue
+            }
+            await download(track)
+            guard generation == bulkGeneration else { return }
+        }
+    }
+
     func cancel(_ track: Track) {
-        guard let taskID = tasks.first(where: { $0.value.id == track.id })?.key else { return }
-        session.getAllTasks { tasks in tasks.first(where: { $0.taskIdentifier == taskID })?.cancel() }
-        tasks[taskID] = nil
+        workTasks[track.id]?.cancel()
+        workTasks[track.id] = nil
+        activeTracks[track.id] = nil
+        if let taskID = trackByTaskID.first(where: { $0.value.id == track.id })?.key {
+            session.getAllTasks { tasks in
+                tasks.first(where: { $0.taskIdentifier == taskID })?.cancel()
+            }
+            trackByTaskID[taskID] = nil
+            if let finisher = finishers.removeValue(forKey: taskID) {
+                finisher.resume(throwing: CancellationError())
+            }
+        }
         progress[track.id] = nil
     }
+
+    func cancelAll(in tracks: [Track]) {
+        bulkGeneration += 1
+        for track in tracks { cancel(track) }
+    }
+
+    func removeDownload(_ track: Track) {
+        cancel(track)
+        let url = fileURL(for: track)
+        try? FileManager.default.removeItem(at: url)
+        offlineTracks.removeAll { $0.id == track.id }
+        persistCatalog()
+    }
+
     func prefetchArtwork(for track: Track) async throws {
         guard let url = track.artworkURL else { return }
         if ArtworkImageCache.shared.image(for: url) != nil { return }
         let (data, _) = try await URLSession.shared.data(from: url)
         if let image = UIImage(data: data) { ArtworkImageCache.shared.insert(image, for: url) }
     }
-    nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        Task { @MainActor in
-            guard let track = tasks.removeValue(forKey: downloadTask.taskIdentifier) else { return }
-            do {
-                let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appendingPathComponent("Downloads", isDirectory: true)
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                let target = directory.appendingPathComponent(track.id.replacingOccurrences(of: ":", with: "_")).appendingPathExtension("audio")
-                if FileManager.default.fileExists(atPath: target.path) { try FileManager.default.removeItem(at: target) }
-                try FileManager.default.moveItem(at: location, to: target)
-                offlineTracks.removeAll { $0.id == track.id }; offlineTracks.append(track); progress[track.id] = nil
-            } catch { progress[track.id] = nil }
+
+    // MARK: - Persist bytes
+
+    private func persist(_ source: URL, for track: Track) async throws {
+        try FileManager.default.createDirectory(at: downloadsDirectory, withIntermediateDirectories: true)
+        let target = fileURL(for: track)
+        if FileManager.default.fileExists(atPath: target.path) {
+            try FileManager.default.removeItem(at: target)
+        }
+
+        if source.isFileURL {
+            // Amazon CENC path already decrypted to a local clear file during resolve.
+            progress[track.id] = 0.95
+            try FileManager.default.copyItem(at: source, to: target)
+            progress[track.id] = 1
+            return
+        }
+
+        let staged = try await downloadRemote(source, track: track)
+        try Task.checkCancellation()
+        if FileManager.default.fileExists(atPath: target.path) {
+            try FileManager.default.removeItem(at: target)
+        }
+        try FileManager.default.moveItem(at: staged, to: target)
+        progress[track.id] = 1
+    }
+
+    private func downloadRemote(_ url: URL, track: Track) async throws -> URL {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<URL, Error>) in
+            let task = session.downloadTask(with: url)
+            trackByTaskID[task.taskIdentifier] = track
+            finishers[task.taskIdentifier] = cont
+            progress[track.id] = max(progress[track.id] ?? 0, 0.01)
+            task.resume()
         }
     }
-    nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
-        Task { @MainActor in guard let track = tasks[downloadTask.taskIdentifier], totalBytesExpectedToWrite > 0 else { return }; progress[track.id] = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite) }
+
+    private func remember(_ track: Track) {
+        offlineTracks.removeAll { $0.id == track.id }
+        offlineTracks.insert(track, at: 0)
+        persistCatalog()
+    }
+
+    private func loadCatalog() {
+        guard let data = UserDefaults.standard.data(forKey: catalogKey),
+              let decoded = try? decoder.decode([Track].self, from: data) else { return }
+        offlineTracks = decoded
+    }
+
+    private func persistCatalog() {
+        if let data = try? encoder.encode(offlineTracks) {
+            UserDefaults.standard.set(data, forKey: catalogKey)
+        }
+    }
+
+    private func pruneMissingFiles() {
+        offlineTracks.removeAll { !FileManager.default.fileExists(atPath: fileURL(for: $0).path) }
+        persistCatalog()
+    }
+
+    // MARK: - URLSessionDownloadDelegate
+
+    /// Copy off the ephemeral download location *before* returning — Apple deletes
+    /// that file as soon as this method returns.
+    nonisolated func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {
+        let taskID = downloadTask.taskIdentifier
+        let staging = FileManager.default.temporaryDirectory
+            .appendingPathComponent("monochrome-dl-\(taskID)-\(UUID().uuidString)")
+            .appendingPathExtension("audio")
+        do {
+            if FileManager.default.fileExists(atPath: staging.path) {
+                try FileManager.default.removeItem(at: staging)
+            }
+            try FileManager.default.copyItem(at: location, to: staging)
+            Task { @MainActor in
+                self.trackByTaskID[taskID] = nil
+                if let cont = self.finishers.removeValue(forKey: taskID) {
+                    cont.resume(returning: staging)
+                }
+            }
+        } catch {
+            Task { @MainActor in
+                self.trackByTaskID[taskID] = nil
+                if let cont = self.finishers.removeValue(forKey: taskID) {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    nonisolated func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        let taskID = downloadTask.taskIdentifier
+        let fraction: Double?
+        if totalBytesExpectedToWrite > 0 {
+            fraction = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
+        } else {
+            fraction = nil
+        }
+        Task { @MainActor in
+            guard let track = self.trackByTaskID[taskID] else { return }
+            if let fraction {
+                self.progress[track.id] = max(0.01, min(0.99, fraction))
+            }
+        }
+    }
+
+    nonisolated func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let error else { return }
+        let taskID = task.taskIdentifier
+        Task { @MainActor in
+            self.trackByTaskID[taskID] = nil
+            if let cont = self.finishers.removeValue(forKey: taskID) {
+                cont.resume(throwing: error)
+            }
+        }
     }
 }
 

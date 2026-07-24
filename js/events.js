@@ -7,6 +7,7 @@ import {
     positionMenu,
     getShareUrl,
     escapeHtml,
+    isPodcastTrack,
 } from './utils.js';
 import {
     lastFMStorage,
@@ -455,10 +456,19 @@ export async function initializePlayerEvents(player, audioPlayer, scrobbler, ui)
             }
             player.updateMediaSessionPlaybackState();
             player.updateMediaSessionPositionState();
+            void player.savePodcastProgress(true);
         });
 
         element.addEventListener('ended', () => {
             if (player.activeElement !== element) return;
+            if (isPodcastTrack(player.currentTrack)) {
+                void db.clearPodcastProgress(player.currentTrack.id);
+                window.dispatchEvent(
+                    new CustomEvent('podcast-progress-changed', {
+                        detail: { id: player.currentTrack.id, cleared: true },
+                    })
+                );
+            }
             const elapsedPlayTime = listeningTracker.getSessionSignals().accumulatedPlayTime || 0;
             const trackDur = listeningTracker.getSessionSignals().trackDuration || 0;
             listeningTracker.onTrackEnd();
@@ -482,6 +492,7 @@ export async function initializePlayerEvents(player, audioPlayer, scrobbler, ui)
                 currentTimeEl.textContent = formatTime(currentTime);
 
                 listeningTracker.onTimeUpdate(currentTime, duration);
+                void player.savePodcastProgress(false);
 
                 if (currentTime >= 10 && player.currentTrack && player.currentTrack.id !== historyLoggedTrackId) {
                     historyLoggedTrackId = player.currentTrack.id;
@@ -865,6 +876,7 @@ function initializeSmoothSliders(player) {
             if (!isNaN(activeEl.duration)) {
                 activeEl.currentTime = lastSeekPosition * activeEl.duration;
                 player.updateMediaSessionPositionState();
+                void player.savePodcastProgress(true);
                 if (wasPlaying) activeEl.play();
             }
             isSeeking = false;
@@ -881,6 +893,7 @@ function initializeSmoothSliders(player) {
             if (!isNaN(activeEl.duration)) {
                 activeEl.currentTime = lastSeekPosition * activeEl.duration;
                 player.updateMediaSessionPositionState();
+                void player.savePodcastProgress(true);
                 if (wasPlaying) activeEl.play();
             }
             isSeeking = false;
@@ -1509,6 +1522,10 @@ export async function handleTrackAction(
             }
         }
     } else if (action === 'add-to-playlist') {
+        if (isPodcastTrack(item)) {
+            showNotification('Podcasts cannot be added to playlists');
+            return;
+        }
         const modal = document.getElementById('playlist-select-modal');
         const list = document.getElementById('playlist-select-list');
         const cancelBtn = document.getElementById('playlist-select-cancel');
@@ -1964,6 +1981,19 @@ async function updateContextMenuLikeState(contextMenu, contextTrack) {
             if (!partyManager.currentParty) {
                 item.style.display = 'none';
             }
+        }
+
+        // Podcasts: searchable/playable, never playlist-eligible
+        if (item.dataset.action === 'add-to-playlist' && isPodcastTrack(contextTrack)) {
+            item.style.display = 'none';
+        }
+        if (
+            isPodcastTrack(contextTrack) &&
+            ['start-mix', 'start-infinite-radio', 'go-to-album', 'go-to-artist', 'request-song', 'track-info'].includes(
+                item.dataset.action
+            )
+        ) {
+            item.style.display = 'none';
         }
 
         // Update labels for Like/Save
@@ -2492,7 +2522,14 @@ export function initializeTrackInteractions(player, api, mainContent, contextMen
                         clearSelection();
                         break;
                     case 'add-to-playlist':
-                        await showMultiSelectPlaylistModal(selectedTracks);
+                        {
+                            const playlistable = selectedTracks.filter((t) => !isPodcastTrack(t));
+                            if (playlistable.length === 0) {
+                                showNotification('Podcasts cannot be added to playlists');
+                            } else {
+                                await showMultiSelectPlaylistModal(playlistable);
+                            }
+                        }
                         clearSelection();
                         break;
                     case 'download':

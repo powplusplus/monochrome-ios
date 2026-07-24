@@ -114,18 +114,23 @@ final class MusicService {
     }
 
     func resolveStream(for track: Track, quality: PlaybackQuality = .stored) async throws -> StreamResponse {
+        // Podcasts play the enclosure URL directly — never run music providers.
+        if track.isPodcast, let url = track.streamURL {
+            return StreamResponse(url: url, provider: .podcast, quality: "PODCAST", replayGain: nil, peak: nil,
+                                  mediaDuration: track.duration > 0 ? track.duration : nil)
+        }
         // Catalog payloads often include a webpage `url` (e.g. tidal.com/track/…) that
         // was historically mapped into streamURL. Only short-circuit for real media.
         if let url = track.streamURL, Self.isDirectMediaURL(url) {
             return StreamResponse(url: url, provider: track.provider, quality: quality.rawValue, replayGain: nil, peak: nil)
         }
 
-        // Match upstream Monochrome `getStreamUrl` (js/api.js):
-        // Amazon Music (Turnstile JWT) → Deezer. TIDAL is catalog-only — never play PREVIEW.
+        // Match web Monochrome `getStreamUrl` (js/api.js):
+        // Amazon Music first → Lucida-Qobuz → Deezer. TIDAL is catalog-only.
         //
         // Enrichment used to run unconditionally in front of Amazon, but Amazon
         // matches on title/artist/album/duration and never reads the ISRC — only
-        // Deezer needs it. Search cards routinely omit the ISRC, so every play
+        // Lucida/Deezer need it. Search cards routinely omit the ISRC, so every play
         // paid for an `/info/` fan-out across the whole instance pool (1.2s hedge
         // per host, 12s ceiling) before Amazon was even asked. With the pool
         // currently answering `Upstream API error`, that was a flat multi-second
@@ -137,11 +142,17 @@ final class MusicService {
             return try await resolveAmazonStream(for: enriched, quality: quality)
         } catch {
             amazonError = error
-            // Fall through to Deezer like web when Amazon is rate-limited / unavailable.
+            // Fall through to Lucida, then Deezer, when Amazon cannot resolve.
         }
-        // Deezer keys off the ISRC, so pay for the lookup here instead.
+        // Lucida + Deezer key off the ISRC, so pay for the lookup here instead.
         if enriched.isrc?.isEmpty != false {
             enriched = await enrichTrackMetadata(enriched)
+        }
+        var lucidaError: Error?
+        do {
+            return try await resolveLucidaStream(for: enriched, quality: quality)
+        } catch {
+            lucidaError = error
         }
         do {
             return try await resolveDeezerStream(for: enriched, quality: quality)
@@ -149,16 +160,17 @@ final class MusicService {
             let amazonDetail = (amazonError as? LocalizedError)?.errorDescription
                 ?? amazonError?.localizedDescription
                 ?? "Amazon Music unavailable"
-            // Report both legs. Reporting only Amazon's made a dead Deezer pool
-            // look like an Amazon auth bug.
+            let lucidaDetail = (lucidaError as? LocalizedError)?.errorDescription
+                ?? lucidaError?.localizedDescription
+                ?? "Lucida unavailable"
             let deezerDetail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             if enriched.isrc?.isEmpty == false {
                 throw ServiceError.unavailable(
-                    "Could not resolve stream URL from Amazon Music or Deezer. Amazon: \(amazonDetail) Deezer: \(deezerDetail)"
+                    "Could not resolve stream URL from Amazon Music, Lucida, or Deezer. Amazon: \(amazonDetail) Lucida: \(lucidaDetail) Deezer: \(deezerDetail)"
                 )
             }
             throw ServiceError.unavailable(
-                "Could not resolve stream URL: \(amazonDetail). Track has no ISRC for Deezer lookup."
+                "Could not resolve stream URL: \(amazonDetail). Track has no ISRC for Lucida/Deezer lookup."
             )
         }
     }
@@ -361,6 +373,70 @@ final class MusicService {
         let kHz = sampleRate.doubleValue / 1000
         let rate = kHz == 44.1 ? "44.1" : String(Int(kHz.rounded()))
         return "\(bitDepth.intValue)/\(rate)"
+    }
+
+    /// Qobuz-via-Lucida (web `/qobuz-lucida/*`). Resolve is cheap; first play of an
+    /// uncached track pays the rip cost inside `/play`. Used only when Amazon
+    /// cannot resolve a stream URL.
+    private func resolveLucidaStream(for track: Track, quality: PlaybackQuality) async throws -> StreamResponse {
+        guard PlaybackSourceSettings.lucidaEnabled else {
+            throw ServiceError.unavailable("Lucida fallback disabled")
+        }
+        guard let isrc = track.isrc?.trimmingCharacters(in: .whitespacesAndNewlines), !isrc.isEmpty else {
+            throw ServiceError.unavailable("Lucida lookup needs ISRC")
+        }
+        let base = PlaybackSourceSettings.lucidaBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let downscale: String = {
+            switch quality {
+            case .low, .high: return "mp3"
+            case .lossless, .hiResLossless: return "original"
+            }
+        }()
+        var components = URLComponents(string: base + "/qobuz-lucida/resolve")
+        components?.queryItems = [
+            URLQueryItem(name: "q", value: isrc),
+            URLQueryItem(name: "quality", value: downscale),
+        ]
+        guard let url = components?.url else {
+            throw ServiceError.unavailable("Invalid Lucida resolve URL")
+        }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
+        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+        applyMonochromeOrigin(to: &request)
+        let (data, response) = try await session.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let detail = Self.providerErrorDetail(in: data) ?? "HTTP \(http.statusCode)"
+            throw ServiceError.unavailable("Lucida resolve failed: \(detail)")
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (object["success"] as? Bool) == true,
+              let playPath = object["url"] as? String, !playPath.isEmpty else {
+            throw ServiceError.unavailable("Lucida returned no stream URL")
+        }
+        let playURL: URL
+        if playPath.hasPrefix("http://") || playPath.hasPrefix("https://") {
+            guard let absolute = URL(string: playPath) else {
+                throw ServiceError.unavailable("Lucida returned an invalid stream URL")
+            }
+            playURL = absolute
+        } else {
+            guard let absolute = URL(string: playPath, relativeTo: URL(string: base + "/"))?.absoluteURL else {
+                throw ServiceError.unavailable("Lucida returned an invalid stream URL")
+            }
+            playURL = absolute
+        }
+        let qualityToken = downscale == "mp3" ? quality.rawValue : PlaybackQuality.lossless.rawValue
+        return StreamResponse(
+            url: playURL,
+            provider: .qobuz,
+            quality: qualityToken,
+            replayGain: nil,
+            peak: nil,
+            isPreview: false,
+            previewReason: nil,
+            mediaDuration: track.duration > 0 ? track.duration : nil,
+            qualityDetail: downscale == "original" ? "16/44.1" : nil
+        )
     }
 
     private func resolveDeezerStream(for track: Track, quality: PlaybackQuality) async throws -> StreamResponse {

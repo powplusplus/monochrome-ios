@@ -217,7 +217,10 @@ struct SearchView: View {
     @State private var errorText: String?
 
     private var trimmedQuery: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
-    private var hasResults: Bool { !(results.tracks.isEmpty && results.albums.isEmpty && results.artists.isEmpty && results.playlists.isEmpty) }
+    private var hasResults: Bool {
+        !(results.tracks.isEmpty && results.albums.isEmpty && results.artists.isEmpty
+            && results.playlists.isEmpty && results.podcasts.isEmpty)
+    }
 
     var body: some View {
         NavigationView {
@@ -226,7 +229,7 @@ struct SearchView: View {
                     VStack(spacing: 14) {
                         Image(systemName: "sparkle.magnifyingglass").font(.system(size: 42)).foregroundColor(.secondary)
                         Text("Search Monochrome").font(.title2.bold())
-                        Text("Find tracks, albums, artists, and playlists.").foregroundColor(.secondary)
+                        Text("Find tracks, albums, artists, playlists, and podcasts.").foregroundColor(.secondary)
                     }.multilineTextAlignment(.center).padding()
                 } else if hasResults {
                     List {
@@ -234,6 +237,15 @@ struct SearchView: View {
                         if !results.albums.isEmpty { Section("Albums") { ForEach(results.albums) { album in NavigationLink(destination: AlbumDetailView(albumID: album.id, initial: album)) { AlbumListRow(album: album) } } } }
                         if !results.artists.isEmpty { Section("Artists") { ForEach(results.artists) { artist in Label(artist.name, systemImage: "person.crop.circle") } } }
                         if !results.playlists.isEmpty { Section("Playlists") { ForEach(results.playlists) { playlist in Label(playlist.title, systemImage: "music.note.list") } } }
+                        if !results.podcasts.isEmpty {
+                            Section("Podcasts") {
+                                ForEach(results.podcasts) { podcast in
+                                    NavigationLink(destination: PodcastDetailView(podcastID: podcast.id, initial: podcast)) {
+                                        PodcastListRow(podcast: podcast)
+                                    }
+                                }
+                            }
+                        }
                     }.listStyle(.insetGrouped)
                 } else if searching || !didSearch {
                     ProgressView("Searching…")
@@ -247,12 +259,12 @@ struct SearchView: View {
                     VStack(spacing: 8) {
                         Image(systemName: "magnifyingglass").font(.title).foregroundColor(.secondary)
                         Text("No Results").font(.headline)
-                        Text("Try a different artist, album, song, or playlist.").font(.subheadline).foregroundColor(.secondary)
+                        Text("Try a different artist, album, song, playlist, or podcast.").font(.subheadline).foregroundColor(.secondary)
                     }.frame(maxWidth: .infinity).padding(.vertical, 40)
                 }
             }
             .navigationTitle("Search")
-            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Artists, albums, songs")
+            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Artists, albums, songs, podcasts")
             .onChange(of: query) { value in
                 if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     results = SearchResults()
@@ -273,17 +285,35 @@ struct SearchView: View {
         let requestedQuery = trimmedQuery
         guard !requestedQuery.isEmpty else { return }
         searching = true
-        do {
-            let response = try await MusicService.shared.search(requestedQuery)
-            guard requestedQuery == trimmedQuery else { return }
-            results = response
+
+        async let musicTask: Result<SearchResults, Error> = {
+            do { return .success(try await MusicService.shared.search(requestedQuery)) }
+            catch { return .failure(error) }
+        }()
+        async let podcastsTask: [Podcast] = {
+            (try? await PodcastsService.shared.search(query: requestedQuery)) ?? []
+        }()
+
+        let music = await musicTask
+        let podcasts = await podcastsTask
+        guard requestedQuery == trimmedQuery else { return }
+
+        var response = SearchResults()
+        switch music {
+        case .success(let value):
+            response = value
             errorText = nil
-            didSearch = true
-        } catch {
-            guard requestedQuery == trimmedQuery else { return }
+        case .failure(let error):
             errorText = error.localizedDescription
-            didSearch = true
         }
+        response.podcasts = podcasts
+
+        let empty = response.tracks.isEmpty && response.albums.isEmpty && response.artists.isEmpty
+            && response.playlists.isEmpty && response.podcasts.isEmpty
+        if !empty { errorText = nil }
+
+        results = response
+        didSearch = true
         if requestedQuery == trimmedQuery { searching = false }
     }
 }
@@ -299,7 +329,7 @@ struct LibraryView: View {
                 Section {
                     NavigationLink(destination: TrackCollectionView(title: "Liked Songs", tracks: library.favorites, creator: "You", usesLikedArtwork: true)) { LibraryDestination(icon: "heart.fill", color: .pink, title: "Liked Songs", count: library.favorites.count) }
                     NavigationLink(destination: TrackCollectionView(title: "Recently Played", tracks: library.history, creator: "You")) { LibraryDestination(icon: "clock.fill", color: .purple, title: "Recently Played", count: library.history.count) }
-                    NavigationLink(destination: DownloadsView()) { LibraryDestination(icon: "arrow.down.circle.fill", color: .blue, title: "Downloads", count: nil) }
+                    NavigationLink(destination: PodcastsBrowseView()) { LibraryDestination(icon: "podcast", color: .orange, title: "Podcasts", count: nil) }
                 }
                 Section("Playlists") {
                     ForEach(library.playlists) { playlist in
@@ -331,6 +361,7 @@ struct SettingsView: View {
     @AppStorage("native.amazonEnabled") private var amazonEnabled = true
     @AppStorage("native.amazonApiBaseURL") private var amazonApiBaseURL = "https://amz.geeked.wtf"
     @AppStorage("native.amazonBypassToken") private var amazonBypassToken = ""
+    @AppStorage("native.lucidaEnabled") private var lucidaEnabled = true
     @AppStorage("native.deezerEnabled") private var deezerEnabled = true
     @AppStorage("native.deezerApiBaseURL") private var deezerApiBaseURL = "https://dzr.tabs-vs-spaces.wtf"
 
@@ -351,7 +382,7 @@ struct SettingsView: View {
                     Toggle("Gapless transitions", isOn: $gapless)
                     Picker("Playback speed", selection: $playback.playbackRate) { Text("0.75×").tag(Float(0.75)); Text("1×").tag(Float(1)); Text("1.25×").tag(Float(1.25)); Text("1.5×").tag(Float(1.5)); Text("2×").tag(Float(2)) }
                 }
-                Section(header: Text("Sources"), footer: Text("Same as web Monochrome: Amazon (Cloudflare check on first play) → Deezer. TIDAL is catalog only — not used for full playback.")) {
+                Section(header: Text("Sources"), footer: Text("Amazon Music first. If Amazon cannot resolve a stream URL, Lucida (Qobuz) is tried next, then Deezer. TIDAL is catalog only.")) {
                     Toggle("Amazon Music", isOn: $amazonEnabled)
                     if amazonEnabled {
                         TextField("Amazon API base URL", text: $amazonApiBaseURL)
@@ -362,6 +393,7 @@ struct SettingsView: View {
                             .textInputAutocapitalization(.never)
                             .disableAutocorrection(true)
                     }
+                    Toggle("Lucida fallback", isOn: $lucidaEnabled)
                     Toggle("Deezer fallback", isOn: $deezerEnabled)
                     if deezerEnabled {
                         TextField("Deezer API base URL", text: $deezerApiBaseURL)
@@ -451,25 +483,215 @@ struct TrackRow: View {
     var index: Int? = nil
     @EnvironmentObject private var playback: PlaybackEngine
     @EnvironmentObject private var library: LibraryRepository
+    @EnvironmentObject private var downloads: DownloadManager
+    @ObservedObject private var podcastProgress = PodcastProgressStore.shared
+
+    private var resumeEntry: PodcastProgressStore.Entry? {
+        guard track.isPodcast else { return nil }
+        return podcastProgress.progress(for: track.id)
+    }
+
     var body: some View {
-        Button { playback.play(track, in: context) } label: {
-            HStack(spacing: 12) {
-                if let index { Text("\(index)").font(.callout.monospacedDigit()).foregroundColor(.secondary).frame(width: 26) }
-                else { ArtworkView(url: track.artworkURL).frame(width: 46, height: 46).clipShape(RoundedRectangle(cornerRadius: 6)) }
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(track.title).lineLimit(1).foregroundColor(.primary)
-                    HStack(spacing: 4) { if track.explicit { Text("E").font(.caption2.bold()).padding(.horizontal, 3).background(Color.secondary.opacity(0.25)).cornerRadius(2) }; Text(track.artist.name).lineLimit(1) }.font(.caption).foregroundColor(.secondary)
+        HStack(spacing: 12) {
+            Button { playback.play(track, in: context) } label: {
+                HStack(spacing: 12) {
+                    if let index { Text("\(index)").font(.callout.monospacedDigit()).foregroundColor(.secondary).frame(width: 26) }
+                    else { ArtworkView(url: track.artworkURL).frame(width: 46, height: 46).clipShape(RoundedRectangle(cornerRadius: 6)) }
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(track.title).lineLimit(1).foregroundColor(.primary)
+                        HStack(spacing: 4) {
+                            if track.explicit { Text("E").font(.caption2.bold()).padding(.horizontal, 3).background(Color.secondary.opacity(0.25)).cornerRadius(2) }
+                            Text(track.artist.name).lineLimit(1)
+                        }.font(.caption).foregroundColor(.secondary)
+                        if let entry = resumeEntry, entry.position >= 5 {
+                            PodcastResumeBar(position: entry.position, duration: entry.duration > 0 ? entry.duration : Int(track.duration))
+                        }
+                    }
+                    Spacer(minLength: 0)
+                if playback.currentTrack?.id == track.id {
+                    if playback.isPlaying {
+                        AudioReactiveBars(meter: playback.audioMeter)
+                            .foregroundStyle(.pink)
+                            .accessibilityLabel("Now playing")
+                    } else {
+                        Image(systemName: "pause.fill").foregroundColor(.pink)
+                    }
+                } else {
+                    Image(systemName: "ellipsis").foregroundColor(.secondary)
                 }
-                Spacer()
-                if playback.currentTrack?.id == track.id { Image(systemName: playback.isPlaying ? "waveform" : "pause.fill").foregroundColor(.pink) } else { Image(systemName: "ellipsis").foregroundColor(.secondary) }
-            }.contentShape(Rectangle()).padding(.vertical, 4)
-        }.buttonStyle(.plain)
+                }
+                .contentShape(Rectangle())
+                .padding(.vertical, 4)
+            }
+            .buttonStyle(.plain)
+
+            if !track.isPodcast, downloads.isDownloading(track) || downloads.isDownloaded(track) {
+                AppStoreDownloadButton(
+                    state: downloadState(for: track),
+                    size: 28,
+                    lineWidth: 2,
+                    squareSize: 7
+                ) {
+                    handleDownloadTap(for: track)
+                }
+            }
+        }
         .contextMenu {
             Button { playback.playNext(track) } label: { Label("Play Next", systemImage: "text.insert") }
             Button { playback.append(track) } label: { Label("Add to Queue", systemImage: "text.badge.plus") }
-            Button { library.toggleFavorite(track) } label: { Label(library.isFavorite(track) ? "Unlike" : "Like", systemImage: library.isFavorite(track) ? "heart.slash" : "heart") }
-            Button { Task { await DownloadManager.shared.download(track) } } label: { Label("Download", systemImage: "arrow.down.circle") }
-        }.accessibilityLabel("\(track.title), by \(track.artist.name)")
+            if !track.isPodcast {
+                Button { library.toggleFavorite(track) } label: { Label(library.isFavorite(track) ? "Unlike" : "Like", systemImage: library.isFavorite(track) ? "heart.slash" : "heart") }
+                if downloads.isDownloaded(track) {
+                    Button(role: .destructive) { downloads.removeDownload(track) } label: { Label("Remove Download", systemImage: "trash") }
+                } else if downloads.isDownloading(track) {
+                    Button { downloads.cancel(track) } label: { Label("Cancel Download", systemImage: "xmark.circle") }
+                } else {
+                    Button { Task { await downloads.download(track) } } label: { Label("Download", systemImage: "arrow.down.circle") }
+                }
+            }
+        }
+        .accessibilityLabel("\(track.title), by \(track.artist.name)")
+    }
+
+    private func downloadState(for track: Track) -> AppStoreDownloadButton.State {
+        if let fraction = downloads.progress[track.id] {
+            return .downloading(max(0.02, min(1, fraction)))
+        }
+        if downloads.isDownloaded(track) { return .downloaded }
+        return .idle
+    }
+
+    private func handleDownloadTap(for track: Track) {
+        if downloads.isDownloading(track) {
+            downloads.cancel(track)
+        } else if downloads.isDownloaded(track) {
+            return
+        } else {
+            Task { await downloads.download(track) }
+        }
+    }
+}
+
+struct PodcastResumeBar: View {
+    let position: Int
+    let duration: Int
+
+    private var fraction: Double {
+        guard duration > 0 else { return 0 }
+        return min(1, Double(position) / Double(duration))
+    }
+
+    private var label: String {
+        "Left off \(formatClock(position))"
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.secondary.opacity(0.25))
+                    Capsule().fill(Color.pink).frame(width: max(2, geo.size.width * fraction))
+                }
+            }
+            .frame(width: 72, height: 3)
+            Text(label).font(.caption2).foregroundColor(.secondary).lineLimit(1)
+        }
+    }
+
+    private func formatClock(_ seconds: Int) -> String {
+        let h = seconds / 3600
+        let m = (seconds % 3600) / 60
+        let s = seconds % 60
+        if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
+        return String(format: "%d:%02d", m, s)
+    }
+}
+
+/// App Store–style circular download control: ring + stop square while active.
+struct AppStoreDownloadButton: View {
+    enum State: Equatable {
+        case idle
+        case downloading(Double)
+        case downloaded
+    }
+
+    let state: State
+    var size: CGFloat = 48
+    var lineWidth: CGFloat = 2.5
+    var squareSize: CGFloat = 9
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                switch state {
+                case .idle:
+                    Image(systemName: "arrow.down")
+                        .font(.system(size: size * 0.38, weight: .semibold))
+                        .foregroundStyle(.primary)
+                case .downloading(let progress):
+                    Circle()
+                        .stroke(Color.primary.opacity(0.22), lineWidth: lineWidth)
+                    Circle()
+                        .trim(from: 0, to: max(0.02, min(1, progress)))
+                        .stroke(Color.primary, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                        .animation(.linear(duration: 0.15), value: progress)
+                    RoundedRectangle(cornerRadius: max(1.5, squareSize * 0.2), style: .continuous)
+                        .fill(Color.primary)
+                        .frame(width: squareSize, height: squareSize)
+                case .downloaded:
+                    Image(systemName: "checkmark")
+                        .font(.system(size: size * 0.36, weight: .bold))
+                        .foregroundStyle(.primary)
+                }
+            }
+            .frame(width: size, height: size)
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled({
+            if case .downloaded = state { return true }
+            return false
+        }())
+        .accessibilityLabel({
+            switch state {
+            case .idle: return "Download"
+            case .downloading: return "Cancel Download"
+            case .downloaded: return "Downloaded"
+            }
+        }())
+    }
+}
+
+/// Five-bar equalizer driven by live playback loudness. Organic phase offsets keep
+/// motion readable; meter level scales amplitude so quiet passages settle and peaks jump.
+private struct AudioReactiveBars: View {
+    @ObservedObject var meter: AudioMeterStore
+
+    private let barCount = 5
+    private let maxHeight: CGFloat = 16
+    private let minHeight: CGFloat = 2.5
+    private let barWidth: CGFloat = 2
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            // Idle floor while the tap attaches; loudness still owns the amplitude.
+            let energy = 0.08 + 0.92 * CGFloat(meter.level)
+            HStack(alignment: .center, spacing: 1.5) {
+                ForEach(0..<barCount, id: \.self) { index in
+                    let phase = Double(index) * 0.85
+                    let speed = 2.6 + Double(index) * 0.55
+                    let wobble = 0.35 + 0.65 * abs(sin(t * speed + phase))
+                    let height = minHeight + (maxHeight - minHeight) * energy * wobble
+                    Capsule()
+                        .frame(width: barWidth, height: height)
+                }
+            }
+            .frame(width: 18, height: maxHeight)
+        }
+        .accessibilityHidden(true)
     }
 }
 
@@ -966,29 +1188,43 @@ struct NowPlayingView: View {
                 .foregroundColor(.secondary)
             }
 
-            if let resolvedQuality {
-                HStack(spacing: 5) {
-                    if resolvedQuality == .lossless || resolvedQuality == .hiResLossless {
-                        QualityWaveMark()
-                            .frame(width: 24, height: 13)
-                    }
-                    Text(resolvedQuality.title.uppercased())
-                    if let detail = playback.currentStreamQualityDetail {
-                        Text(detail)
+            if playback.currentStreamProvider == .qobuz || resolvedQuality != nil {
+                VStack(spacing: 4) {
+                    if playback.currentStreamProvider == .qobuz {
+                        Text("Lucida")
+                            .font(.caption2.weight(.semibold))
+                            .kerning(0.6)
                             .foregroundStyle(.secondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                            .accessibilityLabel("Streaming via Lucida")
+                    }
+                    if let resolvedQuality {
+                        HStack(spacing: 5) {
+                            if resolvedQuality == .lossless || resolvedQuality == .hiResLossless {
+                                QualityWaveMark()
+                                    .frame(width: 24, height: 13)
+                            }
+                            Text(resolvedQuality.title.uppercased())
+                            if let detail = playback.currentStreamQualityDetail {
+                                Text(detail)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel(
+                            playback.currentStreamQualityDetail.map { "\(resolvedQuality.title), \($0) bit depth over kilohertz" }
+                                ?? resolvedQuality.title
+                        )
+                        .font(.caption2.weight(.semibold))
+                        .kerning(1.0)
+                        .foregroundStyle(resolvedQuality == .hiResLossless ? Color(red: 0.85, green: 0.68, blue: 0.24) : .secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(.thinMaterial, in: Capsule())
                     }
                 }
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel(
-                    playback.currentStreamQualityDetail.map { "\(resolvedQuality.title), \($0) bit depth over kilohertz" }
-                        ?? resolvedQuality.title
-                )
-                .font(.caption2.weight(.semibold))
-                .kerning(1.0)
-                .foregroundStyle(resolvedQuality == .hiResLossless ? Color(red: 0.85, green: 0.68, blue: 0.24) : .secondary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 4)
-                .background(.thinMaterial, in: Capsule())
             }
 
             HStack {
@@ -1345,7 +1581,7 @@ struct TrackCollectionView: View {
     var usesLikedArtwork = false
 
     @EnvironmentObject private var playback: PlaybackEngine
-    @State private var downloadingAll = false
+    @EnvironmentObject private var downloads: DownloadManager
 
     private var artworkURL: URL? {
         if let cover, let url = Artwork.url(cover, size: 640) { return url }
@@ -1357,6 +1593,16 @@ struct TrackCollectionView: View {
         let count = tracks.count
         let noun = count == 1 ? "song" : "songs"
         return "\(owner) · \(count) \(noun)"
+    }
+
+    private var collectionDownloadState: AppStoreDownloadButton.State {
+        if let fraction = downloads.collectionProgress(for: tracks) {
+            return .downloading(fraction)
+        }
+        if downloads.allDownloaded(tracks) {
+            return .downloaded
+        }
+        return .idle
     }
 
     var body: some View {
@@ -1487,40 +1733,26 @@ struct TrackCollectionView: View {
             .disabled(tracks.isEmpty)
             .accessibilityLabel("Play")
 
-            Button {
-                guard !tracks.isEmpty, !downloadingAll else { return }
-                downloadingAll = true
-                Task {
-                    for track in tracks {
-                        await DownloadManager.shared.download(track)
-                    }
-                    downloadingAll = false
-                }
-            } label: {
-                Group {
-                    if downloadingAll {
-                        ProgressView().tint(.white)
-                    } else {
-                        Image(systemName: "arrow.down")
-                            .font(.body.weight(.semibold))
-                            .foregroundStyle(.primary)
-                    }
-                }
-                .frame(width: 48, height: 48)
-                .contentShape(Circle())
+            AppStoreDownloadButton(state: collectionDownloadState) {
+                handleCollectionDownloadTap()
             }
-            .buttonStyle(.plain)
             .liquidGlass(cornerRadius: 24, strong: false)
-            .accessibilityLabel("Download")
-            .disabled(tracks.isEmpty || downloadingAll)
+            .disabled(tracks.isEmpty)
         }
         .padding(.horizontal, 28)
     }
-}
 
-struct DownloadsView: View {
-    @EnvironmentObject private var downloads: DownloadManager
-    var body: some View { List { ForEach(downloads.offlineTracks) { TrackRow(track: $0) }; ForEach(Array(downloads.progress.keys), id: \.self) { id in VStack(alignment: .leading) { Text(id); ProgressView(value: downloads.progress[id] ?? 0) } } }.navigationTitle("Downloads").overlay { if downloads.offlineTracks.isEmpty && downloads.progress.isEmpty { Text("Downloaded music is available offline.").foregroundColor(.secondary).multilineTextAlignment(.center).padding() } } }
+    private func handleCollectionDownloadTap() {
+        guard !tracks.isEmpty else { return }
+        switch collectionDownloadState {
+        case .idle:
+            Task { await downloads.downloadAll(tracks) }
+        case .downloading:
+            downloads.cancelAll(in: tracks)
+        case .downloaded:
+            break
+        }
+    }
 }
 
 struct SignInView: View {
@@ -1539,9 +1771,9 @@ struct ProviderSettingsView: View {
     var body: some View {
         Form {
             Picker("Preferred catalog provider", selection: $provider) {
-                ForEach(Provider.allCases) { Text($0.title).tag($0.rawValue) }
+                ForEach(Provider.musicCases) { Text($0.title).tag($0.rawValue) }
             }
-            Text("Catalog search uses TIDAL metadata. Full audio resolves Amazon → Deezer like web Monochrome — not TIDAL stream manifests.")
+            Text("Catalog search uses TIDAL metadata. Full audio resolves Amazon → Lucida → Deezer like web Monochrome — not TIDAL stream manifests. Podcasts play enclosure audio directly.")
                 .font(.footnote)
                 .foregroundColor(.secondary)
         }
@@ -1589,7 +1821,13 @@ struct TrackContextMenu: View {
     let track: Track
     @EnvironmentObject private var playback: PlaybackEngine
     @EnvironmentObject private var library: LibraryRepository
-    var body: some View { Button { playback.play(track) } label: { Label("Play", systemImage: "play.fill") }; Button { playback.playNext(track) } label: { Label("Play Next", systemImage: "text.insert") }; Button { library.toggleFavorite(track) } label: { Label("Like", systemImage: "heart") } }
+    var body: some View {
+        Button { playback.play(track) } label: { Label("Play", systemImage: "play.fill") }
+        Button { playback.playNext(track) } label: { Label("Play Next", systemImage: "text.insert") }
+        if !track.isPodcast {
+            Button { library.toggleFavorite(track) } label: { Label("Like", systemImage: "heart") }
+        }
+    }
 }
 
 /// Square media card shared by album and standalone-song entries (e.g. Editor's
@@ -1624,6 +1862,164 @@ struct AlbumCard: View {
 struct AlbumListRow: View {
     let album: Album
     var body: some View { HStack { ArtworkView(url: album.artworkURL).frame(width: 54, height: 54).clipShape(RoundedRectangle(cornerRadius: 7)); VStack(alignment: .leading) { Text(album.title); Text(album.artist.name).font(.caption).foregroundColor(.secondary) } } }
+}
+
+struct PodcastListRow: View {
+    let podcast: Podcast
+    var body: some View {
+        HStack(spacing: 12) {
+            ArtworkView(url: podcast.artworkURL).frame(width: 54, height: 54).clipShape(RoundedRectangle(cornerRadius: 7))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(podcast.title).lineLimit(1)
+                if let publisher = podcast.publisher, !publisher.isEmpty {
+                    Text(publisher).font(.caption).foregroundColor(.secondary).lineLimit(1)
+                }
+                if let count = podcast.episodeCount, count > 0 {
+                    Text("\(count) episodes").font(.caption2).foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+}
+
+struct PodcastsBrowseView: View {
+    @State private var podcasts: [Podcast] = []
+    @State private var loading = true
+    @State private var errorText: String?
+
+    var body: some View {
+        Group {
+            if loading && podcasts.isEmpty {
+                ProgressView("Loading podcasts…")
+            } else if let errorText, podcasts.isEmpty {
+                VStack(spacing: 8) {
+                    Text("Couldn’t load podcasts").font(.headline)
+                    Text(errorText).font(.subheadline).foregroundColor(.secondary).multilineTextAlignment(.center)
+                }.padding()
+            } else {
+                List {
+                    Section("Trending") {
+                        ForEach(podcasts) { podcast in
+                            NavigationLink(destination: PodcastDetailView(podcastID: podcast.id, initial: podcast)) {
+                                PodcastListRow(podcast: podcast)
+                            }
+                        }
+                    }
+                }
+                .listStyle(.insetGrouped)
+            }
+        }
+        .navigationTitle("Podcasts")
+        .task { await load() }
+        .refreshable { await load() }
+    }
+
+    private func load() async {
+        loading = true
+        do {
+            podcasts = try await PodcastsService.shared.trending()
+            errorText = nil
+        } catch {
+            errorText = error.localizedDescription
+        }
+        loading = false
+    }
+}
+
+struct PodcastDetailView: View {
+    let podcastID: String
+    var initial: Podcast?
+    @EnvironmentObject private var playback: PlaybackEngine
+    @ObservedObject private var podcastProgress = PodcastProgressStore.shared
+    @State private var podcast: Podcast?
+    @State private var episodes: [Track] = []
+    @State private var loading = true
+    @State private var errorText: String?
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                if let podcast = podcast ?? initial {
+                    VStack(spacing: 14) {
+                        ArtworkView(url: podcast.artworkURL)
+                            .aspectRatio(1, contentMode: .fit)
+                            .frame(maxWidth: 220)
+                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .shadow(radius: 16, y: 8)
+                        Text(podcast.title).font(.title2.bold()).multilineTextAlignment(.center)
+                        if let publisher = podcast.publisher, !publisher.isEmpty {
+                            Text(publisher).foregroundColor(.pink)
+                        }
+                        if let description = podcast.description, !description.isEmpty {
+                            Text(description).font(.footnote).foregroundColor(.secondary).lineLimit(4).multilineTextAlignment(.center)
+                        }
+                        HStack {
+                            Button { playResume() } label: {
+                                Label(resumeLabel, systemImage: "play.fill").frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent).tint(.pink)
+                            .disabled(episodes.isEmpty)
+                        }
+                        .padding(.horizontal)
+                    }
+                    .padding()
+                }
+
+                if loading { ProgressView().padding() }
+                else if let errorText {
+                    Text(errorText).foregroundColor(.secondary).padding()
+                } else {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(episodes.enumerated()), id: \.element.id) { index, track in
+                            TrackRow(track: track, context: episodes, index: index + 1)
+                            Divider().padding(.leading, 48)
+                        }
+                    }
+                }
+            }
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        .task { await load() }
+    }
+
+    private var resumeLabel: String {
+        if resumeStartIndex() != nil { return "Resume" }
+        return "Play Latest"
+    }
+
+    private func resumeStartIndex() -> Int? {
+        var bestIndex: Int?
+        var bestUpdated: TimeInterval = 0
+        for (index, track) in episodes.enumerated() {
+            guard let entry = podcastProgress.progress(for: track.id), entry.position >= 5 else { continue }
+            if entry.updatedAt > bestUpdated {
+                bestUpdated = entry.updatedAt
+                bestIndex = index
+            }
+        }
+        return bestIndex
+    }
+
+    private func playResume() {
+        guard !episodes.isEmpty else { return }
+        let index = resumeStartIndex() ?? 0
+        playback.play(episodes[index], in: episodes)
+    }
+
+    private func load() async {
+        loading = true
+        do {
+            async let detail = PodcastsService.shared.podcast(id: podcastID)
+            async let eps = PodcastsService.shared.episodes(podcastID: podcastID)
+            if let fetched = try await detail { podcast = fetched }
+            else if podcast == nil { podcast = initial }
+            episodes = try await eps
+            errorText = nil
+        } catch {
+            errorText = error.localizedDescription
+        }
+        loading = false
+    }
 }
 
 struct ArtworkView: View {

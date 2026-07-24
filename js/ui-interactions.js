@@ -6,6 +6,7 @@ import {
     escapeHtml,
     createQualityBadgeHTML,
     positionMenu,
+    isPodcastTrack,
 } from './utils.js';
 import { sidePanelManager } from './side-panel.js';
 import { downloadQualitySettings, contentBlockingSettings } from './storage.js';
@@ -235,7 +236,12 @@ export function initializeUIInteractions(player, api, ui) {
 
                         try {
                             let addedCount = 0;
+                            let skippedPodcasts = 0;
                             for (const track of currentQueue) {
+                                if (isPodcastTrack(track)) {
+                                    skippedPodcasts++;
+                                    continue;
+                                }
                                 await db.addTrackToPlaylist(playlistId, track);
                                 addedCount++;
                             }
@@ -243,7 +249,13 @@ export function initializeUIInteractions(player, api, ui) {
                             const updatedPlaylist = await db.getPlaylist(playlistId);
                             await syncManager.syncUserPlaylist(updatedPlaylist, 'update');
 
-                            showNotification(`Added ${addedCount} tracks to playlist: ${playlistName}`);
+                            if (addedCount > 0) {
+                                showNotification(`Added ${addedCount} tracks to playlist: ${playlistName}`);
+                            } else if (skippedPodcasts > 0) {
+                                showNotification('Podcasts cannot be added to playlists');
+                            } else {
+                                showNotification('No tracks added');
+                            }
                         } catch (error) {
                             console.error('Failed to add tracks to playlist:', error);
                             showNotification('Failed to add tracks to playlist');
