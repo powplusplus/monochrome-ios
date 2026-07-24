@@ -213,6 +213,7 @@ export class PodcastsAPI {
             explicit: feed.explicit || false,
             episodeCount: feed.episodeCount || 0,
             newestItemPublishTime: feed.newestItemPubdate || feed.newestItemPublishTime || null,
+            medium: feed.medium || '',
         };
     }
 

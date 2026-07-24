@@ -10,6 +10,8 @@ import {
     deriveTrackQuality,
     isPodcastTrack,
     isRealVideoTrack,
+    isVideoEnclosure,
+    prefersPodcastVideo,
 } from './utils.js';
 import {
     queueManager,
@@ -31,6 +33,11 @@ import { SVG_CLOCK, SVG_ATMOS, SVG_TRIANGLE_ALERT, SVG_PLAY, SVG_PAUSE } from '.
 import { UIRenderer } from './ui.js';
 import { MediaSession } from '@capgo/capacitor-media-session';
 import { VideoControlsController } from './video-controls.js';
+import {
+    destroyYoutubePlayerMount,
+    mountYoutubePlayer,
+    resolvePodcastYoutubeId,
+} from './youtube-podcast.js';
 
 export class Player {
     static #instance = null;
@@ -72,6 +79,10 @@ export class Player {
 
         this.hls = null;
         this.videoControls = new VideoControlsController(this);
+        this._youtubeMode = false;
+        this.youtubePlayer = null;
+        this._youtubeShim = null;
+        this._youtubePoll = null;
         // Sleep timer properties
         this.sleepTimer = null;
         this.sleepTimerEndTime = null;
@@ -1116,6 +1127,7 @@ export class Player {
         }
         this.videoControls?.clearExternalSubtitles();
         this.videoControls?.resetQualityUi();
+        this.stopYoutubePlayback();
 
         // Retain the initialized Shaka player if we are remaining on the same HTMLMediaElement
         if (this.shakaInitialized && this.shakaPlayer) {
@@ -1247,7 +1259,7 @@ export class Player {
 
             if (isPodcast) {
                 streamUrl = track.enclosureUrl;
-                if (!streamUrl) {
+                if (!streamUrl && !prefersPodcastVideo(track)) {
                     console.warn(`Podcast episode ${trackTitle} audio URL is missing. Skipping.`);
                     track.isUnavailable = true;
                     await this.playNext();
@@ -1255,6 +1267,32 @@ export class Player {
                 }
 
                 if (this.playbackSequence !== currentSequence) return;
+
+                // WAN Show etc.: RSS is audio-only, video lives on YouTube (feed.link).
+                const wantsYoutube =
+                    prefersPodcastVideo(track) &&
+                    !isVideoEnclosure(track.enclosureType, track.enclosureUrl);
+
+                if (wantsYoutube) {
+                    try {
+                        const ytId = await resolvePodcastYoutubeId(track);
+                        if (this.playbackSequence !== currentSequence) return;
+                        if (ytId) {
+                            track.youtubeId = ytId;
+                            await this.startYoutubePodcastPlayback(track, startTime, currentSequence);
+                            return;
+                        }
+                    } catch (e) {
+                        console.warn('YouTube podcast resolve failed, falling back to audio enclosure', e);
+                    }
+                }
+
+                if (!streamUrl) {
+                    console.warn(`Podcast episode ${trackTitle} media URL is missing. Skipping.`);
+                    track.isUnavailable = true;
+                    await this.playNext();
+                    return;
+                }
 
                 if (isVideoTrack && UIRenderer.instance) {
                     const isInFullscreen =
@@ -2036,7 +2074,232 @@ export class Player {
     }
 
     get activeElement() {
+        if (this._youtubeMode && this._youtubeShim) return this._youtubeShim;
         return isRealVideoTrack(this.currentTrack) ? this.video : this.audio;
+    }
+
+    stopYoutubePlayback() {
+        this._youtubeMode = false;
+        if (this._youtubePoll) {
+            clearInterval(this._youtubePoll);
+            this._youtubePoll = null;
+        }
+        try {
+            this.youtubePlayer?.stopVideo?.();
+            this.youtubePlayer?.destroy?.();
+        } catch {
+            // ignore
+        }
+        this.youtubePlayer = null;
+        this._youtubeShim = null;
+        destroyYoutubePlayerMount();
+        const ytHost = document.getElementById('youtube-podcast-player');
+        if (ytHost) ytHost.style.display = 'none';
+    }
+
+    _buildYoutubeShim() {
+        const self = this;
+        return {
+            tagName: 'VIDEO',
+            get src() {
+                return self.currentTrack?.youtubeId
+                    ? `https://www.youtube.com/watch?v=${self.currentTrack.youtubeId}`
+                    : '';
+            },
+            get currentSrc() {
+                return this.src;
+            },
+            get currentTime() {
+                try {
+                    return self.youtubePlayer?.getCurrentTime?.() || 0;
+                } catch {
+                    return 0;
+                }
+            },
+            set currentTime(value) {
+                try {
+                    self.youtubePlayer?.seekTo(value, true);
+                } catch {
+                    // ignore
+                }
+            },
+            get duration() {
+                try {
+                    const d = self.youtubePlayer?.getDuration?.();
+                    if (d && d > 0) return d;
+                } catch {
+                    // ignore
+                }
+                return self.currentTrack?.duration || 0;
+            },
+            get paused() {
+                try {
+                    // YT.PlayerState.PLAYING === 1
+                    return self.youtubePlayer?.getPlayerState?.() !== 1;
+                } catch {
+                    return true;
+                }
+            },
+            get ended() {
+                try {
+                    return self.youtubePlayer?.getPlayerState?.() === 0;
+                } catch {
+                    return false;
+                }
+            },
+            get volume() {
+                try {
+                    return (self.youtubePlayer?.getVolume?.() || 100) / 100;
+                } catch {
+                    return self.userVolume;
+                }
+            },
+            set volume(v) {
+                try {
+                    self.youtubePlayer?.setVolume?.(Math.round(v * 100));
+                } catch {
+                    // ignore
+                }
+            },
+            get muted() {
+                try {
+                    return !!self.youtubePlayer?.isMuted?.();
+                } catch {
+                    return false;
+                }
+            },
+            set muted(v) {
+                try {
+                    if (v) self.youtubePlayer?.mute?.();
+                    else self.youtubePlayer?.unMute?.();
+                } catch {
+                    // ignore
+                }
+            },
+            play: async () => {
+                self.youtubePlayer?.playVideo?.();
+            },
+            pause: () => {
+                self.youtubePlayer?.pauseVideo?.();
+            },
+            load: () => {},
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            dispatchEvent: () => false,
+        };
+    }
+
+    _updateYoutubeProgressUi() {
+        const el = this._youtubeShim;
+        if (!el) return;
+        const current = el.currentTime || 0;
+        const duration = el.duration || 0;
+        const pct = duration > 0 ? (current / duration) * 100 : 0;
+
+        const fill = document.getElementById('progress-fill');
+        const currentTimeEl = document.getElementById('current-time');
+        const totalDurationEl = document.getElementById('total-duration');
+        if (fill) fill.style.width = `${pct}%`;
+        if (currentTimeEl) currentTimeEl.textContent = formatTime(current);
+        if (totalDurationEl) totalDurationEl.textContent = formatTime(duration);
+
+        const fsFill = document.getElementById('fs-progress-fill');
+        const fsCurrent = document.getElementById('fs-current-time');
+        const fsTotal = document.getElementById('fs-total-duration');
+        if (fsFill) fsFill.style.width = `${pct}%`;
+        if (fsCurrent) fsCurrent.textContent = formatTime(current);
+        if (fsTotal) fsTotal.textContent = formatTime(duration);
+
+        const playPauseBtn = document.getElementById('play-pause-btn');
+        const fsPlayPause = document.getElementById('fs-play-pause-btn');
+        const icon = el.paused ? SVG_PLAY(20) : SVG_PAUSE(20);
+        if (playPauseBtn) playPauseBtn.innerHTML = icon;
+        if (fsPlayPause) fsPlayPause.innerHTML = el.paused ? SVG_PLAY(32) : SVG_PAUSE(32);
+    }
+
+    _startYoutubeProgressPoll() {
+        if (this._youtubePoll) clearInterval(this._youtubePoll);
+        this._youtubePoll = setInterval(() => {
+            if (!this._youtubeMode) return;
+            this._updateYoutubeProgressUi();
+            void this.savePodcastProgress(false);
+            this.updateMediaSessionPositionState();
+        }, 500);
+    }
+
+    async startYoutubePodcastPlayback(track, startTime = 0, currentSequence = this.playbackSequence) {
+        // Tear down native media so only YouTube audio plays.
+        if (this.audio) {
+            this.audio.pause();
+            this.audio.removeAttribute('src');
+            this.audio.load();
+        }
+        if (this.video) {
+            this.video.pause();
+            this.video.removeAttribute('src');
+            this.video.load();
+            this.video.style.display = 'none';
+        }
+
+        if (UIRenderer.instance) {
+            const isInFullscreen =
+                document.getElementById('fullscreen-cover-overlay')?.style.display === 'flex';
+            if (!isInFullscreen) {
+                UIRenderer.instance.showFullscreenCover(
+                    track,
+                    this.getNextTrack(),
+                    UIRenderer.instance.lyricsManager,
+                    this.video
+                );
+            }
+            document.getElementById('fullscreen-cover-overlay')?.classList.add('is-video-mode');
+            const videoContainer = document.getElementById('fullscreen-video-container');
+            if (videoContainer) videoContainer.style.display = 'flex';
+            const image = document.getElementById('fullscreen-cover-image');
+            if (image) image.style.display = 'none';
+        }
+
+        this._youtubeShim = this._buildYoutubeShim();
+        this._youtubeMode = true;
+
+        const YTPlayer = await mountYoutubePlayer({
+            videoId: track.youtubeId,
+            startSeconds: startTime,
+            onStateChange: (e) => {
+                if (this.playbackSequence !== currentSequence) return;
+                this._updateYoutubeProgressUi();
+                // 0 = ended
+                if (e?.data === 0) {
+                    void db.clearPodcastProgress(track.id);
+                    window.dispatchEvent(
+                        new CustomEvent('podcast-progress-changed', {
+                            detail: { id: track.id, cleared: true },
+                        })
+                    );
+                    void this.playNext();
+                }
+                this.updateMediaSessionPlaybackState();
+            },
+        });
+
+        if (this.playbackSequence !== currentSequence) {
+            try {
+                YTPlayer.destroy?.();
+            } catch {
+                // ignore
+            }
+            return;
+        }
+
+        this.youtubePlayer = YTPlayer;
+        const host = document.getElementById('youtube-podcast-player');
+        if (host) host.style.display = 'block';
+
+        this._startYoutubeProgressPoll();
+        this._updateYoutubeProgressUi();
+        this.updateMediaSession(track);
+        this.updateMediaSessionPlaybackState();
+        document.title = `${getTrackTitle(track)} • ${getTrackArtists(track)}`;
     }
 
     async handlePlayPause() {

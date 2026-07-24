@@ -71,7 +71,32 @@ describe('utils.js', () => {
                     enclosureUrl: 'https://cdn.example/ep.mp3',
                 })
             ).toBe(false);
+            expect(utils.isRealVideoTrack({ youtubeId: 'L8-5CSAaViY', isPodcast: true })).toBe(true);
             expect(utils.isRealVideoTrack({ id: 'tidal_1' })).toBe(false);
+        });
+
+        test('prefersPodcastVideo detects YouTube-backed / WAN Show audio RSS', () => {
+            expect(
+                utils.prefersPodcastVideo({
+                    isPodcast: true,
+                    enclosureType: 'audio/mpeg',
+                    podcastFeedLink: 'https://www.youtube.com/user/LinusTechTips',
+                })
+            ).toBe(true);
+            expect(
+                utils.prefersPodcastVideo({
+                    isPodcast: true,
+                    title: 'Something - WAN Show July 17, 2026',
+                    enclosureType: 'audio/mpeg',
+                })
+            ).toBe(true);
+            expect(
+                utils.prefersPodcastVideo({
+                    isPodcast: true,
+                    enclosureType: 'audio/mpeg',
+                    title: 'Normal audio podcast',
+                })
+            ).toBe(false);
         });
     });
 

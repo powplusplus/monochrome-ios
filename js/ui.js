@@ -18,6 +18,7 @@ import {
     createModal,
     isPodcastTrack,
     isRealVideoTrack,
+    prefersPodcastVideo,
     enclosureFormatToken,
     debounce,
 } from './utils.js';
@@ -510,7 +511,7 @@ export class UIRenderer {
         const isUnavailable = track.isUnavailable;
         const isBlocked = contentBlockingSettings?.shouldHideTrack(track);
         const isPodcast = isPodcastTrack(track);
-        const isVideo = isRealVideoTrack(track);
+        const isVideo = isRealVideoTrack(track) || prefersPodcastVideo(track);
         const isMusicVideo = track.type === 'video' && !isPodcast;
 
         let trackImageHTML = '';
@@ -7332,9 +7333,15 @@ export class UIRenderer {
                 }
 
                 this.podcastState.podcastTitle = podcastResult.title;
+                this.podcastState.podcastMeta = {
+                    link: podcastResult.link || '',
+                    medium: podcastResult.medium || '',
+                    feedUrl: podcastResult.feedUrl || '',
+                };
                 const _playBtn = document.getElementById('play-podcasts-btn');
             } else {
                 this.podcastState.podcastTitle = 'Unknown Podcast';
+                this.podcastState.podcastMeta = {};
             }
 
             document.title = `${podcastResult?.title || 'Podcast'} - Monochrome Music`;
@@ -7363,7 +7370,10 @@ export class UIRenderer {
             this.podcastState.hasMore = false;
 
             const podcastTitle = this.podcastState.podcastTitle || 'Unknown Podcast';
-            const tracks = result.items.map((ep) => this.transformPodcastEpisodeToTrack(ep, podcastTitle));
+            const podcastMeta = this.podcastState.podcastMeta || {};
+            const tracks = result.items.map((ep) =>
+                this.transformPodcastEpisodeToTrack(ep, podcastTitle, podcastMeta)
+            );
             await this.attachPodcastProgress(tracks);
             await this.renderListWithTracks(episodesContainer, tracks, true);
 
@@ -7371,7 +7381,7 @@ export class UIRenderer {
             if (playBtn && result.items.length > 0) {
                 playBtn.onclick = async () => {
                     const tracksToPlay = this.podcastState.episodes.map((ep) =>
-                        this.transformPodcastEpisodeToTrack(ep, podcastTitle)
+                        this.transformPodcastEpisodeToTrack(ep, podcastTitle, podcastMeta)
                     );
                     await this.attachPodcastProgress(tracksToPlay);
                     // Resume most recently listened unfinished episode, else start first
@@ -7480,7 +7490,7 @@ export class UIRenderer {
         });
     }
 
-    transformPodcastEpisodeToTrack(episode, podcastTitle = 'Unknown Podcast') {
+    transformPodcastEpisodeToTrack(episode, podcastTitle = 'Unknown Podcast', podcastMeta = {}) {
         return {
             id: `podcast_${episode.id}`,
             title: episode.title,
@@ -7506,7 +7516,10 @@ export class UIRenderer {
             episodeType: episode.episodeType,
             season: episode.season,
             description: episode.description,
+            link: episode.link || '',
             podcastEpisode: episode,
+            podcastFeedLink: podcastMeta.link || podcastMeta.feedLink || '',
+            podcastMedium: podcastMeta.medium || '',
         };
     }
 }

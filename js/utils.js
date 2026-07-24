@@ -99,15 +99,29 @@ export const enclosureFormatToken = (enclosureType, enclosureUrl) => {
 };
 
 /**
- * Real video playback (music video or video podcast) — drives `#video-player`
- * / fullscreen video mode. Distinct from decorative `videoCover` artwork.
+ * Real video playback (music video, video enclosure podcast, or resolved YouTube).
+ * Distinct from decorative `videoCover` artwork.
  */
 export const isRealVideoTrack = (track) => {
     if (!track) return false;
     if (track.type === 'video') return true;
+    if (track.youtubeId) return true;
     if (isPodcastTrack(track) && isVideoEnclosure(track.enclosureType, track.enclosureUrl)) {
         return true;
     }
+    return false;
+};
+
+/** Podcast likely has video even when RSS enclosure is audio (YouTube-backed / medium=video). */
+export const prefersPodcastVideo = (track) => {
+    if (!isPodcastTrack(track)) return false;
+    if (isRealVideoTrack(track)) return true;
+    if (String(track.podcastMedium || '').toLowerCase() === 'video') return true;
+    const link = track.podcastFeedLink || track.feedLink || '';
+    if (/youtube\.com|youtu\.be/i.test(String(link))) return true;
+    // Common video shows published as audio RSS (e.g. WAN Show).
+    const blob = `${track.title || ''} ${track.artist?.name || ''} ${track.album?.title || ''}`;
+    if (/\bwan show\b/i.test(blob)) return true;
     return false;
 };
 
