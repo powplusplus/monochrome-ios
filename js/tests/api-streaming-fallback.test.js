@@ -175,6 +175,104 @@ describe('LosslessAPI stream source fallback', () => {
     });
 });
 
+describe('LosslessAPI Lucida hedge', () => {
+    let api;
+
+    const deferred = () => {
+        let settle;
+        const promise = new Promise((resolve) => {
+            settle = resolve;
+        });
+        return { promise, settle };
+    };
+
+    beforeEach(() => {
+        api = new LosslessAPI({});
+        api.streamCache?.clear?.();
+        // Fire the hedge immediately instead of sitting through the real 2s window.
+        api.amazonHedgeDelayMs = 0;
+        amazonMusicSettings.isEnabled.mockReturnValue(true);
+        lucidaQobuzSettings.isEnabled.mockReturnValue(true);
+        vi.spyOn(api, 'getTrackMetadata').mockResolvedValue({ id: '123', isrc: 'TESTISRC123' });
+        vi.spyOn(api, 'getDeezerStreamUrl').mockResolvedValue(null);
+        vi.spyOn(api, 'getTrack').mockResolvedValue(null);
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    test('starts Lucida while a stalling Amazon is still in flight', async () => {
+        const amazon = deferred();
+        vi.spyOn(api, 'getAmazonMusicStreamUrl').mockReturnValue(amazon.promise);
+        vi.spyOn(api, 'getQobuzStreamUrl').mockResolvedValue({
+            url: 'https://audio.example/qobuz.flac',
+            provider: 'qobuz',
+        });
+
+        const pending = api.getStreamUrl('123', 'LOSSLESS');
+        await new Promise((r) => setTimeout(r, 5));
+
+        // Lucida is already resolving even though Amazon has not answered yet.
+        expect(api.getQobuzStreamUrl).toHaveBeenCalled();
+
+        amazon.settle(null);
+        const result = await pending;
+        expect(result.provider).toBe('qobuz');
+    });
+
+    test('Amazon still wins when it resolves after the hedge started', async () => {
+        const amazon = deferred();
+        vi.spyOn(api, 'getAmazonMusicStreamUrl').mockReturnValue(amazon.promise);
+        vi.spyOn(api, 'getQobuzStreamUrl').mockResolvedValue({
+            url: 'https://audio.example/qobuz.flac',
+            provider: 'qobuz',
+        });
+
+        const pending = api.getStreamUrl('123', 'LOSSLESS');
+        await new Promise((r) => setTimeout(r, 5));
+        expect(api.getQobuzStreamUrl).toHaveBeenCalled();
+
+        amazon.settle({
+            url: 'blob:https://app.example/amazon',
+            provider: 'amazon',
+            playbackType: 'direct',
+            quality: 'HD_44',
+        });
+
+        const result = await pending;
+        expect(result.provider).toBe('amazon');
+    });
+
+    test('leaves Lucida alone when Amazon answers inside the hedge window', async () => {
+        api.amazonHedgeDelayMs = 50_000;
+        vi.spyOn(api, 'getAmazonMusicStreamUrl').mockResolvedValue({
+            url: 'blob:https://app.example/amazon',
+            provider: 'amazon',
+            playbackType: 'direct',
+            quality: 'HD_44',
+        });
+        vi.spyOn(api, 'getQobuzStreamUrl').mockResolvedValue(null);
+
+        const result = await api.getStreamUrl('123', 'LOSSLESS');
+
+        expect(result.provider).toBe('amazon');
+        expect(api.getQobuzStreamUrl).not.toHaveBeenCalled();
+    });
+
+    test('runs the Lucida leg only once when hedge and fallback both want it', async () => {
+        vi.spyOn(api, 'getAmazonMusicStreamUrl').mockResolvedValue(null);
+        vi.spyOn(api, 'getQobuzStreamUrl').mockResolvedValue({
+            url: 'https://audio.example/qobuz.flac',
+            provider: 'qobuz',
+        });
+
+        await api.getStreamUrl('123', 'LOSSLESS');
+
+        expect(api.getQobuzStreamUrl).toHaveBeenCalledTimes(1);
+    });
+});
+
 describe('LosslessAPI Lucida without ISRC', () => {
     let api;
 

@@ -782,12 +782,14 @@ export async function initializeSettings(scrobbler, player, api, ui) {
                 localStorage.removeItem('community-theme');
                 const styleEl = document.getElementById('custom-theme-style');
                 if (styleEl) styleEl.remove();
-                themeManager.setTheme('system');
+                themeManager.setTheme(themeManager.DEFAULT_THEME);
 
                 const themePicker = document.getElementById('theme-picker');
                 if (themePicker) {
                     themePicker.querySelectorAll('.theme-option').forEach((opt) => opt.classList.remove('active'));
-                    themePicker.querySelector('[data-theme="system"]')?.classList.add('active');
+                    themePicker
+                        .querySelector(`[data-theme="${themeManager.DEFAULT_THEME}"]`)
+                        ?.classList.add('active');
                 }
                 document.getElementById('custom-theme-editor').classList.remove('show');
             }

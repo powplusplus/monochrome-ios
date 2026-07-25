@@ -13,8 +13,34 @@
 
 import { CORS, json, searchQobuzId } from './_lucida.js';
 
+// Lucida rate-limits its search page, and the same ISRC is looked up again on every
+// replay, queue advance, and prefetch. Remember the mapping so a throttled search
+// cannot turn an already-resolved track into "No Qobuz track found".
+const SEARCH_TTL_SECONDS = 86400;
+
+const searchCacheKey = (origin, query) => new Request(`${origin}/qobuz-lucida/_search/${encodeURIComponent(query)}`);
+
+async function cachedSearch(origin, query) {
+    if (typeof caches === 'undefined' || !caches.default) return null;
+    const hit = await caches.default.match(searchCacheKey(origin, query)).catch(() => null);
+    if (!hit) return null;
+    const body = await hit.json().catch(() => null);
+    return body && body.qobuzId ? String(body.qobuzId) : null;
+}
+
+async function rememberSearch(origin, query, qobuzId) {
+    if (typeof caches === 'undefined' || !caches.default) return;
+    const value = new Response(JSON.stringify({ qobuzId }), {
+        headers: {
+            'content-type': 'application/json;charset=UTF-8',
+            'cache-control': `public, max-age=${SEARCH_TTL_SECONDS}`,
+        },
+    });
+    await caches.default.put(searchCacheKey(origin, query), value).catch(() => {});
+}
+
 export async function onRequest(context) {
-    const { request } = context;
+    const { request, waitUntil } = context;
     if (request.method === 'OPTIONS') return new Response(null, { headers: CORS });
 
     const url = new URL(request.url);
@@ -24,7 +50,15 @@ export async function onRequest(context) {
 
     try {
         if (!qobuzId || !/^\d+$/.test(qobuzId)) {
-            qobuzId = await searchQobuzId(q || '');
+            qobuzId = q ? await cachedSearch(url.origin, q) : null;
+            if (!qobuzId) {
+                qobuzId = await searchQobuzId(q || '');
+                if (qobuzId && q) {
+                    const remember = rememberSearch(url.origin, q, qobuzId);
+                    if (waitUntil) waitUntil(remember);
+                    else await remember;
+                }
+            }
         }
         if (!qobuzId) {
             return json({ success: false, error: 'No Qobuz track found for query' }, 404);

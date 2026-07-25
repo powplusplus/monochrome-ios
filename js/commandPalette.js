@@ -432,14 +432,6 @@ class CommandPalette {
             },
 
             {
-                id: 'theme-system',
-                group: 'Theme',
-                icon: 'monitor',
-                label: 'Theme: System',
-                keywords: ['theme', 'system', 'auto', 'default'],
-                action: () => this.setTheme('system'),
-            },
-            {
                 id: 'theme-black',
                 group: 'Theme',
                 icon: 'moon',
@@ -454,14 +446,6 @@ class CommandPalette {
                 label: 'Theme: Dark',
                 keywords: ['theme', 'dark'],
                 action: () => this.setTheme('dark'),
-            },
-            {
-                id: 'theme-white',
-                group: 'Theme',
-                icon: 'sun',
-                label: 'Theme: White',
-                keywords: ['theme', 'white', 'light'],
-                action: () => this.setTheme('white'),
             },
             {
                 id: 'theme-ocean',
@@ -510,14 +494,6 @@ class CommandPalette {
                 label: 'Theme: Frapp\u00e9',
                 keywords: ['theme', 'frappe', 'catppuccin'],
                 action: () => this.setTheme('frappe'),
-            },
-            {
-                id: 'theme-latte',
-                group: 'Theme',
-                icon: 'palette',
-                label: 'Theme: Latte',
-                keywords: ['theme', 'latte', 'catppuccin', 'light'],
-                action: () => this.setTheme('latte'),
             },
             {
                 id: 'theme-store',

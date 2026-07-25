@@ -1196,8 +1196,6 @@ export class UIRenderer {
         if (!color) return;
 
         const root = document.documentElement;
-        const theme = root.getAttribute('data-theme');
-        const isLightMode = theme === 'white';
 
         let hex = color.replace('#', '');
         // Handle shorthand hex
@@ -1219,28 +1217,16 @@ export class UIRenderer {
         let brightness = (r * 299 + g * 587 + b * 114) / 1000;
         let fullscreenBrightness = brightness;
 
-        if (isLightMode) {
-            // In light mode, the background is white.
-            // We need the color (used for text/highlights) to be dark enough.
-            // If brightness is too high (> 150), darken it.
-            while (brightness > 150) {
-                r = Math.floor(r * 0.9);
-                g = Math.floor(g * 0.9);
-                b = Math.floor(b * 0.9);
-                brightness = (r * 299 + g * 587 + b * 114) / 1000;
-            }
-        } else {
-            // In dark mode, the background is dark.
-            // We need the color to be light enough.
-            // If brightness is too low (< 80), lighten it.
-            while (brightness < 80) {
-                r = Math.min(255, Math.max(r + 1, Math.floor(r * 1.15)));
-                g = Math.min(255, Math.max(g + 1, Math.floor(g * 1.15)));
-                b = Math.min(255, Math.max(b + 1, Math.floor(b * 1.15)));
-                brightness = (r * 299 + g * 587 + b * 114) / 1000;
-                // Break if we hit white or can't get brighter to avoid infinite loop
-                if (r >= 255 && g >= 255 && b >= 255) break;
-            }
+        // Every theme is dark, so the background is dark.
+        // We need the color to be light enough.
+        // If brightness is too low (< 80), lighten it.
+        while (brightness < 80) {
+            r = Math.min(255, Math.max(r + 1, Math.floor(r * 1.15)));
+            g = Math.min(255, Math.max(g + 1, Math.floor(g * 1.15)));
+            b = Math.min(255, Math.max(b + 1, Math.floor(b * 1.15)));
+            brightness = (r * 299 + g * 587 + b * 114) / 1000;
+            // Break if we hit white or can't get brighter to avoid infinite loop
+            if (r >= 255 && g >= 255 && b >= 255) break;
         }
 
         const adjustedColor = `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;

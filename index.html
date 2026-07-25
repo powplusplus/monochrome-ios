@@ -116,17 +116,14 @@
                     const stored = localStorage.getItem('monochrome-theme');
                     const css = localStorage.getItem('custom_theme_css');
                     const palette = localStorage.getItem('monochrome-custom-theme');
-                    // Default to 'system' when nothing is saved (matches themeManager.getTheme()).
-                    const theme = stored || 'system';
-
-                    // 'system' has no CSS block of its own, so resolve it to a real
-                    // palette here (before first paint). Without this the root renders
-                    // with no color variables, i.e. white — even in dark mode.
-                    if (theme === 'system') {
-                        const isDark =
-                            window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-                        document.documentElement.setAttribute('data-theme', isDark ? 'monochrome' : 'white');
-                        return;
+                    // The app is dark-only. 'system'/'white'/'latte'/'light' are retired
+                    // themes; migrate any saved value to the dark default so a light OS
+                    // preference can never leak in. Keep in sync with themeManager.
+                    const RETIRED = ['system', 'white', 'latte', 'light'];
+                    let theme = stored || 'monochrome';
+                    if (RETIRED.indexOf(theme) !== -1) {
+                        theme = 'monochrome';
+                        localStorage.setItem('monochrome-theme', theme);
                     }
 
                     document.documentElement.setAttribute('data-theme', theme);
@@ -3049,7 +3046,6 @@
                                     </div>
                                 </div>
                                 <div class="theme-picker" id="theme-picker">
-                                    <div class="theme-option" data-theme="system">System</div>
                                     <div
                                         class="theme-option apple-music-theme-option"
                                         data-theme="apple-music"
@@ -3059,7 +3055,6 @@
                                         Apple Music
                                     </div>
                                     <div class="theme-option" data-theme="monochrome">Black</div>
-                                    <div class="theme-option" data-theme="white">White</div>
                                     <div class="theme-option" data-theme="dark">Dark</div>
                                     <div class="theme-option" data-theme="ocean">Ocean</div>
                                     <div class="theme-option" data-theme="purple">Purple</div>
@@ -3067,7 +3062,6 @@
                                     <div class="theme-option" data-theme="mocha">Mocha</div>
                                     <div class="theme-option" data-theme="machiatto">Machiatto</div>
                                     <div class="theme-option" data-theme="frappe">Frappé</div>
-                                    <div class="theme-option" data-theme="latte">Latte</div>
                                     <div class="theme-option" data-theme="custom">Custom</div>
                                 </div>
                                 <div id="applied-community-theme-container" style="display: none; margin-top: 1rem">

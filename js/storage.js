@@ -328,8 +328,14 @@ export const themeManager = {
     STORAGE_KEY: 'monochrome-theme',
     CUSTOM_THEME_KEY: 'monochrome-custom-theme',
 
+    DEFAULT_THEME: 'monochrome',
+
+    // The app is dark-only. These themes (and the OS-following 'system' option)
+    // could render a light palette, so any stored value is migrated to the dark
+    // default. Keep in sync with the pre-paint boot script in index.html.
+    RETIRED_THEMES: ['system', 'white', 'latte', 'light'],
+
     defaultThemes: {
-        light: {},
         dark: {},
         monochrome: {},
         'apple-music': {},
@@ -339,26 +345,24 @@ export const themeManager = {
         mocha: {},
         macchiato: {},
         frappe: {},
-        latte: {},
     },
 
     getTheme() {
         try {
-            return localStorage.getItem(this.STORAGE_KEY) || 'system';
+            const stored = localStorage.getItem(this.STORAGE_KEY);
+            if (!stored || this.RETIRED_THEMES.includes(stored)) return this.DEFAULT_THEME;
+            return stored;
         } catch {
-            return 'system';
+            return this.DEFAULT_THEME;
         }
     },
 
     setTheme(theme) {
+        if (this.RETIRED_THEMES.includes(theme)) theme = this.DEFAULT_THEME;
+
         localStorage.setItem(this.STORAGE_KEY, theme);
 
-        if (theme === 'system') {
-            const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-            document.documentElement.setAttribute('data-theme', isDark ? 'monochrome' : 'white');
-        } else {
-            document.documentElement.setAttribute('data-theme', theme);
-        }
+        document.documentElement.setAttribute('data-theme', theme);
 
         if (theme !== 'custom') {
             const root = document.documentElement;
@@ -2712,15 +2716,6 @@ export const sidebarSectionSettings = {
         });
     },
 };
-
-// System theme listener
-if (typeof window !== 'undefined' && window.matchMedia) {
-    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
-        if (themeManager.getTheme() === 'system') {
-            document.documentElement.setAttribute('data-theme', e.matches ? 'monochrome' : 'white');
-        }
-    });
-}
 
 export const fontSettings = {
     STORAGE_KEY: 'monochrome-font-config-v2',

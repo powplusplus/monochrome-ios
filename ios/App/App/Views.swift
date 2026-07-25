@@ -356,7 +356,6 @@ struct SettingsView: View {
     @EnvironmentObject private var playback: PlaybackEngine
     @EnvironmentObject private var library: LibraryRepository
     @EnvironmentObject private var auth: AuthSession
-    @AppStorage("native.darkAppearance") private var darkAppearance = true
     @AppStorage("native.playbackQuality") private var playbackQuality = PlaybackQuality.lossless.rawValue
     @AppStorage("native.downloadQuality") private var downloadQuality = PlaybackQuality.hiResLossless.rawValue
     @AppStorage("native.gapless") private var gapless = true
@@ -374,7 +373,7 @@ struct SettingsView: View {
                     if auth.isSignedIn { Label("Signed in", systemImage: "checkmark.circle.fill").foregroundColor(.green); Button("Sign Out", role: .destructive) { auth.signOut() } }
                     else { NavigationLink("Sign in to Monochrome", destination: SignInView()) }
                 }
-                Section("Appearance") { Toggle("Dark appearance", isOn: $darkAppearance); Label("Uses your system text size", systemImage: "textformat.size") }
+                Section("Appearance") { Label("Always dark", systemImage: "moon.fill"); Label("Uses your system text size", systemImage: "textformat.size") }
                 Section("Audio") {
                     Picker("Streaming quality", selection: $playbackQuality) {
                         ForEach(PlaybackQuality.allCases) { quality in
@@ -418,7 +417,7 @@ struct SettingsView: View {
                     }
                 }
             }.navigationTitle("Settings")
-        }.navigationViewStyle(.stack).preferredColorScheme(darkAppearance ? .dark : nil)
+        }.navigationViewStyle(.stack).preferredColorScheme(.dark)
     }
 
     @ViewBuilder private var cloudSyncLabel: some View {
@@ -1252,6 +1251,10 @@ struct NowPlayingView: View {
             SyncedLyricsView(
                 lyrics: lyrics,
                 activeIndex: lyrics.activeIndex(at: playback.elapsed),
+                // Sampled per frame by the instrumental dots. Passed as a closure
+                // over the engine rather than as a value so the list keeps
+                // re-evaluating only when `activeIndex` moves.
+                elapsed: { [playback] in playback.preciseElapsed },
                 onSeek: { playback.seek(to: $0) }
             )
             .padding(.horizontal, 20)
@@ -1523,6 +1526,8 @@ struct NowPlayingView: View {
 struct SyncedLyricsView: View {
     let lyrics: SyncedLyrics
     let activeIndex: Int?
+    /// Exact transport position, read on demand. Only the instrumental dots use it.
+    var elapsed: () -> Double
     var onSeek: (Double) -> Void
 
     var body: some View {
@@ -1551,10 +1556,19 @@ struct SyncedLyricsView: View {
                 // which lands the target line in the wrong place and snaps.
                 // Lyrics are a bounded list, so building them all is cheaper.
                 VStack(alignment: .leading, spacing: 18) {
-                    ForEach(lyrics.lines) { line in
-                        LyricLineView(line: line, role: lineRole(for: line.id), onSeek: onSeek)
-                            .equatable()
-                            .id(line.id)
+                    ForEach(Array(lyrics.lines.enumerated()), id: \.element.id) { index, line in
+                        LyricLineView(
+                            line: line,
+                            // An instrumental gap runs until the next line starts.
+                            // A trailing one has no next line, so give it a nominal
+                            // window rather than a zero-length one.
+                            lineEnd: index + 1 < lyrics.lines.count ? lyrics.lines[index + 1].time : line.time + 10,
+                            role: lineRole(for: line.id),
+                            elapsed: elapsed,
+                            onSeek: onSeek
+                        )
+                        .equatable()
+                        .id(line.id)
                     }
                 }
                 // Enough slack for the scroll anchor to place the first and last
@@ -1592,11 +1606,14 @@ private enum LyricLineRole: Equatable { case recentPast, past, active, upcoming,
 /// or three rows whose role actually changed.
 private struct LyricLineView: View, Equatable {
     let line: LyricLine
+    /// Start of the following line — the end of this line's instrumental gap.
+    let lineEnd: Double
     let role: LyricLineRole
+    let elapsed: () -> Double
     let onSeek: (Double) -> Void
 
     static func == (lhs: LyricLineView, rhs: LyricLineView) -> Bool {
-        lhs.line == rhs.line && lhs.role == rhs.role
+        lhs.line == rhs.line && lhs.lineEnd == rhs.lineEnd && lhs.role == rhs.role
     }
 
     private var isInstrumentalGap: Bool { line.text == "..." }
@@ -1607,7 +1624,12 @@ private struct LyricLineView: View, Equatable {
         } label: {
             Group {
                 if isInstrumentalGap {
-                    InstrumentalDotsView(isActive: role == .active)
+                    InstrumentalDotsView(
+                        start: line.time,
+                        end: lineEnd,
+                        isActive: role == .active,
+                        elapsed: elapsed
+                    )
                 } else {
                     Text(line.text)
                 }
@@ -1658,39 +1680,94 @@ private struct LyricLineView: View, Equatable {
     }
 }
 
-/// Apple Music's karaoke view marks instrumental gaps with three dots that
-/// fade in and out in a rolling wave rather than a static "...". Only the
-/// active line animates — past/upcoming rows sit dim and still so the
-/// pulsing doesn't scatter across the whole lyric column.
+/// Apple Music's instrumental marker is a progress indicator, not a blinking
+/// "…": the three dots read out how much of the gap is left. The cluster
+/// breathes on a slow cycle timed so it bottoms out right as the vocal is about
+/// to return, each dot brightens as playback crosses its third of the gap and
+/// then stays lit, and the whole group pops and collapses over the last beat.
+/// The old rolling-wave fade was tied to wall-clock time, so it carried no
+/// information and never lined up with the music.
+///
+/// Every value is sampled from the transport rather than driven by a
+/// free-running animation, so a seek into the middle of a gap lands on the
+/// right fill and the right phase instead of starting over. Inactive gaps draw
+/// nothing, matching the web player, so the pulsing never scatters down the
+/// whole lyric column.
 private struct InstrumentalDotsView: View {
-    var isActive: Bool
+    let start: Double
+    let end: Double
+    let isActive: Bool
+    let elapsed: () -> Double
 
-    private let period: Double = 1.1
-    private let stagger: Double = 0.16
+    /// Half a breath: the cluster runs from `maxScale` to `minScale` over this,
+    /// then back. Matches the web player's 4 s `gap-loop`.
+    private static let breathHalfCycle: Double = 4
+    /// How long before the next line the exit pop starts.
+    private static let exitLead: Double = 0.6
+    private static let maxScale: Double = 1.12
+    private static let minScale: Double = 0.85
+    private static let popScale: Double = 1.2
+    /// The dots grow in over this once the gap becomes active.
+    private static let entryDuration: Double = 0.4
+
+    private var duration: Double { max(end - start, 0.1) }
 
     var body: some View {
-        TimelineView(.animation(paused: !isActive)) { timeline in
+        TimelineView(.animation(paused: !isActive)) { _ in
+            let t = min(max(elapsed(), start), end)
             HStack(spacing: 10) {
                 ForEach(0..<3, id: \.self) { index in
                     Circle()
                         .fill(Color.white)
                         .frame(width: 9, height: 9)
-                        .opacity(isActive ? opacity(at: timeline.date, dot: index) : 0.4)
+                        .opacity(dotOpacity(index: index, at: t))
                 }
             }
-            .frame(height: 26)
+            .scaleEffect(clusterScale(at: t), anchor: .leading)
+            .opacity(isActive ? 1 : 0)
+            .frame(height: 26, alignment: .leading)
         }
     }
 
-    /// Triangle wave per dot, staggered so the fade sweeps left to right
-    /// like a rolling "…" rather than all three dots blinking in unison.
-    private func opacity(at date: Date, dot index: Int) -> Double {
-        let t = date.timeIntervalSinceReferenceDate - Double(index) * stagger
-        var phase = t.truncatingRemainder(dividingBy: period) / period
-        if phase < 0 { phase += 1 }
-        let wave = phase < 0.5 ? phase * 2 : (1 - phase) * 2
-        return 0.25 + wave * 0.75
+    /// Each dot owns a third of the gap and fills across it, easing out so the
+    /// last of the brightening is gentle. Once filled it stays lit, leaving the
+    /// cluster as a coarse three-step progress bar through the instrumental.
+    private func dotOpacity(index: Int, at t: Double) -> Double {
+        let third = duration / 3
+        let fill = clamp01((t - (start + Double(index) * third)) / third)
+        return 0.3 + 0.7 * easeOut(fill)
     }
+
+    private func clusterScale(at t: Double) -> Double {
+        guard isActive else { return 0 }
+        let remaining = end - t
+        guard remaining > Self.exitLead else { return exitScale(remaining: remaining) }
+        return breathScale(at: t) * easeOut(clamp01((t - start) / Self.entryDuration))
+    }
+
+    /// Cosine breath pinned so its trough lands exactly where the exit pop takes
+    /// over — the pop then springs out of the bottom of a breath rather than
+    /// from wherever a free-running loop happened to be.
+    private func breathScale(at t: Double) -> Double {
+        let mid = (Self.maxScale + Self.minScale) / 2
+        let amplitude = (Self.maxScale - Self.minScale) / 2
+        let trough = start + duration - Self.exitLead
+        return mid - amplitude * cos(.pi * (t - trough) / Self.breathHalfCycle)
+    }
+
+    /// Overshoot to `popScale` in the first third of the lead-out, then collapse
+    /// to nothing as the next line lands.
+    private func exitScale(remaining: Double) -> Double {
+        let progress = clamp01(1 - remaining / Self.exitLead)
+        if progress < 0.35 {
+            return Self.minScale + (Self.popScale - Self.minScale) * easeOut(progress / 0.35)
+        }
+        return Self.popScale * (1 - easeOut((progress - 0.35) / 0.65))
+    }
+
+    private func clamp01(_ value: Double) -> Double { min(max(value, 0), 1) }
+
+    private func easeOut(_ value: Double) -> Double { 1 - pow(1 - clamp01(value), 2) }
 }
 
 /// Mimics Apple's Lossless/Hi-Res badge: concentric arcs radiating from a

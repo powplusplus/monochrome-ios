@@ -1,9 +1,10 @@
 :root {
-    color-scheme: light dark;
+    /* Dark-only app: never let the UA paint light form controls/scrollbars. */
+    color-scheme: dark;
 
-    /* Fallback palette: applied whenever data-theme is missing or unknown
-       (e.g. 'system' before JS resolves it). Prevents unstyled white-on-white
-       rendering in dark mode. Real themes below override every one of these. */
+    /* Fallback palette: applied whenever data-theme is missing or unknown.
+       Prevents unstyled white-on-white rendering. Real themes below override
+       every one of these. */
     --background: #0a0a0a;
     --foreground: #f5f5f5;
     --card: #141414;
@@ -454,51 +455,6 @@
     --highlight-rgb: 186, 187, 241;
     --active-highlight: #babbf1;
     --explicit-badge: #e5c890;
-}
-
-:root[data-theme='latte'] {
-    color-scheme: light;
-
-    --background: #eff1f5;
-    --foreground: #4c4f69;
-    --card: #ccd0da;
-    --card-foreground: #7c7f93;
-    --primary: #1e66f5;
-    --primary-foreground: #ccd0da;
-    --secondary: #bcc0cc;
-    --secondary-foreground: #9ca0b0;
-    --muted: #ccd0da;
-    --muted-foreground: #6c6f85;
-    --border: #ccd0da;
-    --input: #bcc0cc;
-    --ring: #fdfdfd;
-    --highlight: #1e66f5;
-    --highlight-rgb: 114, 135, 253;
-    --active-highlight: #7287fd;
-    --explicit-badge: #df8e1d;
-}
-
-:root[data-theme='white'] {
-    color-scheme: light;
-
-    --background: #f5f5f5;
-    --foreground: #1a1a1a;
-    --card: #e8e8e8;
-    --card-foreground: #1a1a1a;
-    --primary: #1a1a1a;
-    --primary-foreground: #f5f5f5;
-    --secondary: #ddd;
-    --secondary-foreground: #2a2a2a;
-    --muted: #e0e0e0;
-    --muted-foreground: #555;
-    --border: #ccc;
-    --input: #e0e0e0;
-    --ring: #1a1a1a;
-    --highlight: #1a1a1a;
-    --highlight-rgb: 26, 26, 26;
-    --active-highlight: var(--highlight);
-    --explicit-badge: #1a1a1a;
-    --cover-filter: blur(50px) brightness(1.6) opacity(0.35);
 }
 
 *,
@@ -1252,11 +1208,6 @@ ul {
     opacity: 1;
 }
 
-/* Light mode adjustments */
-:root[data-theme='white'] #page-background {
-    mask-image: linear-gradient(to bottom, rgb(0, 0, 0, 1) 0%, rgb(0, 0, 0, 0) 100%);
-}
-
 .now-playing-bar {
     grid-area: player;
     padding: var(--spacing-sm) var(--spacing-md);
@@ -1283,11 +1234,6 @@ ul {
     transition: all var(--transition-normal) var(--ease-out-back);
     height: var(--player-bar-height-desktop);
     animation: slide-up var(--transition-slow) var(--ease-out-back);
-}
-
-:root[data-theme='white'] .now-playing-bar {
-    background-color: color-mix(in srgb, var(--card) 80%, transparent);
-    border-color: rgb(0, 0, 0, 0.1);
 }
 
 .sidebar-logo {

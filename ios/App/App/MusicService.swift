@@ -6,6 +6,10 @@ final class MusicService {
     private let session: URLSession
     private let cache = NSCache<NSString, NSData>()
 
+    /// How long Amazon gets on its own before the Lucida leg starts alongside it.
+    /// Mirrors `AMAZON_HEDGE_DELAY_MS` in web `js/api.js`.
+    static let lucidaHedgeDelayNanos: UInt64 = 2_000_000_000
+
     init(session: URLSession = .shared) { self.session = session }
 
     /// Amazon/Deezer provider instances gate their media APIs behind a
@@ -150,10 +154,31 @@ final class MusicService {
         // URL AVPlayer rejected (signed CDN expire, CENC decode fail) and continue
         // down the chain — without that, Amazon "success" permanently blocked Lucida.
         var enriched = track.duration > 0 ? track : await enrichTrackMetadata(track)
+
+        // The legs are hedged, not raced: Lucida starts while Amazon is still
+        // working, but Amazon still wins whenever it resolves, so the preference
+        // order is unchanged. What the hedge removes is the stacking — Amazon can
+        // spend two full timeout windows (30s, then 20s on retry) before Lucida is
+        // even asked, so a track only Lucida could serve waited for the sum of every
+        // leg. The delay keeps the common case untouched: a warm Amazon instance
+        // answers well inside it and the hedge never starts.
+        var lucidaHedge: Task<StreamResponse, Error>?
+        if !skipped.contains(.amazon), !skipped.contains(.qobuz), PlaybackSourceSettings.lucidaEnabled {
+            let candidate = enriched
+            lucidaHedge = Task {
+                try await Task.sleep(nanoseconds: Self.lucidaHedgeDelayNanos)
+                var hedged = candidate
+                if hedged.isrc?.isEmpty != false { hedged = await self.enrichTrackMetadata(hedged) }
+                return try await self.resolveLucidaStream(for: hedged, quality: quality)
+            }
+        }
+
         var amazonError: Error?
         if !skipped.contains(.amazon) {
             do {
-                return try await resolveAmazonStream(for: enriched, quality: quality)
+                let response = try await resolveAmazonStream(for: enriched, quality: quality)
+                lucidaHedge?.cancel()
+                return response
             } catch {
                 amazonError = error
                 // Fall through to Lucida, then Deezer, when Amazon cannot resolve.
@@ -167,10 +192,15 @@ final class MusicService {
         var lucidaError: Error?
         if !skipped.contains(.qobuz) {
             do {
+                if let lucidaHedge {
+                    return try await lucidaHedge.value
+                }
                 return try await resolveLucidaStream(for: enriched, quality: quality)
             } catch {
                 lucidaError = error
             }
+        } else {
+            lucidaHedge?.cancel()
         }
         if !skipped.contains(.deezer) {
             do {

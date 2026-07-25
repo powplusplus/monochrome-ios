@@ -78,6 +78,18 @@ final class PlaybackEngine: ObservableObject {
         return queue[currentIndex]
     }
 
+    /// The transport position sampled on demand rather than read from the 4 Hz
+    /// republished `elapsed`. Anything that drives a per-frame animation from the
+    /// clock — the instrumental dots in the lyrics pane — steps visibly on 250 ms
+    /// values; asking the player directly costs nothing and is exact after a seek.
+    /// Falls back to `elapsed` while a load is in flight, when the player's time
+    /// still belongs to the item being torn down.
+    var preciseElapsed: Double {
+        guard !isLoading else { return elapsed }
+        let seconds = player.currentTime().seconds
+        return seconds.isFinite ? seconds : elapsed
+    }
+
     init(musicService: MusicService = .shared) {
         self.musicService = musicService
         // We advance the catalog queue ourselves. Leaving AVQueuePlayer on .advance

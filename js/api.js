@@ -54,6 +54,35 @@ function notifyAudioSourceMissing() {
     import('./downloads.js').then((m) => m.showNotification('Could not find Audio Source')).catch(() => {});
 }
 
+// How long Amazon gets on its own before the Lucida leg is started alongside it.
+// A warm Amazon instance answers well inside this, so the hedge normally never
+// fires; a cold or dead one no longer makes Lucida wait for its full timeout.
+const AMAZON_HEDGE_DELAY_MS = 2000;
+
+const TURNSTILE_JWT_FALLBACK_TTL_MS = 55 * 60 * 1000;
+
+// The Amazon provider signs the JWT with its own `exp`. Caching it for a flat hour
+// from the moment the response lands overshoots that by the request latency and by
+// any device clock skew, so the tail of every cached hour was served with a token
+// the server already considered dead — it answers 401 "Invalid Turnstile JWT", and
+// the track becomes unplayable until something else forces a refresh. Read the real
+// expiry off the token and retire it a minute early. (iOS does the same in
+// AmazonTurnstileAuth.expiryMilliseconds.)
+export function turnstileJwtExpiry(jwt, now = Date.now()) {
+    const fallback = now + TURNSTILE_JWT_FALLBACK_TTL_MS;
+    const segment = typeof jwt === 'string' ? jwt.split('.')[1] : null;
+    if (!segment) return fallback;
+    try {
+        const base64 = segment.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(segment.length / 4) * 4, '=');
+        const payload = JSON.parse(atob(base64));
+        const exp = Number(payload?.exp);
+        if (!Number.isFinite(exp) || exp <= 0) return fallback;
+        return (exp - 60) * 1000;
+    } catch {
+        return fallback;
+    }
+}
+
 export class LosslessAPI {
     constructor(settings) {
         this.settings = settings;
@@ -63,6 +92,9 @@ export class LosslessAPI {
         });
         this.streamCache = new Map();
         this.turnstileLoadPromise = null;
+        this._turnstileJwtPromise = null;
+        this._turnstileJwtGeneration = 0;
+        this.amazonHedgeDelayMs = AMAZON_HEDGE_DELAY_MS;
 
         setInterval(
             async () => {
@@ -2044,6 +2076,11 @@ export class LosslessAPI {
         return this.turnstileLoadPromise;
     }
 
+    // Each solve gets its own widget host inside the shared panel. They used to
+    // share one `#amazon-music-turnstile-container` that every caller wiped on
+    // entry, so a second solve starting while one was in flight deleted the first
+    // widget's DOM — its callbacks then never fired and it died on the 30s timeout
+    // as "Turnstile timed out", even though Cloudflare had answered fine.
     getTurnstileContainer() {
         let panel = document.getElementById('amazon-music-turnstile-panel');
         if (!panel) {
@@ -2067,11 +2104,15 @@ export class LosslessAPI {
                 <div style="color: var(--muted-foreground); margin-bottom: 0.75rem; line-height: 1.35;">
                     Amazon Music playback needs a quick browser check.
                 </div>
-                <div id="amazon-music-turnstile-container"></div>
+                <div id="amazon-music-turnstile-widgets"></div>
             `;
             document.body.appendChild(panel);
         }
-        return panel.querySelector('#amazon-music-turnstile-container');
+        const host = panel.querySelector('#amazon-music-turnstile-widgets');
+        const container = document.createElement('div');
+        container.className = 'amazon-music-turnstile-container';
+        host.appendChild(container);
+        return container;
     }
 
     async getTurnstileResponse() {
@@ -2081,7 +2122,6 @@ export class LosslessAPI {
         }
 
         const container = this.getTurnstileContainer();
-        container.innerHTML = '';
         const turnstile = await this.loadTurnstile();
 
         const playBtns = document.querySelectorAll('.play-pause-btn, #fs-play-pause-btn');
@@ -2116,7 +2156,14 @@ export class LosslessAPI {
                 });
                 clearTimeout(timeoutId);
                 removeWidget();
-                document.getElementById('amazon-music-turnstile-panel')?.remove();
+                container.remove();
+                // Only tear down the shared panel once nothing else is using it,
+                // so one finished solve cannot pull the card out from under a
+                // concurrent one that still needs the user to click.
+                const panel = document.getElementById('amazon-music-turnstile-panel');
+                if (panel && !panel.querySelector('.amazon-music-turnstile-container')) {
+                    panel.remove();
+                }
             };
 
             const renderVisibleFallback = () => {
@@ -2189,6 +2236,12 @@ export class LosslessAPI {
             return this._turnstileJwtPromise;
         }
 
+        // A `forceRefresh` caller replaces the in-flight slot. The older solve's
+        // `finally` then runs *after* that swap, so clearing unconditionally
+        // dropped the live refresh on the floor and let the next caller start a
+        // third solve against the same widget. Only the run that still owns the
+        // slot may clear it.
+        const generation = ++this._turnstileJwtGeneration;
         this._turnstileJwtPromise = (async () => {
             if (forceRefresh) {
                 this.clearAmazonTurnstileJwt();
@@ -2223,14 +2276,19 @@ export class LosslessAPI {
 
             const data = await response.json();
             const jwt = data.access_token;
-            const expiry = Date.now() + 60 * 60 * 1000;
+            if (!jwt) {
+                throw new Error('Turnstile exchange returned no access token');
+            }
+            const expiry = turnstileJwtExpiry(jwt);
 
             localStorage.setItem('amazon_turnstile_jwt', jwt);
             localStorage.setItem('amazon_turnstile_expiry', expiry.toString());
 
             return jwt;
         })().finally(() => {
-            this._turnstileJwtPromise = null;
+            if (this._turnstileJwtGeneration === generation) {
+                this._turnstileJwtPromise = null;
+            }
         });
 
         return this._turnstileJwtPromise;
@@ -2769,6 +2827,12 @@ export class LosslessAPI {
         // Amazon Music first when enabled. Lucida-Qobuz is a fallback only — first
         // Lucida play of an uncached track can take 10–35s, so it must not win the
         // race over a working Amazon stream. Order: Amazon → Lucida → Deezer.
+        //
+        // The legs are hedged, not raced: Lucida starts early but Amazon still wins
+        // whenever it resolves, so the preference order is unchanged. What the hedge
+        // removes is the stacking — a cold Amazon instance burns its whole 30s window
+        // and only then does Lucida start its own ~20s resolve, so a track that only
+        // Lucida can serve used to take the sum of every leg before it played.
         const tryAmazon = async () => {
             if (amazonResult?.url) return;
             amazonResult = await this.getAmazonMusicStreamUrl(id, actualQuality, {
@@ -2795,10 +2859,31 @@ export class LosslessAPI {
             deezerResult = await this.getDeezerStreamUrl(track.isrc, quality);
         };
 
+        // Start (or join) the Lucida leg exactly once, whether the hedge timer or the
+        // fallback path asks for it.
+        let qobuzAttempt = null;
+        const startQobuz = () => {
+            if (!qobuzAttempt) qobuzAttempt = tryQobuz().catch(() => null);
+            return qobuzAttempt;
+        };
+
         if (amazonMusicSettings?.isEnabled()) {
-            await tryAmazon();
+            let amazonSettled = false;
+            const amazonAttempt = tryAmazon().finally(() => {
+                amazonSettled = true;
+            });
+            // Amazon answers a warm instance well inside this window, so the common
+            // case never touches Lucida. Only a stalling Amazon pays for the hedge.
+            const hedgeTimer = setTimeout(() => {
+                if (!amazonSettled) startQobuz();
+            }, this.amazonHedgeDelayMs);
+            try {
+                await amazonAttempt;
+            } finally {
+                clearTimeout(hedgeTimer);
+            }
         }
-        if (!amazonResult?.url) await tryQobuz();
+        if (!amazonResult?.url) await startQobuz();
         if (!amazonResult?.url && !qobuzResult?.url) await tryDeezer();
 
         if (amazonResult?.url) {
