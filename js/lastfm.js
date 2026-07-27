@@ -104,8 +104,6 @@ export class LastFMScrobbler {
 
         const signatureString = sortedKeys.map((key) => `${key}${filteredParams[key]}`).join('') + this.API_SECRET;
 
-        console.log('Signature string:', signatureString);
-
         try {
             const { default: md5 } = await import('./md5.js');
             return md5(signatureString);

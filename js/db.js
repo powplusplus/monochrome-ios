@@ -1,7 +1,7 @@
 export class MusicDatabase {
     constructor() {
         this.dbName = 'MonochromeDB';
-        this.version = 12;
+        this.version = 13;
         this.db = null;
     }
 
@@ -77,6 +77,15 @@ export class MusicDatabase {
                 if (!db.objectStoreNames.contains('podcast_progress')) {
                     const store = db.createObjectStore('podcast_progress', { keyPath: 'id' });
                     store.createIndex('updatedAt', 'updatedAt', { unique: false });
+                }
+                // v13: autoplay recommendation caches
+                if (!db.objectStoreNames.contains('track_features')) {
+                    const store = db.createObjectStore('track_features', { keyPath: 'id' });
+                    store.createIndex('fetchedAt', 'fetchedAt', { unique: false });
+                }
+                if (!db.objectStoreNames.contains('lastfm_resolution')) {
+                    const store = db.createObjectStore('lastfm_resolution', { keyPath: 'key' });
+                    store.createIndex('ts', 'ts', { unique: false });
                 }
             };
         });
@@ -962,6 +971,132 @@ export class MusicDatabase {
 
     async getSetting(key) {
         return await this.performTransaction('settings', 'readonly', (store) => store.get(key));
+    }
+
+    // Autoplay recommendation caches (v13)
+
+    async getTrackFeature(id) {
+        return this.performTransaction('track_features', 'readonly', (store) => store.get(String(id)));
+    }
+
+    /**
+     * Reads many feature vectors in a single transaction.
+     * @param {Array<string|number>} ids
+     * @returns {Promise<Map<string, Object>>} keyed by id; missing ids are absent
+     */
+    async getTrackFeatures(ids) {
+        const found = new Map();
+        if (!ids || ids.length === 0) return found;
+
+        const database = await this.open();
+        return new Promise((resolve, reject) => {
+            const transaction = database.transaction('track_features', 'readonly');
+            const store = transaction.objectStore('track_features');
+
+            for (const rawId of new Set(ids.map((id) => String(id)))) {
+                const request = store.get(rawId);
+                request.onsuccess = () => {
+                    if (request.result) found.set(rawId, request.result);
+                };
+            }
+
+            transaction.oncomplete = () => resolve(found);
+            transaction.onerror = (event) => reject(event.target.error);
+        });
+    }
+
+    async putTrackFeature(feature) {
+        return this.putTrackFeatures([feature]);
+    }
+
+    async putTrackFeatures(features) {
+        const rows = (features || []).filter((f) => f && f.id != null);
+        if (rows.length === 0) return;
+
+        const database = await this.open();
+        return new Promise((resolve, reject) => {
+            const transaction = database.transaction('track_features', 'readwrite');
+            const store = transaction.objectStore('track_features');
+
+            for (const row of rows) {
+                store.put({ ...row, id: String(row.id), fetchedAt: row.fetchedAt || Date.now() });
+            }
+
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = (event) => reject(event.target.error);
+        });
+    }
+
+    async getResolution(key) {
+        return this.performTransaction('lastfm_resolution', 'readonly', (store) => store.get(key));
+    }
+
+    async putResolution(entry) {
+        if (!entry || !entry.key) return;
+        await this.performTransaction('lastfm_resolution', 'readwrite', (store) =>
+            store.put({ ...entry, ts: entry.ts || Date.now() })
+        );
+    }
+
+    async pruneTrackFeatures(options = {}) {
+        return this._pruneByAge('track_features', 'fetchedAt', {
+            maxEntries: options.maxEntries ?? 5000,
+            isExpired: options.isExpired,
+        });
+    }
+
+    async pruneResolutions(options = {}) {
+        return this._pruneByAge('lastfm_resolution', 'ts', {
+            maxEntries: options.maxEntries ?? 5000,
+            isExpired: options.isExpired,
+        });
+    }
+
+    /**
+     * Walks an index oldest-first, deleting expired rows and then the oldest
+     * survivors until the store is back under `maxEntries`.
+     * @returns {Promise<number>} number of rows deleted
+     */
+    async _pruneByAge(storeName, indexName, { maxEntries, isExpired }) {
+        const database = await this.open();
+        return new Promise((resolve, reject) => {
+            const transaction = database.transaction(storeName, 'readwrite');
+            const store = transaction.objectStore(storeName);
+            const index = store.index(indexName);
+
+            let deleted = 0;
+            const survivors = [];
+
+            const countRequest = store.count();
+            countRequest.onsuccess = () => {
+                const total = countRequest.result;
+                const cursorRequest = index.openCursor();
+
+                cursorRequest.onsuccess = (event) => {
+                    const cursor = event.target.result;
+                    if (cursor) {
+                        if (isExpired && isExpired(cursor.value)) {
+                            cursor.delete();
+                            deleted++;
+                        } else {
+                            survivors.push(cursor.primaryKey);
+                        }
+                        cursor.continue();
+                        return;
+                    }
+
+                    // survivors are index-ordered, so the head is the oldest
+                    const overflow = total - deleted - maxEntries;
+                    for (let i = 0; i < overflow && i < survivors.length; i++) {
+                        store.delete(survivors[i]);
+                        deleted++;
+                    }
+                };
+            };
+
+            transaction.oncomplete = () => resolve(deleted);
+            transaction.onerror = (event) => reject(event.target.error);
+        });
     }
 }
 

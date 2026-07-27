@@ -36,6 +36,7 @@ import {
     deezerFallbackSettings,
     lucidaQobuzSettings,
     gaplessPlaybackSettings,
+    autoplaySettings,
     analyticsSettings,
     modalSettings,
     preferDolbyAtmosSettings,
@@ -1222,6 +1223,31 @@ export async function initializeSettings(scrobbler, player, api, ui) {
         gaplessPlaybackToggle.checked = gaplessPlaybackSettings.isEnabled();
         gaplessPlaybackToggle.addEventListener('change', (e) => {
             gaplessPlaybackSettings.setEnabled(e.target.checked);
+        });
+    }
+
+    // Autoplay recommendation settings
+    const smartRecsToggle = document.getElementById('smart-recommendations-toggle');
+    if (smartRecsToggle) {
+        smartRecsToggle.checked = autoplaySettings.isSmartRecsEnabled();
+        smartRecsToggle.addEventListener('change', (e) => {
+            autoplaySettings.setSmartRecsEnabled(e.target.checked);
+        });
+    }
+
+    const autoplayLastFmToggle = document.getElementById('autoplay-lastfm-toggle');
+    if (autoplayLastFmToggle) {
+        autoplayLastFmToggle.checked = autoplaySettings.isLastFmEnrichmentEnabled();
+        autoplayLastFmToggle.addEventListener('change', (e) => {
+            autoplaySettings.setLastFmEnrichmentEnabled(e.target.checked);
+        });
+    }
+
+    const autoplayDiversitySelect = document.getElementById('autoplay-diversity-select');
+    if (autoplayDiversitySelect) {
+        autoplayDiversitySelect.value = autoplaySettings.getDiversityLevel();
+        autoplayDiversitySelect.addEventListener('change', (e) => {
+            autoplaySettings.setDiversityLevel(e.target.value);
         });
     }
 

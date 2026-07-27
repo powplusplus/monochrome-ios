@@ -199,4 +199,87 @@ describe('Player', () => {
         player.setPlaybackSpeed(0);
         expect(audioEffectsSettings.setSpeed).toHaveBeenCalledWith(0.01);
     });
+
+    describe('autoplay continuation', () => {
+        const queueOf = (length) => Array.from({ length }, (_, i) => ({ id: i + 1 }));
+
+        test('does not prefetch while autoplay and radio are both off', () => {
+            player = new Player(audioElement, api);
+            player.queue = queueOf(4);
+            player.currentQueueIndex = 3;
+
+            expect(player._shouldPrefetchContinuation()).toBe(false);
+        });
+
+        test('prefetches once three or fewer tracks remain', () => {
+            player = new Player(audioElement, api);
+            player.autoplayEnabled = true;
+            player.queue = queueOf(10);
+
+            player.currentQueueIndex = 5; // 4 remaining
+            expect(player._shouldPrefetchContinuation()).toBe(false);
+
+            player.currentQueueIndex = 6; // 3 remaining
+            expect(player._shouldPrefetchContinuation()).toBe(true);
+
+            player.currentQueueIndex = 9; // queue exhausted
+            expect(player._shouldPrefetchContinuation()).toBe(true);
+        });
+
+        test('does not prefetch on repeat-one or while a fetch is in flight', () => {
+            player = new Player(audioElement, api);
+            player.autoplayEnabled = true;
+            player.queue = queueOf(4);
+            player.currentQueueIndex = 3;
+
+            player.repeatMode = REPEAT_MODE.ONE;
+            expect(player._shouldPrefetchContinuation()).toBe(false);
+
+            player.repeatMode = REPEAT_MODE.OFF;
+            player._continuationFetch = Promise.resolve();
+            expect(player._shouldPrefetchContinuation()).toBe(false);
+
+            player._continuationFetch = null;
+            expect(player._shouldPrefetchContinuation()).toBe(true);
+        });
+
+        test('concurrent callers share one in-flight request', async () => {
+            player = new Player(audioElement, api);
+            player.autoplayEnabled = true;
+            player.queue = queueOf(4);
+            player.currentQueueIndex = 3;
+            player.currentTrack = null;
+
+            const first = player.fetchAutoplayRecommendations();
+            const second = player.fetchRadioRecommendations();
+            expect(first).toBe(second);
+
+            await first;
+            expect(player._continuationFetch).toBeNull();
+            expect(player.isFetchingAutoplay).toBe(false);
+            expect(player.isFetchingRadio).toBe(false);
+        });
+
+        test('enableAutoplay is idempotent and announces the change', () => {
+            player = new Player(audioElement, api);
+            const listener = vi.fn();
+            window.addEventListener('autoplay-state-changed', listener);
+
+            try {
+                player.enableAutoplay();
+                player.enableAutoplay();
+                expect(player.autoplayEnabled).toBe(true);
+                expect(listener).toHaveBeenCalledTimes(1);
+                expect(listener.mock.calls[0][0].detail).toEqual({ enabled: true });
+
+                player.disableAutoplay();
+                player.disableAutoplay();
+                expect(player.autoplayEnabled).toBe(false);
+                expect(listener).toHaveBeenCalledTimes(2);
+                expect(listener.mock.calls[1][0].detail).toEqual({ enabled: false });
+            } finally {
+                window.removeEventListener('autoplay-state-changed', listener);
+            }
+        });
+    });
 });

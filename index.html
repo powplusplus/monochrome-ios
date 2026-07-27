@@ -391,6 +391,9 @@
                                     <button id="fs-repeat-btn" title="Repeat">
                                         <use svg="!lucide/repeat.svg" size="24" />
                                     </button>
+                                    <button id="fs-autoplay-btn" title="Autoplay" aria-pressed="false">
+                                        <use svg="!lucide/infinity.svg" size="24" />
+                                    </button>
                                     <button
                                         id="fs-captions-btn"
                                         class="fs-captions-btn"
@@ -4297,6 +4300,47 @@
                             <div class="settings-group">
                                 <div class="setting-item">
                                     <div class="info">
+                                        <span class="label">Personalised recommendations</span>
+                                        <span class="description"
+                                            >Rank autoplay picks using your play, skip and completion history</span
+                                        >
+                                    </div>
+                                    <label class="toggle-switch">
+                                        <input type="checkbox" id="smart-recommendations-toggle" checked />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                                <div class="setting-item">
+                                    <div class="info">
+                                        <span class="label">Last.fm genre &amp; mood tags</span>
+                                        <span class="description"
+                                            >Look up genre and mood tags so autoplay matches the feel of a song. Sends
+                                            track and artist names to Last.fm.</span
+                                        >
+                                    </div>
+                                    <label class="toggle-switch">
+                                        <input type="checkbox" id="autoplay-lastfm-toggle" checked />
+                                        <span class="slider"></span>
+                                    </label>
+                                </div>
+                                <div class="setting-item">
+                                    <div class="info">
+                                        <span class="label">Autoplay variety</span>
+                                        <span class="description"
+                                            >How far autoplay strays from artists you already listen to</span
+                                        >
+                                    </div>
+                                    <select id="autoplay-diversity-select">
+                                        <option value="low">Familiar</option>
+                                        <option value="balanced">Balanced</option>
+                                        <option value="high">Discovery</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div class="settings-group">
+                                <div class="setting-item">
+                                    <div class="info">
                                         <span class="label">ReplayGain Mode</span>
                                         <span class="description">Normalize volume across tracks</span>
                                     </div>
@@ -6790,6 +6834,9 @@
                         </button>
                         <button id="repeat-btn" title="Repeat">
                             <use svg="!lucide/repeat.svg" size="24" />
+                        </button>
+                        <button id="autoplay-btn" title="Autoplay" aria-pressed="false">
+                            <use svg="!lucide/infinity.svg" size="24" />
                         </button>
                     </div>
                     <div class="progress-container">

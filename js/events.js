@@ -33,6 +33,18 @@ import { Player } from './player.js';
 
 let currentTrackIdForWaveform = null;
 
+/**
+ * Feeds a playback outcome to the autoplay recommender without ever blocking or
+ * breaking the playback path - the engine is loaded lazily and any failure is
+ * swallowed, since recommendations are a nicety and playback is not.
+ */
+function notifyRecommendationEngine(method, track, completionRatio) {
+    if (!track) return;
+    import('./recommendation-engine.js')
+        .then(({ recommendationEngine }) => recommendationEngine[method](track, completionRatio))
+        .catch(() => {});
+}
+
 const trackSelection = {
     selectedIds: new Set(),
     lastClickedId: null,
@@ -424,6 +436,13 @@ export async function initializePlayerEvents(player, audioPlayer, scrobbler, ui)
                         if (prevTrack && prevPlayTime > 0) {
                             listeningTracker.updateArtistAffinity(prevTrack, prevPlayTime, prevDuration, true);
                         }
+                        if (prevTrack) {
+                            notifyRecommendationEngine(
+                                'onTrackSkipped',
+                                prevTrack,
+                                prevDuration > 0 ? prevPlayTime / prevDuration : 0
+                            );
+                        }
                         listeningTracker.forceFlush();
                     }
                     _previousTrackId = currentId;
@@ -476,6 +495,11 @@ export async function initializePlayerEvents(player, audioPlayer, scrobbler, ui)
             if (player.currentTrack) {
                 const effectivePlayTime = elapsedPlayTime || (Date.now() - _trackPlayStartTime) / 1000;
                 listeningTracker.updateArtistAffinity(player.currentTrack, effectivePlayTime, trackDur, false);
+                notifyRecommendationEngine(
+                    'onTrackFinished',
+                    player.currentTrack,
+                    trackDur > 0 ? effectivePlayTime / trackDur : 1
+                );
             }
             listeningTracker.forceFlush();
             _previousTrackId = null;
@@ -602,6 +626,38 @@ export async function initializePlayerEvents(player, audioPlayer, scrobbler, ui)
         repeatBtn.title =
             mode === REPEAT_MODE.OFF ? 'Repeat' : mode === REPEAT_MODE.ALL ? 'Repeat Queue' : 'Repeat One';
     });
+
+    const autoplayBtns = ['autoplay-btn', 'fs-autoplay-btn']
+        .map((id) => document.getElementById(id))
+        .filter(Boolean);
+
+    const syncAutoplayBtns = (enabled) => {
+        autoplayBtns.forEach((btn) => {
+            btn.classList.toggle('active', enabled);
+            btn.setAttribute('aria-pressed', String(enabled));
+            btn.title = enabled ? 'Autoplay on — keeps the music going' : 'Autoplay off';
+        });
+    };
+
+    autoplayBtns.forEach((btn) => {
+        btn.addEventListener('click', async () => {
+            await hapticLight();
+            if (player.autoplayEnabled) {
+                player.disableAutoplay();
+            } else {
+                player.enableAutoplay();
+            }
+        });
+    });
+
+    window.addEventListener('autoplay-state-changed', (e) => {
+        const enabled = !!e.detail?.enabled;
+        syncAutoplayBtns(enabled);
+        showNotification(enabled ? 'Autoplay enabled' : 'Autoplay disabled');
+    });
+
+    // Restores the saved preference - the only thing that made autoplay reachable
+    syncAutoplayBtns(player.autoplayEnabled);
 
     window.addEventListener('radio-state-changed', (e) => {
         if (e.detail && e.detail.enabled) {

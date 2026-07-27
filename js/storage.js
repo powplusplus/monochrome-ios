@@ -2416,6 +2416,8 @@ try {
 export const autoplaySettings = {
     ENABLED_KEY: 'autoplay-enabled',
     SMART_RECS_KEY: 'smart-recommendations-enabled',
+    LASTFM_ENRICHMENT_KEY: 'autoplay-lastfm-enrichment',
+    DIVERSITY_KEY: 'autoplay-diversity-level',
 
     isEnabled() {
         try {
@@ -2440,6 +2442,35 @@ export const autoplaySettings = {
 
     setSmartRecsEnabled(enabled) {
         localStorage.setItem(this.SMART_RECS_KEY, enabled ? 'true' : 'false');
+    },
+
+    // Sends played track/artist names to Last.fm to fetch genre and mood tags.
+    isLastFmEnrichmentEnabled() {
+        try {
+            const val = localStorage.getItem(this.LASTFM_ENRICHMENT_KEY);
+            return val === null ? true : val === 'true';
+        } catch {
+            return true;
+        }
+    },
+
+    setLastFmEnrichmentEnabled(enabled) {
+        localStorage.setItem(this.LASTFM_ENRICHMENT_KEY, enabled ? 'true' : 'false');
+    },
+
+    /** @returns {'low'|'balanced'|'high'} how hard autoplay pushes away from repetition */
+    getDiversityLevel() {
+        try {
+            const val = localStorage.getItem(this.DIVERSITY_KEY);
+            return ['low', 'balanced', 'high'].includes(val) ? val : 'balanced';
+        } catch {
+            return 'balanced';
+        }
+    },
+
+    setDiversityLevel(level) {
+        if (!['low', 'balanced', 'high'].includes(level)) return;
+        localStorage.setItem(this.DIVERSITY_KEY, level);
     },
 };
 

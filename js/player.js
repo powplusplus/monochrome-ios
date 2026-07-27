@@ -39,6 +39,12 @@ import {
     resolvePodcastYoutubeId,
 } from './youtube-podcast.js';
 
+// Start topping the queue up while this many tracks are still ahead of us.
+const CONTINUATION_PREFETCH_THRESHOLD = 3;
+const CONTINUATION_PREFETCH_COUNT = 8;
+// Smaller batch when the queue has already run dry - get audio going sooner.
+const CONTINUATION_REPAIR_COUNT = 5;
+
 export class Player {
     static #instance = null;
 
@@ -1074,18 +1080,15 @@ export class Player {
             preserveGestureToken && previousActiveElement === this.audio && track.type !== 'video';
 
         // Proactively fetch more artist tracks when the last track starts playing
-        console.log('[playTrackFromQueue] Check for fetch:', {
-            radioEnabled: this.radioEnabled,
-            artistId: this.artistPopularTracksState.artistId,
-            hasMore: this.artistPopularTracksState.hasMore,
-            isFetching: this.artistPopularTracksState.isFetching,
-            currentIndex: this.currentQueueIndex,
-            queueLength: currentQueue.length,
-            isLastTrack: this.currentQueueIndex >= currentQueue.length - 1,
-        });
-
         if (this.shouldFetchMoreArtistPopularTracks(currentQueue)) {
             void this.fetchMoreArtistPopularTracksForPlayback(currentQueue).catch(console.error);
+        }
+
+        // Top the queue up well before it runs dry, so autoplay never leaves a gap
+        if (this._shouldPrefetchContinuation(currentQueue)) {
+            void this._fetchContinuation({
+                mode: this.radioEnabled ? 'radio' : 'autoplay',
+            }).catch(console.error);
         }
 
         // Neither queue persistence nor radio backfill is required to begin audio. Keeping both
@@ -1681,23 +1684,8 @@ export class Player {
             const isLastTrack = this.currentQueueIndex >= currentQueue.length - 1;
 
             if (recursiveCount > currentQueue.length) {
-                if (this.radioEnabled && isLastTrack) {
-                    this.fetchRadioRecommendations().then(async () => {
-                        const updatedQueue = this.getCurrentQueue();
-                        if (this.currentQueueIndex < updatedQueue.length - 1) {
-                            await this.playNext(0, options);
-                        }
-                    });
-                    return;
-                }
-                if (this.autoplayEnabled && isLastTrack) {
-                    this.fetchAutoplayRecommendations().then(async () => {
-                        const updatedQueue = this.getCurrentQueue();
-                        if (this.currentQueueIndex < updatedQueue.length - 1) {
-                            await this.playNext(0, options);
-                        }
-                    });
-                    return;
+                if ((this.radioEnabled || this.autoplayEnabled) && isLastTrack) {
+                    return this._continueAndAdvance(options);
                 }
                 if (this.artistPopularTracksState.artistId && this.artistPopularTracksState.hasMore) {
                     const newTracks = await this.fetchMoreArtistPopularTracks();
@@ -1728,22 +1716,8 @@ export class Player {
                 if (track?.isUnavailable || contentBlockingSettings.shouldHideTrack(track)) {
                     return this.playNext(recursiveCount + 1, options);
                 }
-            } else if (this.radioEnabled) {
-                this.fetchRadioRecommendations().then(async () => {
-                    const updatedQueue = this.getCurrentQueue();
-                    if (this.currentQueueIndex < updatedQueue.length - 1) {
-                        await this.playNext(0, options);
-                    }
-                });
-                return;
-            } else if (this.autoplayEnabled) {
-                this.fetchAutoplayRecommendations().then(async () => {
-                    const updatedQueue = this.getCurrentQueue();
-                    if (this.currentQueueIndex < updatedQueue.length - 1) {
-                        await this.playNext(0, options);
-                    }
-                });
-                return;
+            } else if (this.radioEnabled || this.autoplayEnabled) {
+                return this._continueAndAdvance(options);
             } else if (this.artistPopularTracksState.artistId && this.artistPopularTracksState.hasMore) {
                 const newTracks = await this.fetchMoreArtistPopularTracks();
                 if (newTracks && newTracks.length > 0) {
@@ -1776,6 +1750,23 @@ export class Player {
         } catch (error) {
             console.error(error);
         }
+    }
+
+    /**
+     * Queue ran out with autoplay or radio on: wait for more tracks, then keep
+     * playing. Awaiting rather than firing-and-forgetting means an in-flight
+     * prefetch is joined instead of duplicated, and playback resumes the moment
+     * the tracks land.
+     */
+    async _continueAndAdvance(options) {
+        await this._fetchContinuation({ mode: this.radioEnabled ? 'radio' : 'autoplay' });
+
+        const updatedQueue = this.getCurrentQueue();
+        if (this.currentQueueIndex < updatedQueue.length - 1) {
+            return this.playNext(0, options);
+        }
+
+        this.activeElement.pause();
     }
 
     async enableRadio(seeds = []) {
@@ -1815,71 +1806,158 @@ export class Player {
     }
 
     fetchRadioRecommendations() {
-        if (this.isFetchingRadio) return this.radioFetchPromise || Promise.resolve();
-        this.isFetchingRadio = true;
+        return this._fetchContinuation({ mode: 'radio' });
+    }
 
+    fetchAutoplayRecommendations() {
+        return this._fetchContinuation({ mode: 'autoplay' });
+    }
+
+    /**
+     * True when the queue is close enough to running out that we should already
+     * be fetching more. Prefetching here - rather than repairing once the last
+     * track ends - is what keeps autoplay gapless.
+     */
+    _shouldPrefetchContinuation(currentQueue = this.getCurrentQueue()) {
+        if (!this.autoplayEnabled && !this.radioEnabled) return false;
+        if (this._continuationFetch) return false;
+        if (this.repeatMode === REPEAT_MODE.ONE) return false;
+        return currentQueue.length - 1 - this.currentQueueIndex <= CONTINUATION_PREFETCH_THRESHOLD;
+    }
+
+    /** Tracks the listener already knows, so recommendations stay fresh. */
+    async _collectKnownTrackIds() {
+        const [favorites, userPlaylists, history] = await Promise.all([
+            db.getFavorites('track'),
+            db.getAll('user_playlists'),
+            db.getHistory(),
+        ]);
+
+        return new Set([
+            ...favorites.map((t) => t.id),
+            ...userPlaylists.flatMap((p) => (p.tracks || []).map((t) => t.id)),
+            ...history.map((t) => t.id),
+            ...this._recentlyPlayedIds,
+            ...this.getCurrentQueue().map((t) => t.id),
+        ]);
+    }
+
+    /**
+     * Appends recommended tracks to the queue. Radio and autoplay share this
+     * path entirely; they differ only in which tracks seed the recommendation.
+     *
+     * Concurrent callers join the in-flight request rather than starting a
+     * second one, so a prefetch and an end-of-queue repair can never race.
+     *
+     * @param {{mode: 'autoplay'|'radio'}} options
+     */
+    _fetchContinuation({ mode }) {
+        if (this._continuationFetch) return this._continuationFetch;
+
+        this.isFetchingRadio = mode === 'radio';
+        this.isFetchingAutoplay = mode === 'autoplay';
         this.showRadioLoading(true);
 
-        this.radioFetchPromise = (async () => {
+        const count = this._shouldPrefetchContinuation()
+            ? CONTINUATION_PREFETCH_COUNT
+            : CONTINUATION_REPAIR_COUNT;
+
+        this._continuationFetch = (async () => {
             try {
-                if (this.radioSeeds.length === 0) {
-                    this.radioSeeds = await this.pickRadioSeeds();
-                }
+                const seeds = await this._pickContinuationSeeds(mode);
+                if (seeds.length === 0) return;
 
-                const shuffledSeeds = [...this.radioSeeds].sort(() => 0.5 - Math.random());
-                const seeds =
-                    shuffledSeeds.length > 0 ? shuffledSeeds.slice(0, 5) : this.currentTrack ? [this.currentTrack] : [];
+                const knownTrackIds = await this._collectKnownTrackIds();
+                const currentQueue = this.getCurrentQueue();
+                const queueTail = currentQueue.slice(this.currentQueueIndex + 1);
 
-                if (seeds.length === 0) {
-                    return;
-                }
-
-                const [favorites, userPlaylists, history] = await Promise.all([
-                    db.getFavorites('track'),
-                    db.getAll('user_playlists'),
-                    db.getHistory(),
-                ]);
-
-                const knownTrackIds = new Set([
-                    ...favorites.map((t) => t.id),
-                    ...userPlaylists.flatMap((p) => (p.tracks || []).map((t) => t.id)),
-                    ...history.map((t) => t.id),
-                    ...this._recentlyPlayedIds,
-                ]);
-
-                let recommendations = await this.api.getRecommendedTracksForPlaylist(seeds, 20, {
-                    knownTrackIds: knownTrackIds,
-                });
-
-                const { autoplaySettings: _autoplaySettings } = await import('./storage.js');
-                if (_autoplaySettings.isSmartRecsEnabled()) {
-                    const { smartRecommendations } = await import('./smart-recommendations.js');
-                    recommendations = smartRecommendations.filterRecommendations(recommendations);
-                    recommendations = smartRecommendations.rankRecommendations(recommendations);
-                }
-
-                if (recommendations && recommendations.length > 0) {
-                    const currentQueueIds = new Set(this.getCurrentQueue().map((t) => t.id));
-
-                    let newTracks = recommendations.filter((t) => {
-                        return !currentQueueIds.has(t.id);
+                let picks = [];
+                try {
+                    const { recommendationEngine } = await import('./recommendation-engine.js');
+                    picks = await recommendationEngine.recommend({
+                        api: this.api,
+                        seeds,
+                        queueTail,
+                        knownTrackIds,
+                        recentlyPlayedIds: this._recentlyPlayedIds,
+                        count,
                     });
+                } catch (error) {
+                    console.error('Recommendation engine failed, using fallback:', error);
+                }
 
-                    if (newTracks.length > 0) {
-                        const tracksToAdd = newTracks.sort(() => 0.5 - Math.random()).slice(0, 5);
-                        await this.addToQueue(tracksToAdd);
-                    }
+                if (picks.length === 0) {
+                    picks = await this._legacyRecommendations(seeds, knownTrackIds, count);
+                }
+
+                const currentQueueIds = new Set(currentQueue.map((t) => t.id));
+                const tracksToAdd = picks
+                    .filter((t) => t && !currentQueueIds.has(t.id))
+                    .slice(0, count)
+                    .map((t) => ({ ...t, _source: mode, _recAt: Date.now() }));
+
+                if (tracksToAdd.length > 0) {
+                    await this.addToQueue(tracksToAdd);
                 }
             } catch (error) {
-                console.error('Failed to fetch radio recommendations:', error);
+                console.error(`Failed to fetch ${mode} recommendations:`, error);
             } finally {
+                this._continuationFetch = null;
                 this.isFetchingRadio = false;
+                this.isFetchingAutoplay = false;
                 this.radioFetchPromise = null;
+                this.autoplayFetchPromise = null;
                 setTimeout(() => this.showRadioLoading(false), 500);
             }
         })();
 
-        return this.radioFetchPromise;
+        // Kept in sync for callers that still read the per-mode promise fields
+        this.radioFetchPromise = this._continuationFetch;
+        this.autoplayFetchPromise = this._continuationFetch;
+
+        return this._continuationFetch;
+    }
+
+    async _pickContinuationSeeds(mode) {
+        if (mode === 'radio') {
+            if (this.radioSeeds.length === 0) {
+                this.radioSeeds = await this.pickRadioSeeds();
+            }
+            const shuffled = [...this.radioSeeds].sort(() => 0.5 - Math.random());
+            if (shuffled.length > 0) return shuffled.slice(0, 3);
+            return this.currentTrack ? [this.currentTrack] : [];
+        }
+
+        const currentQueue = this.getCurrentQueue();
+        const recentQueueTracks = currentQueue.slice(
+            Math.max(0, this.currentQueueIndex - 10),
+            this.currentQueueIndex + 1
+        );
+
+        const { smartRecommendations } = await import('./smart-recommendations.js');
+        const seeds = await smartRecommendations.getAdaptiveQueueSeeds(recentQueueTracks, this._recentlyPlayedIds, 3);
+
+        if (seeds.length > 0) return seeds;
+        return this.currentTrack ? [this.currentTrack] : [];
+    }
+
+    /** Artist-fanout recommendations - the last resort when the engine returns nothing. */
+    async _legacyRecommendations(seeds, knownTrackIds, count) {
+        try {
+            let recommendations = await this.api.getRecommendedTracksForPlaylist(seeds, 20, { knownTrackIds });
+            if (!recommendations || recommendations.length === 0) return [];
+
+            const { autoplaySettings: settings } = await import('./storage.js');
+            if (settings.isSmartRecsEnabled()) {
+                const { smartRecommendations } = await import('./smart-recommendations.js');
+                recommendations = smartRecommendations.filterRecommendations(recommendations);
+                recommendations = smartRecommendations.rankRecommendations(recommendations);
+            }
+            return recommendations.slice(0, count);
+        } catch (error) {
+            console.error('Fallback recommendations failed:', error);
+            return [];
+        }
     }
 
     async pickRadioSeeds() {
@@ -1947,13 +2025,22 @@ export class Player {
     }
 
     enableAutoplay() {
+        if (this.autoplayEnabled) return;
         this.autoplayEnabled = true;
         autoplaySettings.setEnabled(true);
+        window.dispatchEvent(new CustomEvent('autoplay-state-changed', { detail: { enabled: true } }));
+
+        // Start filling the queue straight away rather than waiting for it to drain
+        if (this._shouldPrefetchContinuation()) {
+            void this._fetchContinuation({ mode: 'autoplay' }).catch(console.error);
+        }
     }
 
     disableAutoplay() {
+        if (!this.autoplayEnabled) return;
         this.autoplayEnabled = false;
         autoplaySettings.setEnabled(false);
+        window.dispatchEvent(new CustomEvent('autoplay-state-changed', { detail: { enabled: false } }));
     }
 
     addToRecentlyPlayed(trackId) {
@@ -1963,78 +2050,6 @@ export class Player {
         if (this._recentlyPlayedIds.length > this._maxRecentlyPlayed) {
             this._recentlyPlayedIds = this._recentlyPlayedIds.slice(-this._maxRecentlyPlayed);
         }
-    }
-
-    fetchAutoplayRecommendations() {
-        if (this.isFetchingAutoplay) return this.autoplayFetchPromise || Promise.resolve();
-        this.isFetchingAutoplay = true;
-
-        this.showRadioLoading(true);
-
-        this.autoplayFetchPromise = (async () => {
-            try {
-                const { smartRecommendations } = await import('./smart-recommendations.js');
-                const { autoplaySettings: _autoplaySettings } = await import('./storage.js');
-
-                const currentQueue = this.getCurrentQueue();
-                const recentQueueTracks = currentQueue.slice(
-                    Math.max(0, this.currentQueueIndex - 10),
-                    this.currentQueueIndex + 1
-                );
-
-                const seeds = await smartRecommendations.getAdaptiveQueueSeeds(
-                    recentQueueTracks,
-                    this._recentlyPlayedIds,
-                    5
-                );
-
-                if (seeds.length === 0) {
-                    if (this.currentTrack) seeds.push(this.currentTrack);
-                    else return;
-                }
-
-                const [favorites, userPlaylists, history] = await Promise.all([
-                    db.getFavorites('track'),
-                    db.getAll('user_playlists'),
-                    db.getHistory(),
-                ]);
-
-                const knownTrackIds = new Set([
-                    ...favorites.map((t) => t.id),
-                    ...userPlaylists.flatMap((p) => (p.tracks || []).map((t) => t.id)),
-                    ...history.map((t) => t.id),
-                    ...this._recentlyPlayedIds,
-                    ...currentQueue.map((t) => t.id),
-                ]);
-
-                let recommendations = await this.api.getRecommendedTracksForPlaylist(seeds, 20, {
-                    knownTrackIds: knownTrackIds,
-                });
-
-                if (_autoplaySettings.isSmartRecsEnabled()) {
-                    recommendations = smartRecommendations.filterRecommendations(recommendations);
-                    recommendations = smartRecommendations.rankRecommendations(recommendations);
-                }
-
-                if (recommendations && recommendations.length > 0) {
-                    const currentQueueIds = new Set(currentQueue.map((t) => t.id));
-                    let newTracks = recommendations.filter((t) => !currentQueueIds.has(t.id));
-
-                    if (newTracks.length > 0) {
-                        const tracksToAdd = newTracks.slice(0, 5);
-                        await this.addToQueue(tracksToAdd);
-                    }
-                }
-            } catch (error) {
-                console.error('Failed to fetch autoplay recommendations:', error);
-            } finally {
-                this.isFetchingAutoplay = false;
-                this.autoplayFetchPromise = null;
-                setTimeout(() => this.showRadioLoading(false), 500);
-            }
-        })();
-
-        return this.autoplayFetchPromise;
     }
 
     playPrev(recursiveCount = 0) {

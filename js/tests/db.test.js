@@ -33,6 +33,61 @@ describe('MusicDatabase', () => {
         expect(openedDb.objectStoreNames.contains('history_tracks')).toBe(true);
         expect(openedDb.objectStoreNames.contains('user_playlists')).toBe(true);
         expect(openedDb.objectStoreNames.contains('podcast_progress')).toBe(true);
+        expect(openedDb.objectStoreNames.contains('track_features')).toBe(true);
+        expect(openedDb.objectStoreNames.contains('lastfm_resolution')).toBe(true);
+    });
+
+    test('track features round-trip in a single batch', async () => {
+        await db.putTrackFeatures([
+            { id: 1, bpm: 128, tags: { house: 1 } },
+            { id: '2', bpm: null, tags: {} },
+        ]);
+
+        const found = await db.getTrackFeatures([1, 2, 3]);
+        expect(found.size).toBe(2);
+        expect(found.get('1').bpm).toBe(128);
+        expect(found.get('2').bpm).toBeNull();
+        expect(found.get('1').fetchedAt).toBeGreaterThan(0);
+        expect(found.has('3')).toBe(false);
+
+        const single = await db.getTrackFeature(1);
+        expect(single.tags).toEqual({ house: 1 });
+    });
+
+    test('getTrackFeatures returns an empty map for no ids', async () => {
+        await db.open();
+        expect((await db.getTrackFeatures([])).size).toBe(0);
+    });
+
+    test('pruneTrackFeatures drops expired rows then trims to the cap', async () => {
+        const now = Date.now();
+        await db.putTrackFeatures([
+            { id: 'expired', fetchedAt: now - 1000, stale: true },
+            { id: 'old', fetchedAt: now - 300 },
+            { id: 'mid', fetchedAt: now - 200 },
+            { id: 'new', fetchedAt: now - 100 },
+        ]);
+
+        const deleted = await db.pruneTrackFeatures({
+            maxEntries: 2,
+            isExpired: (row) => row.stale === true,
+        });
+
+        expect(deleted).toBe(2); // 1 expired + 1 over the cap
+        const remaining = await db.getTrackFeatures(['expired', 'old', 'mid', 'new']);
+        expect([...remaining.keys()].sort()).toEqual(['mid', 'new']);
+    });
+
+    test('lastfm resolutions cache both hits and misses', async () => {
+        await db.putResolution({ key: 'radiohead|creep', trackId: '42' });
+        await db.putResolution({ key: 'nobody|nothing', notFound: true });
+
+        expect((await db.getResolution('radiohead|creep')).trackId).toBe('42');
+        expect((await db.getResolution('nobody|nothing')).notFound).toBe(true);
+        expect(await db.getResolution('missing|key')).toBeUndefined();
+
+        const deleted = await db.pruneResolutions({ maxEntries: 1 });
+        expect(deleted).toBe(1);
     });
 
     test('podcast progress saves to the second and resume rejects finished', async () => {

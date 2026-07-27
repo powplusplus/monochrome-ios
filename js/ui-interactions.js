@@ -276,6 +276,26 @@ export function initializeUIInteractions(player, api, ui) {
         }
     };
 
+    const AUTOPLAY_SECTION_HEADER = `
+        <div class="queue-section-header">
+            <span class="queue-section-title">Autoplay</span>
+            <span class="queue-section-sub">Based on what you've been playing</span>
+        </div>
+    `;
+
+    /**
+     * Index where the trailing run of autoplay-added tracks begins, or -1.
+     *
+     * Taking the longest *suffix* rather than the first tagged track means that
+     * dragging a hand-picked track into the middle of an autoplay block splits
+     * it, and only the tail stays labelled.
+     */
+    const findAutoplaySectionStart = (queue) => {
+        let start = queue.length;
+        while (start > 0 && queue[start - 1]?._source) start--;
+        return start === queue.length ? -1 : start;
+    };
+
     const renderQueueItemHTML = (track, index) => {
         if (contentBlockingSettings?.isHardcodedBlockedTrack(track)) return '';
         const isPlaying = index === player.currentQueueIndex;
@@ -291,8 +311,12 @@ export function initializeUIInteractions(player, api, ui) {
         const coverUrl =
             isVideo && track.imageId ? api.getVideoCoverUrl(track.imageId) : api.getCoverUrl(track.album?.cover);
 
+        const autoplayBadge = track._source
+            ? '<span class="queue-autoplay-badge" title="Added by Autoplay">∞</span>'
+            : '';
+
         return `
-        <div class="queue-track-item ${isPlaying ? 'playing' : ''} ${isBlocked ? 'blocked' : ''}" data-queue-index="${index}" data-track-id="${track.id}" draggable="${isBlocked ? 'false' : 'true'}" ${blockedTitle}>
+        <div class="queue-track-item ${isPlaying ? 'playing' : ''} ${isBlocked ? 'blocked' : ''} ${track._source ? 'autoplay-picked' : ''}" data-queue-index="${index}" data-track-id="${track.id}" draggable="${isBlocked ? 'false' : 'true'}" ${blockedTitle}>
             <div class="drag-handle">
                 ${SVG_EQUAL(16)}
             </div>
@@ -300,7 +324,7 @@ export function initializeUIInteractions(player, api, ui) {
                 <img crossorigin="anonymous" referrerpolicy="no-referrer" src="${coverUrl}"
                      class="track-item-cover" loading="lazy">
                 <div class="track-item-details">
-                    <div class="title">${escapeHtml(trackTitle)} ${qualityBadge}</div>
+                    <div class="title">${escapeHtml(trackTitle)} ${qualityBadge}${autoplayBadge}</div>
                     <div class="artist">${escapeHtml(trackArtists)}</div>
                 </div>
             </div>
@@ -482,7 +506,16 @@ export function initializeUIInteractions(player, api, ui) {
             topObserver.observe(container.querySelector('#queue-top-sentinel'));
             bottomObserver.observe(container.querySelector('#queue-bottom-sentinel'));
         } else {
-            container.innerHTML = `<div style="padding: 0.5rem">${currentQueue.map((track, index) => renderQueueItemHTML(track, index)).join('')}</div>`;
+            // Only the non-virtualized branch gets the section header: the
+            // virtualized one derives spacer heights from `index * ESTIMATED_ITEM_HEIGHT`,
+            // and an extra row would drift the scroll anchor.
+            const autoplayStart = findAutoplaySectionStart(currentQueue);
+            const rows = currentQueue.map((track, index) => {
+                const header = index === autoplayStart ? AUTOPLAY_SECTION_HEADER : '';
+                return header + renderQueueItemHTML(track, index);
+            });
+
+            container.innerHTML = `<div style="padding: 0.5rem">${rows.join('')}</div>`;
             if (topObserver) topObserver.disconnect();
             if (bottomObserver) bottomObserver.disconnect();
         }
