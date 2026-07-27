@@ -970,7 +970,14 @@ actor RecommendationEngine {
         var needsLookup: [Track] = []
 
         for track in tracks {
-            if let cached = memoryFeatures[track.id] ?? (await store.feature(track.id)) {
+            // `??` takes an autoclosure, which cannot contain `await`, so the
+            // disk lookup has to be a separate step from the memory hit.
+            var cached = memoryFeatures[track.id]
+            if cached == nil {
+                cached = await store.feature(track.id)
+            }
+
+            if let cached {
                 out[track.id] = cached
                 memoryFeatures[track.id] = cached
             } else {
