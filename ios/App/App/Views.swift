@@ -1438,6 +1438,27 @@ struct NowPlayingView: View {
             }
             .buttonStyle(.plain)
 
+            HStack(spacing: 6) {
+                Button { playback.autoplayEnabled.toggle() } label: {
+                    Image(systemName: "infinity")
+                        .foregroundColor(playback.autoplayEnabled ? .pink : .secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(playback.autoplayEnabled ? "Autoplay on" : "Autoplay off")
+
+                if playback.isFindingMore {
+                    ProgressView().controlSize(.mini)
+                    Text("Finding more songs…")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else if playback.autoplayEnabled {
+                    Text("Autoplay")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+            }
+
             HStack {
                 RoutePickerView().frame(width: 42, height: 32)
                 Spacer()

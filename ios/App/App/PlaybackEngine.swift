@@ -14,6 +14,17 @@ final class PlaybackEngine: ObservableObject {
     @Published private(set) var elapsed: Double = 0
     @Published private(set) var duration: Double = 0
     @Published var playbackRate: Float = 1 { didSet { if isPlaying { player.rate = playbackRate }; updateNowPlaying() } }
+    /// Keeps the music going once the queue runs out, using content-aware
+    /// recommendations rather than more of the same artist.
+    @Published var autoplayEnabled: Bool = UserDefaults.standard.bool(forKey: "native.autoplayEnabled") {
+        didSet {
+            UserDefaults.standard.set(autoplayEnabled, forKey: "native.autoplayEnabled")
+            if autoplayEnabled { maybePrefetchContinuation() }
+        }
+    }
+    /// True while a recommendation batch is in flight, for the "finding more
+    /// songs" affordance in the player UI.
+    @Published private(set) var isFindingMore = false
     @Published var repeatMode: RepeatMode = .off { didSet { prefetchUpcoming() } }
     @Published var shuffleEnabled = false { didSet { prefetchUpcoming() } }
     @Published var errorMessage: String?
@@ -216,14 +227,24 @@ final class PlaybackEngine: ObservableObject {
         skippedProviders = []
         guard !queue.isEmpty else { return }
         if repeatMode == .one { seek(to: 0); resume(); return }
+
+        // Skipping past a track that autoplay chose is the strongest negative
+        // signal available, so tell the recommender before the index moves.
+        reportOutcomeForCurrentTrack(skipped: true)
+
         if shuffleEnabled, queue.count > 1 {
             var next = Int.random(in: queue.indices)
             while next == currentIndex { next = Int.random(in: queue.indices) }
             currentIndex = next
         } else if let index = currentIndex, index + 1 < queue.count { currentIndex = index + 1 }
         else if repeatMode == .all { currentIndex = 0 }
-        else { pause(); return }
+        else if autoplayEnabled {
+            // Queue is exhausted: fetch more rather than silently stopping.
+            Task { await self.extendQueue(advanceAfterwards: true) }
+            return
+        } else { pause(); return }
         persistQueue(); loadCurrent(autoplay: true)
+        maybePrefetchContinuation()
     }
 
     func previous() {
@@ -259,6 +280,106 @@ final class PlaybackEngine: ObservableObject {
     }
 
     func move(from offsets: IndexSet, to destination: Int) { queue.move(fromOffsets: offsets, toOffset: destination); persistQueue() }
+
+    // MARK: - Autoplay
+
+    /// How many tracks may remain ahead before we start topping the queue up.
+    /// Prefetching here, rather than repairing once the last track ends, is what
+    /// keeps autoplay gapless.
+    private static let continuationPrefetchThreshold = 3
+    private static let continuationBatchSize = 8
+
+    private var continuationTask: Task<Void, Never>?
+
+    private func maybePrefetchContinuation() {
+        guard autoplayEnabled, repeatMode != .one, continuationTask == nil,
+              let index = currentIndex else { return }
+        guard queue.count - 1 - index <= Self.continuationPrefetchThreshold else { return }
+        Task { await extendQueue(advanceAfterwards: false) }
+    }
+
+    /// Appends a batch of recommendations. Concurrent callers join the in-flight
+    /// request instead of starting a second one, so a prefetch and an
+    /// end-of-queue repair can never race.
+    private func extendQueue(advanceAfterwards: Bool) async {
+        if let existing = continuationTask {
+            await existing.value
+            if advanceAfterwards { advanceIntoAppendedTracks() }
+            return
+        }
+
+        let seeds = continuationSeeds()
+        guard !seeds.isEmpty else {
+            if advanceAfterwards { pause() }
+            return
+        }
+
+        isFindingMore = true
+        let queueTail = Array(queue.suffix(from: min((currentIndex ?? 0) + 1, queue.count)))
+        let exclude = Set(queue.map(\.id) + recentlyPlayedIDs)
+        let batch = advanceAfterwards ? 5 : Self.continuationBatchSize
+
+        let task = Task { [weak self] in
+            let picks = await RecommendationEngine.shared.recommend(
+                seeds: seeds, queueTail: queueTail, exclude: exclude, count: batch)
+            guard let self else { return }
+            await MainActor.run {
+                let existing = Set(self.queue.map(\.id))
+                let additions = picks.filter { !existing.contains($0.id) }.map { track -> Track in
+                    var tagged = track
+                    tagged.recSource = "autoplay"
+                    return tagged
+                }
+                if !additions.isEmpty {
+                    self.queue.append(contentsOf: additions)
+                    self.persistQueue()
+                }
+            }
+        }
+
+        continuationTask = task
+        await task.value
+        continuationTask = nil
+        isFindingMore = false
+
+        if advanceAfterwards { advanceIntoAppendedTracks() }
+    }
+
+    private func advanceIntoAppendedTracks() {
+        guard let index = currentIndex, index + 1 < queue.count else {
+            pause()
+            return
+        }
+        currentIndex = index + 1
+        persistQueue()
+        loadCurrent(autoplay: true)
+    }
+
+    /// Recent listening drives the recommendation; the current track alone is a
+    /// thin seed and produces a much narrower batch.
+    private func continuationSeeds() -> [Track] {
+        guard let index = currentIndex else { return currentTrack.map { [$0] } ?? [] }
+        let window = queue[max(0, index - 4)...index]
+        return Array(window.reversed().prefix(3))
+    }
+
+    private var recentlyPlayedIDs: [String] = []
+
+    private func reportOutcomeForCurrentTrack(skipped: Bool) {
+        guard let track = currentTrack, !track.isPodcast else { return }
+        let completion = duration > 0 ? min(1, elapsed / duration) : (skipped ? 0 : 1)
+
+        recentlyPlayedIDs.append(track.id)
+        if recentlyPlayedIDs.count > 100 { recentlyPlayedIDs.removeFirst(recentlyPlayedIDs.count - 100) }
+
+        Task {
+            if skipped {
+                await RecommendationEngine.shared.recordSkip(track, completion: completion)
+            } else {
+                await RecommendationEngine.shared.recordFinish(track, completion: completion)
+            }
+        }
+    }
 
     func append(_ track: Track) { queue.append(track); persistQueue(); prefetchUpcoming() }
     func playNext(_ track: Track) { queue.insert(track, at: min((currentIndex ?? -1) + 1, queue.count)); persistQueue(); prefetchUpcoming() }
@@ -570,7 +691,32 @@ final class PlaybackEngine: ObservableObject {
                 ScrobblingCoordinator.shared.completed(track, listened: max(elapsed, duration))
             }
         }
-        next()
+        reportOutcomeForCurrentTrack(skipped: false)
+        advanceAfterCompletion()
+    }
+
+    /// End-of-track advance. Separate from `next()` so a natural finish is not
+    /// misreported to the recommender as a skip.
+    private func advanceAfterCompletion() {
+        savePodcastProgressIfNeeded(force: true)
+        skippedProviders = []
+        guard !queue.isEmpty else { return }
+        if repeatMode == .one { seek(to: 0); resume(); return }
+
+        if shuffleEnabled, queue.count > 1 {
+            var next = Int.random(in: queue.indices)
+            while next == currentIndex { next = Int.random(in: queue.indices) }
+            currentIndex = next
+        } else if let index = currentIndex, index + 1 < queue.count { currentIndex = index + 1 }
+        else if repeatMode == .all { currentIndex = 0 }
+        else if autoplayEnabled {
+            Task { await self.extendQueue(advanceAfterwards: true) }
+            return
+        } else { pause(); return }
+
+        persistQueue()
+        loadCurrent(autoplay: true)
+        maybePrefetchContinuation()
     }
 
     private func applyPendingPodcastSeekIfNeeded() {

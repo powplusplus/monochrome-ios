@@ -302,11 +302,26 @@ struct Track: Codable, Identifiable, Hashable {
     /// Quality token written with the offline file.
     var offlineQuality: String? = nil
     var offlineQualityDetail: String? = nil
+    /// Beats per minute reported by TIDAL. Absent for much of the long tail, so
+    /// autoplay treats `nil` as "unknown" rather than folding it into a default.
+    var bpm: Double? = nil
+    /// Musical key (e.g. `Bb`) and scale (`MAJOR`/`MINOR`) — drive harmonic mixing.
+    var musicalKey: String? = nil
+    var keyScale: String? = nil
+    /// TIDAL popularity, 0-100.
+    var popularity: Int? = nil
+    /// Release year, taken from the album or stream start date when present.
+    var releaseYear: Int? = nil
+    /// Set when autoplay queued this track, so the UI can label it and the
+    /// engine can weight a skip on its own pick more heavily than a manual one.
+    var recSource: String? = nil
 
     init(id: String, title: String, artist: Artist, album: AlbumSummary? = nil, duration: Double = 0,
          explicit: Bool = false, audioQuality: String? = nil, mediaTags: [String]? = nil, isrc: String? = nil,
          provider: Provider = .tidal, streamURL: URL? = nil, enclosureType: String? = nil,
-         offlineProvider: Provider? = nil, offlineQuality: String? = nil, offlineQualityDetail: String? = nil) {
+         offlineProvider: Provider? = nil, offlineQuality: String? = nil, offlineQualityDetail: String? = nil,
+         bpm: Double? = nil, musicalKey: String? = nil, keyScale: String? = nil,
+         popularity: Int? = nil, releaseYear: Int? = nil, recSource: String? = nil) {
         self.id = id
         self.title = title
         self.artist = artist
@@ -322,7 +337,16 @@ struct Track: Codable, Identifiable, Hashable {
         self.offlineProvider = offlineProvider
         self.offlineQuality = offlineQuality
         self.offlineQualityDetail = offlineQualityDetail
+        self.bpm = bpm
+        self.musicalKey = musicalKey
+        self.keyScale = keyScale
+        self.popularity = popularity
+        self.releaseYear = releaseYear
+        self.recSource = recSource
     }
+
+    /// Camelot wheel code (e.g. `3A`) when TIDAL reported a key, else nil.
+    var camelot: String? { RecommendationMath.camelot(key: musicalKey, scale: keyScale) }
 
     var artworkURL: URL? { Artwork.url(album?.cover, size: 640) }
     var playbackID: String { id.split(separator: ":").last.map(String.init) ?? id }
@@ -567,12 +591,29 @@ enum ModelMapper {
         let seconds = (dict["duration"] as? NSNumber)?.doubleValue ?? 0
         let prefixed = id.contains(":") ? id : "tidal:\(id)"
         let directURL = string(dict, ["streamUrl", "streamURL"]).flatMap(URL.init(string:))
+
+        // Album, playlist and mix payloads embed the full TIDAL track object, so
+        // BPM and key often arrive free here and need no extra /info lookup.
+        let albumDict = dict["album"] as? [String: Any]
+        let releaseDate = string(dict, ["streamStartDate", "releaseDate"])
+            ?? albumDict.flatMap { string($0, ["releaseDate", "release_date"]) }
+
         return Track(id: prefixed, title: title, artist: artist(artistValue), album: album, duration: seconds,
                      explicit: (dict["explicit"] as? Bool) ?? false,
                      audioQuality: string(dict, ["audioQuality", "quality"]),
                      mediaTags: mediaTags(dict), isrc: string(dict, ["isrc", "ISRC"]),
                      provider: Provider(rawValue: prefixed.split(separator: ":").first.map(String.init) ?? "tidal") ?? .tidal,
-                     streamURL: directURL)
+                     streamURL: directURL,
+                     bpm: (dict["bpm"] as? NSNumber)?.doubleValue,
+                     musicalKey: string(dict, ["key"]),
+                     keyScale: string(dict, ["keyScale"]),
+                     popularity: (dict["popularity"] as? NSNumber)?.intValue,
+                     releaseYear: releaseDate.flatMap(year(from:)))
+    }
+
+    /// Leading four digits of an ISO-8601 date, e.g. `1993-04-05` -> 1993.
+    static func year(from date: String) -> Int? {
+        Int(date.prefix(4))
     }
 
     static func album(_ dict: [String: Any]) -> Album? {

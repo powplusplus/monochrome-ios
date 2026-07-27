@@ -87,6 +87,33 @@ final class MusicService {
         return ModelMapper.array(object, keys: ["tracks", "items"]).compactMap(ModelMapper.track)
     }
 
+    /// Full track object from `/info`, the only route that carries `bpm`, `key`
+    /// and `keyScale`. Cached, because those values never change.
+    func trackInfo(id: String) async throws -> Track {
+        let object = try await json(path: "/info/?id=\(id.urlQueryEncoded)")
+        let root = (object as? [String: Any])?["data"] ?? object
+        let candidates = ModelMapper.array(root, keys: ["items", "tracks"])
+        if let dict = root as? [String: Any], let track = ModelMapper.track(dict) { return track }
+        if let track = candidates.compactMap(ModelMapper.track).first { return track }
+        throw ServiceError.invalidResponse
+    }
+
+    func similarArtists(for artistID: String) async throws -> [Artist] {
+        let object = try await json(path: "/artist/similar/?id=\(artistID.urlQueryEncoded)")
+        return ModelMapper.array(object, keys: ["artists", "items"]).map { ModelMapper.artist($0) }
+    }
+
+    func artistTopTracks(for artistID: String, limit: Int = 10) async throws -> [Track] {
+        let object = try await json(path: "/artist/?f=\(artistID.urlQueryEncoded)&skip_tracks=true&offset=0&limit=\(limit)")
+        return ModelMapper.array(object, keys: ["topTracks", "tracks", "items"]).compactMap(ModelMapper.track)
+    }
+
+    /// Best-effort resolution of a Last.fm artist/title pair to a catalog track.
+    func searchTrack(artist: String, title: String) async -> [Track] {
+        let object = await scopedSearch(path: "/search/?s=\("\(artist) \(title)".urlQueryEncoded)")
+        return sectionItems(in: object, named: "tracks").compactMap(ModelMapper.track)
+    }
+
     func lyrics(for track: Track) async -> SyncedLyrics? {
         let title = track.title.trimmingCharacters(in: .whitespacesAndNewlines)
         let artist = track.artist.name.trimmingCharacters(in: .whitespacesAndNewlines)
