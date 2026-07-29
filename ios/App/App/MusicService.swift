@@ -110,10 +110,14 @@ final class MusicService {
         return candidates.first
     }
 
-    func resolveStream(for track: Track, quality: PlaybackQuality = .stored) async throws -> StreamResponse {
+    func resolveStream(
+        for track: Track,
+        quality: PlaybackQuality = .stored,
+        skipping skipped: Set<Provider> = []
+    ) async throws -> StreamResponse {
         // Catalog payloads often include a webpage `url` (e.g. tidal.com/track/…) that
         // was historically mapped into streamURL. Only short-circuit for real media.
-        if let url = track.streamURL, Self.isDirectMediaURL(url) {
+        if let url = track.streamURL, Self.isDirectMediaURL(url), !skipped.contains(track.provider) {
             return StreamResponse(url: url, provider: track.provider, quality: quality.rawValue, replayGain: nil, peak: nil)
         }
 
@@ -130,34 +134,36 @@ final class MusicService {
         // the leg about to run actually needs.
         var enriched = track.duration > 0 ? track : await enrichTrackMetadata(track)
         var amazonError: Error?
-        do {
-            return try await resolveAmazonStream(for: enriched, quality: quality)
-        } catch {
-            amazonError = error
-            // Fall through to Deezer like web when Amazon is rate-limited / unavailable.
+        if !skipped.contains(.amazon) {
+            do {
+                return try await resolveAmazonStream(for: enriched, quality: quality)
+            } catch {
+                amazonError = error
+            }
         }
         // Deezer keys off the ISRC, so pay for the lookup here instead.
         if enriched.isrc?.isEmpty != false {
             enriched = await enrichTrackMetadata(enriched)
         }
-        do {
-            return try await resolveDeezerStream(for: enriched, quality: quality)
-        } catch {
-            let amazonDetail = (amazonError as? LocalizedError)?.errorDescription
-                ?? amazonError?.localizedDescription
-                ?? "Amazon Music unavailable"
-            // Report both legs. Reporting only Amazon's made a dead Deezer pool
-            // look like an Amazon auth bug.
-            let deezerDetail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            if enriched.isrc?.isEmpty == false {
+        if !skipped.contains(.deezer) {
+            do {
+                return try await resolveDeezerStream(for: enriched, quality: quality)
+            } catch {
+                let amazonDetail = Self.errorDetail(amazonError, fallback: skipped.contains(.amazon) ? "skipped" : "unavailable")
+                let deezerDetail = Self.errorDetail(error, fallback: "unavailable")
                 throw ServiceError.unavailable(
-                    "Could not resolve stream URL from Amazon Music or Deezer. Amazon: \(amazonDetail) Deezer: \(deezerDetail)"
+                    "Could not resolve a playable source. Amazon: \(amazonDetail) Deezer: \(deezerDetail)"
                 )
             }
-            throw ServiceError.unavailable(
-                "Could not resolve stream URL: \(amazonDetail). Track has no ISRC for Deezer lookup."
-            )
         }
+        let amazonDetail = Self.errorDetail(amazonError, fallback: "skipped")
+        throw ServiceError.unavailable(
+            "Could not resolve a playable source. Amazon: \(amazonDetail) Deezer: skipped"
+        )
+    }
+
+    private static func errorDetail(_ error: Error?, fallback: String) -> String {
+        (error as? LocalizedError)?.errorDescription ?? error?.localizedDescription ?? fallback
     }
 
     /// Pull ISRC / duration when search cards omit them. The ISRC is what the
@@ -182,6 +188,33 @@ final class MusicService {
     }
 
     private func resolveAmazonStream(for track: Track, quality: PlaybackQuality) async throws -> StreamResponse {
+        var lastError: Error = ServiceError.unavailable("Amazon Music unavailable")
+        for attempt in 0..<3 {
+            do {
+                return try await resolveAmazonStreamOnce(for: track, quality: quality)
+            } catch {
+                lastError = error
+                guard Self.isTransientPlaybackError(error), attempt < 2 else { throw error }
+                try Task.checkCancellation()
+                try await Task.sleep(nanoseconds: UInt64(500 + attempt * 900) * 1_000_000)
+            }
+        }
+        throw lastError
+    }
+
+    static func isTransientPlaybackError(_ error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            return [.timedOut, .networkConnectionLost, .cannotConnectToHost, .cannotFindHost,
+                    .dnsLookupFailed, .notConnectedToInternet, .resourceUnavailable].contains(urlError.code)
+        }
+        if let serviceError = error as? ServiceError, case .http(let status) = serviceError {
+            return status == 403 || status == 404 || status == 408 || status == 409
+                || status == 425 || status == 429 || status >= 500
+        }
+        return false
+    }
+
+    private func resolveAmazonStreamOnce(for track: Track, quality: PlaybackQuality) async throws -> StreamResponse {
         guard PlaybackSourceSettings.amazonEnabled else {
             throw ServiceError.unavailable("Amazon Music disabled")
         }
@@ -300,6 +333,13 @@ final class MusicService {
         }
         let (data, response) = try await session.data(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            // Preserve retryable statuses as structured errors. Converting a 503
+            // to a message-only `.unavailable` made the retry layer treat the
+            // most common intermittent gateway failure as permanent.
+            if http.statusCode == 408 || http.statusCode == 409 || http.statusCode == 425
+                || http.statusCode == 429 || http.statusCode >= 500 {
+                throw ServiceError.http(http.statusCode)
+            }
             // Amazon states its own failures ("Invalid Turnstile JWT",
             // "turnstile_required"); a bare status code hid which one it was.
             if let detail = Self.providerErrorDetail(in: data), http.statusCode != 401, http.statusCode != 428 {

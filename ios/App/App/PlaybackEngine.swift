@@ -30,11 +30,17 @@ final class PlaybackEngine: ObservableObject {
     private let musicService: MusicService
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
+    private var failedObserver: NSObjectProtocol?
+    private var stalledObserver: NSObjectProtocol?
     private var loadTask: Task<Void, Never>?
     private var itemStatusObservation: NSKeyValueObservation?
     private var pendingAutoplay = false
     private var fadeTask: Task<Void, Never>?
     private let fadeDuration: TimeInterval = 0.25
+    private var currentStreamProvider: Provider?
+    private var skippedProviders: Set<Provider> = []
+    private var providerFailureCounts: [Provider: Int] = [:]
+    private var recoveryQuality: PlaybackQuality?
 
     /// A stream that has already been resolved and whose asset header has been fetched.
     /// `AVURLAsset` is not `Sendable`, but this one is only ever touched on the main actor.
@@ -101,14 +107,41 @@ final class PlaybackEngine: ObservableObject {
                 self.itemDidFinish()
             }
         }
+        failedObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemFailedToPlayToEndTime, object: nil, queue: .main) { [weak self] notification in
+            Task { @MainActor in
+                guard let self,
+                      let failed = notification.object as? AVPlayerItem,
+                      failed === self.player.currentItem,
+                      let provider = self.currentStreamProvider else { return }
+                self.recoverPlaybackFailure(provider: provider, autoplay: true)
+            }
+        }
+        stalledObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemPlaybackStalled, object: nil, queue: .main) { [weak self] notification in
+            Task { @MainActor in
+                guard let self,
+                      let stalled = notification.object as? AVPlayerItem,
+                      stalled === self.player.currentItem,
+                      let provider = self.currentStreamProvider else { return }
+                let position = self.player.currentTime().seconds
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                guard !Task.isCancelled, stalled === self.player.currentItem,
+                      self.isPlaying,
+                      abs(self.player.currentTime().seconds - position) < 0.25,
+                      self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate else { return }
+                self.recoverPlaybackFailure(provider: provider, autoplay: true)
+            }
+        }
     }
 
     deinit {
         if let timeObserver { player.removeTimeObserver(timeObserver) }
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        if let failedObserver { NotificationCenter.default.removeObserver(failedObserver) }
+        if let stalledObserver { NotificationCenter.default.removeObserver(stalledObserver) }
     }
 
     func play(_ track: Track, in context: [Track]? = nil) {
+        resetPlaybackRecovery()
         let tracks = context ?? [track]
         queue = tracks
         currentIndex = tracks.firstIndex(where: { $0.id == track.id }) ?? 0
@@ -160,6 +193,7 @@ final class PlaybackEngine: ObservableObject {
     }
 
     func next() {
+        resetPlaybackRecovery()
         guard !queue.isEmpty else { return }
         if repeatMode == .one { seek(to: 0); resume(); return }
         if shuffleEnabled, queue.count > 1 {
@@ -173,6 +207,7 @@ final class PlaybackEngine: ObservableObject {
     }
 
     func previous() {
+        resetPlaybackRecovery()
         if elapsed > 4 { seek(to: 0); return }
         guard !queue.isEmpty else { return }
         if let index = currentIndex, index > 0 { currentIndex = index - 1 }
@@ -235,6 +270,8 @@ final class PlaybackEngine: ObservableObject {
         lastNowPlayingElapsed = -1
         updateNowPlaying()
         let warm = usePrefetch ? takePrefetch(for: track) : nil
+        let skipProviders = skippedProviders
+        let requestedQuality = recoveryQuality ?? PlaybackQuality.stored
         loadTask = Task {
             do {
                 let stream: StreamResponse
@@ -245,12 +282,17 @@ final class PlaybackEngine: ObservableObject {
                     asset = prepared.asset
                     wasPrefetched = true
                 } else {
-                    stream = try await musicService.resolveStream(for: track, quality: PlaybackQuality.stored)
+                    stream = try await musicService.resolveStream(
+                        for: track,
+                        quality: requestedQuality,
+                        skipping: skipProviders
+                    )
                     asset = Self.asset(for: stream)
                 }
                 guard !Task.isCancelled else { return }
                 currentStreamQuality = stream.quality
                 currentStreamQualityDetail = stream.qualityDetail
+                currentStreamProvider = stream.provider
                 let item = AVPlayerItem(asset: asset)
                 item.audioTimePitchAlgorithm = .timeDomain
                 pendingAutoplay = autoplay
@@ -272,6 +314,10 @@ final class PlaybackEngine: ObservableObject {
                             if wasPrefetched {
                                 // Warmed URL went stale. Re-resolve once before blaming the track.
                                 self.loadCurrent(autoplay: autoplay, usePrefetch: false)
+                                return
+                            }
+                            if [.amazon, .qobuz, .deezer].contains(stream.provider) {
+                                self.recoverPlaybackFailure(provider: stream.provider, autoplay: autoplay)
                                 return
                             }
                             self.isLoading = false
@@ -371,6 +417,50 @@ final class PlaybackEngine: ObservableObject {
             return nil
         }
         return entry.task
+    }
+
+    private func resetPlaybackRecovery() {
+        skippedProviders.removeAll()
+        providerFailureCounts.removeAll()
+        currentStreamProvider = nil
+        recoveryQuality = nil
+    }
+
+    /// A provider can resolve successfully and still hand AVPlayer an expired,
+    /// truncated, or non-seekable asset. Re-resolve automatically (fresh signed
+    /// URL / file), downgrade Amazon from FLAC to its simpler AAC path when needed,
+    /// then exclude an exhausted provider. The user never has to hammer Play.
+    private func recoverPlaybackFailure(provider: Provider, autoplay: Bool) {
+        guard currentTrack != nil else { return }
+        // The Amazon resolver intentionally reuses decrypted local files. If
+        // AVPlayer rejects one, remove that cache entry before resolving again;
+        // otherwise every retry reopens the exact same corrupt file.
+        if provider == .amazon,
+           let asset = player.currentItem?.asset as? AVURLAsset,
+           asset.url.isFileURL,
+           asset.url.lastPathComponent.hasPrefix("monochrome-amz-") {
+            try? FileManager.default.removeItem(at: asset.url)
+        }
+        let failures = (providerFailureCounts[provider] ?? 0) + 1
+        providerFailureCounts[provider] = failures
+        if provider == .amazon, failures == 2, (recoveryQuality ?? PlaybackQuality.stored).rank > PlaybackQuality.high.rank {
+            // FLAC-in-fMP4 is the least forgiving AVFoundation path. Preserve the
+            // first retry at the requested tier, then choose Amazon AAC before
+            // abandoning a track whose catalog lookup itself was successful.
+            recoveryQuality = .high
+        } else if provider == .amazon, failures == 4 {
+            recoveryQuality = .low
+        }
+        if (provider == .amazon && failures >= 6) || (provider != .amazon && failures >= 3) {
+            skippedProviders.insert(provider)
+        }
+        pendingAutoplay = false
+        itemStatusObservation = nil
+        player.pause()
+        isPlaying = false
+        isLoading = true
+        errorMessage = nil
+        loadCurrent(autoplay: autoplay, usePrefetch: false)
     }
 
     private func itemDidFinish() {
