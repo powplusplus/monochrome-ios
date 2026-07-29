@@ -20,13 +20,37 @@ enum AmazonCencDecryptor {
         }
         _ = pruneCacheOnce
 
-        let (data, response) = try await session.data(from: sourceURL)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw ServiceError.unavailable("Amazon stream download failed")
+        var latestError: Error = ServiceError.unavailable("Amazon stream download failed")
+        for attempt in 0..<4 {
+            do {
+                let (data, response) = try await session.data(from: sourceURL)
+                guard let http = response as? HTTPURLResponse else { throw ServiceError.invalidResponse }
+                guard (200..<300).contains(http.statusCode) else { throw ServiceError.http(http.statusCode) }
+                guard data.count > 4096 else { throw ServiceError.malformed("Amazon stream was truncated") }
+                let clear = try decrypt(data: data, key: key, codec: codec)
+                try clear.write(to: target, options: .atomic)
+                return target
+            } catch {
+                latestError = error
+                guard attempt < 3, isRetryable(error) else { throw error }
+                try Task.checkCancellation()
+                try await Task.sleep(nanoseconds: UInt64(350 + attempt * 650) * 1_000_000)
+            }
         }
-        let clear = try decrypt(data: data, key: key, codec: codec)
-        try clear.write(to: target, options: .atomic)
-        return target
+        throw latestError
+    }
+
+    private static func isRetryable(_ error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            return [.timedOut, .networkConnectionLost, .cannotConnectToHost, .cannotFindHost,
+                    .dnsLookupFailed, .notConnectedToInternet, .resourceUnavailable].contains(urlError.code)
+        }
+        if let serviceError = error as? ServiceError, case .http(let status) = serviceError {
+            // 403/404 commonly mean the signed CDN URL expired between lookup and
+            // download; the outer resolver will mint a fresh URL if this one stays bad.
+            return status == 403 || status == 404 || status == 408 || status == 429 || status >= 500
+        }
+        return false
     }
 
     private static func cacheURL(for sourceURL: URL, codec: String) -> URL {

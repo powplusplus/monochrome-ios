@@ -3,6 +3,13 @@ import Foundation
 final class MusicService {
     static let shared = MusicService()
 
+    /// Provider gateways deliberately allow the official web app rather than arbitrary API clients.
+    /// Preserve that contract when the native shell makes the equivalent request.
+    static let webRequestHeaders = [
+        "Origin": "https://monochrome.tf",
+        "Referer": "https://monochrome.tf/",
+    ]
+
     private let session: URLSession
     private let cache = NSCache<NSString, NSData>()
 
@@ -18,8 +25,7 @@ final class MusicService {
     /// its page origin on every fetch; native URLSession sends neither header
     /// and gets a 403. Stamp the Monochrome origin so native reaches parity.
     private func applyMonochromeOrigin(to request: inout URLRequest) {
-        request.setValue("https://monochrome.tf", forHTTPHeaderField: "Origin")
-        request.setValue("https://monochrome.tf/", forHTTPHeaderField: "Referer")
+        Self.webRequestHeaders.forEach { request.setValue($1, forHTTPHeaderField: $0) }
     }
 
     func search(_ query: String) async throws -> SearchResults {
@@ -157,7 +163,9 @@ final class MusicService {
         // Catalog payloads often include a webpage `url` (e.g. tidal.com/track/…) that
         // was historically mapped into streamURL. Only short-circuit for real media.
         // Stamp format from the URL/catalog — never the requested preference tier.
-        if let url = track.streamURL, Self.isDirectMediaURL(url) {
+        if let url = track.streamURL,
+           Self.isDirectMediaURL(url),
+           !skipped.contains(track.provider) {
             let token = track.audioQuality
                 ?? PlaybackQuality.mediaFormatToken(mimeType: track.enclosureType, url: url)
                 ?? track.catalogQuality?.rawValue
@@ -278,6 +286,33 @@ final class MusicService {
     }
 
     private func resolveAmazonStream(for track: Track, quality: PlaybackQuality) async throws -> StreamResponse {
+        var lastError: Error = ServiceError.unavailable("Amazon Music unavailable")
+        for attempt in 0..<3 {
+            do {
+                return try await resolveAmazonStreamOnce(for: track, quality: quality)
+            } catch {
+                lastError = error
+                guard Self.isTransientPlaybackError(error), attempt < 2 else { throw error }
+                try Task.checkCancellation()
+                try await Task.sleep(nanoseconds: UInt64(500 + attempt * 900) * 1_000_000)
+            }
+        }
+        throw lastError
+    }
+
+    static func isTransientPlaybackError(_ error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            return [.timedOut, .networkConnectionLost, .cannotConnectToHost, .cannotFindHost,
+                    .dnsLookupFailed, .notConnectedToInternet, .resourceUnavailable].contains(urlError.code)
+        }
+        if let serviceError = error as? ServiceError, case .http(let status) = serviceError {
+            return status == 403 || status == 404 || status == 408 || status == 409
+                || status == 425 || status == 429 || status >= 500
+        }
+        return false
+    }
+
+    private func resolveAmazonStreamOnce(for track: Track, quality: PlaybackQuality) async throws -> StreamResponse {
         guard PlaybackSourceSettings.amazonEnabled else {
             throw ServiceError.unavailable("Amazon Music disabled")
         }
@@ -396,6 +431,13 @@ final class MusicService {
         }
         let (data, response) = try await session.data(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            // Preserve retryable statuses as structured errors. Converting a 503
+            // to a message-only `.unavailable` made the retry layer treat the
+            // most common intermittent gateway failure as permanent.
+            if http.statusCode == 408 || http.statusCode == 409 || http.statusCode == 425
+                || http.statusCode == 429 || http.statusCode >= 500 {
+                throw ServiceError.http(http.statusCode)
+            }
             // Amazon states its own failures ("Invalid Turnstile JWT",
             // "turnstile_required"); a bare status code hid which one it was.
             if let detail = Self.providerErrorDetail(in: data), http.statusCode != 401, http.statusCode != 428 {
@@ -583,6 +625,7 @@ final class MusicService {
                     quality: format,
                     replayGain: nil,
                     peak: nil,
+                    requestHeaders: Self.webRequestHeaders,
                     isPreview: false,
                     previewReason: nil,
                     mediaDuration: track.duration > 0 ? track.duration : nil

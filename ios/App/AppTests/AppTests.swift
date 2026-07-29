@@ -1,4 +1,5 @@
 import XCTest
+import Foundation
 @testable import App
 
 final class AppTests: XCTestCase {
@@ -72,6 +73,28 @@ final class AppTests: XCTestCase {
         XCTAssertTrue(html.contains("turnstile.execute(id)"))
         XCTAssertTrue(html.contains("sitekey: '0xTEST'"))
         XCTAssertFalse(html.contains("appearance: 'always'"))
+    }
+
+    func testProviderRequestsUseOfficialMonochromeOrigin() {
+        XCTAssertEqual(MusicService.webRequestHeaders["Origin"], "https://monochrome.tf")
+        XCTAssertEqual(MusicService.webRequestHeaders["Referer"], "https://monochrome.tf/")
+    }
+
+    func testPlaybackRetryClassifiesGatewayAndSignedURLFailuresAsTransient() {
+        for status in [403, 404, 408, 409, 425, 429, 500, 502, 503, 504] {
+            XCTAssertTrue(MusicService.isTransientPlaybackError(ServiceError.http(status)), "HTTP \(status)")
+        }
+        XCTAssertFalse(MusicService.isTransientPlaybackError(ServiceError.http(400)))
+        XCTAssertFalse(MusicService.isTransientPlaybackError(ServiceError.http(422)))
+        XCTAssertFalse(MusicService.isTransientPlaybackError(ServiceError.unavailable("track is not in the catalog")))
+    }
+
+    func testPlaybackRetryClassifiesConnectionFailuresAsTransient() {
+        for code in [URLError.timedOut, .networkConnectionLost, .cannotConnectToHost,
+                     .cannotFindHost, .dnsLookupFailed, .notConnectedToInternet, .resourceUnavailable] {
+            XCTAssertTrue(MusicService.isTransientPlaybackError(URLError(code)), "\(code)")
+        }
+        XCTAssertFalse(MusicService.isTransientPlaybackError(URLError(.badURL)))
     }
 
     func testAmazonTurnstileChallengeHTMLVisibleFallbackParity() {

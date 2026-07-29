@@ -456,6 +456,8 @@ struct StreamResponse: Codable {
     var quality: String
     var replayGain: Double?
     var peak: Double?
+    /// Headers required by provider endpoints that only serve the Monochrome web origin.
+    var requestHeaders: [String: String] = [:]
     /// TIDAL OpenAPI can return a ~30s `PREVIEW` when full playback needs a subscription.
     var isPreview: Bool = false
     var previewReason: String? = nil
