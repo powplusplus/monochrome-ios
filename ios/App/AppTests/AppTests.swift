@@ -74,6 +74,11 @@ final class AppTests: XCTestCase {
         XCTAssertFalse(html.contains("appearance: 'always'"))
     }
 
+    func testProviderRequestsUseOfficialMonochromeOrigin() {
+        XCTAssertEqual(MusicService.webRequestHeaders["Origin"], "https://monochrome.tf")
+        XCTAssertEqual(MusicService.webRequestHeaders["Referer"], "https://monochrome.tf/")
+    }
+
     func testAmazonTurnstileChallengeHTMLVisibleFallbackParity() {
         let html = AmazonTurnstileAuth.challengeHTML(siteKey: "0xTEST", mode: .alwaysVisible)
         XCTAssertTrue(html.contains("execution: 'render'"))

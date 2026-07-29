@@ -3,6 +3,13 @@ import Foundation
 final class MusicService {
     static let shared = MusicService()
 
+    /// Provider gateways deliberately allow the official web app rather than arbitrary API clients.
+    /// Preserve that contract when the native shell makes the equivalent request.
+    static let webRequestHeaders = [
+        "Origin": "https://monochrome.tf",
+        "Referer": "https://monochrome.tf/",
+    ]
+
     private let session: URLSession
     private let cache = NSCache<NSString, NSData>()
 
@@ -14,8 +21,7 @@ final class MusicService {
     /// its page origin on every fetch; native URLSession sends neither header
     /// and gets a 403. Stamp the Monochrome origin so native reaches parity.
     private func applyMonochromeOrigin(to request: inout URLRequest) {
-        request.setValue("https://monochrome.tf", forHTTPHeaderField: "Origin")
-        request.setValue("https://monochrome.tf/", forHTTPHeaderField: "Referer")
+        Self.webRequestHeaders.forEach { request.setValue($1, forHTTPHeaderField: $0) }
     }
 
     func search(_ query: String) async throws -> SearchResults {
@@ -391,6 +397,7 @@ final class MusicService {
                     quality: format,
                     replayGain: nil,
                     peak: nil,
+                    requestHeaders: Self.webRequestHeaders,
                     isPreview: false,
                     previewReason: nil,
                     mediaDuration: track.duration > 0 ? track.duration : nil
@@ -420,6 +427,7 @@ final class MusicService {
                     quality: format,
                     replayGain: nil,
                     peak: nil,
+                    requestHeaders: Self.webRequestHeaders,
                     isPreview: false,
                     previewReason: nil,
                     mediaDuration: track.duration > 0 ? track.duration : nil

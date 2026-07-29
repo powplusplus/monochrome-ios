@@ -43,6 +43,14 @@ final class PlaybackEngine: ObservableObject {
         let asset: AVURLAsset
     }
 
+    private static func asset(for stream: StreamResponse) -> AVURLAsset {
+        guard !stream.requestHeaders.isEmpty else { return AVURLAsset(url: stream.url) }
+        return AVURLAsset(
+            url: stream.url,
+            options: ["AVURLAssetHTTPHeaderFieldsKey": stream.requestHeaders]
+        )
+    }
+
     private var prefetch: [String: (task: Task<PreparedStream, Error>, startedAt: Date)] = [:]
     /// Signed CDN URLs go stale; past this age we re-resolve instead of handing
     /// AVPlayer a dead URL.
@@ -238,7 +246,7 @@ final class PlaybackEngine: ObservableObject {
                     wasPrefetched = true
                 } else {
                     stream = try await musicService.resolveStream(for: track, quality: PlaybackQuality.stored)
-                    asset = AVURLAsset(url: stream.url)
+                    asset = Self.asset(for: stream)
                 }
                 guard !Task.isCancelled else { return }
                 currentStreamQuality = stream.quality
@@ -345,7 +353,7 @@ final class PlaybackEngine: ObservableObject {
             let task = Task<PreparedStream, Error> {
                 let stream = try await service.resolveStream(for: track, quality: PlaybackQuality.stored)
                 try Task.checkCancellation()
-                let asset = AVURLAsset(url: stream.url)
+                let asset = Self.asset(for: stream)
                 // Pull the manifest / moov box now so playback starts on bytes we already hold.
                 _ = try? await asset.load(.isPlayable, .duration)
                 return PreparedStream(stream: stream, asset: asset)
@@ -428,7 +436,9 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     func download(_ track: Track) async {
         do {
             let stream = try await MusicService.shared.resolveStream(for: track, quality: PlaybackQuality.stored)
-            let task = session.downloadTask(with: stream.url); tasks[task.taskIdentifier] = track; progress[track.id] = 0; task.resume()
+            var request = URLRequest(url: stream.url)
+            stream.requestHeaders.forEach { request.setValue($1, forHTTPHeaderField: $0) }
+            let task = session.downloadTask(with: request); tasks[task.taskIdentifier] = track; progress[track.id] = 0; task.resume()
         } catch { progress[track.id] = nil }
     }
     func cancel(_ track: Track) {
