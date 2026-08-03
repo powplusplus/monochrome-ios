@@ -244,7 +244,8 @@ final class AudioAnalyzerTests: XCTestCase {
         )
         defer { try? FileManager.default.removeItem(at: url) }
 
-        let analysis = try XCTUnwrap(await AudioAnalyzer.analyze(url: url))
+        let result = await AudioAnalyzer.analyze(url: url)
+        let analysis = try XCTUnwrap(result)
         XCTAssertEqual(analysis.codec, "WAV")
         XCTAssertEqual(analysis.sampleRate, 44_100)
         XCTAssertEqual(analysis.verdict, .lossless)
@@ -258,7 +259,8 @@ final class AudioAnalyzerTests: XCTestCase {
         )
         defer { try? FileManager.default.removeItem(at: url) }
 
-        let analysis = try XCTUnwrap(await AudioAnalyzer.analyze(url: url))
+        let result = await AudioAnalyzer.analyze(url: url)
+        let analysis = try XCTUnwrap(result)
         XCTAssertEqual(analysis.verdict, .transcoded)
         XCTAssertEqual(try XCTUnwrap(analysis.cutoffHz), 16_000, accuracy: 900)
     }
@@ -270,7 +272,8 @@ final class AudioAnalyzerTests: XCTestCase {
         )
         defer { try? FileManager.default.removeItem(at: url) }
 
-        let analysis = try XCTUnwrap(await AudioAnalyzer.analyze(url: url))
+        let result = await AudioAnalyzer.analyze(url: url)
+        let analysis = try XCTUnwrap(result)
         XCTAssertEqual(analysis.sampleRate, 96_000)
         XCTAssertEqual(analysis.verdict, .upsampled)
     }
