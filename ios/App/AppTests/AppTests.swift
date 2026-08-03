@@ -176,6 +176,34 @@ final class AppTests: XCTestCase {
         XCTAssertFalse(html.contains("interaction-only"))
     }
 
+    func testAmazonTurnstileChallengeReportsCloudflareErrorCodes() {
+        // 110200 (domain not on the site key) and 600010 (embedding refused) are
+        // both `turnstile_failed` without the code, and they need opposite fixes.
+        for mode in [AmazonTurnstileAuth.ChallengeMode.interactionOnly, .alwaysVisible] {
+            let html = AmazonTurnstileAuth.challengeHTML(siteKey: "0xTEST", mode: mode)
+            XCTAssertTrue(html.contains("'error-callback': function(code)"), "\(mode)")
+            XCTAssertTrue(html.contains("code: code ? String(code) : ''"), "\(mode)")
+        }
+    }
+
+    func testTurnstileFailureTextKeepsTheCloudflareCode() {
+        XCTAssertEqual(AmazonTurnstileAuth.describe("turnstile_failed", code: "110200"),
+                       "turnstile_failed [110200]")
+        XCTAssertEqual(AmazonTurnstileAuth.describe("turnstile_failed", code: nil), "turnstile_failed")
+        XCTAssertEqual(AmazonTurnstileAuth.describe("turnstile_failed", code: ""), "turnstile_failed")
+    }
+
+    func testTurnstileChallengeIsServedAsTheMonochromeWebOrigin() {
+        // The site keys are issued for this host; anything else is a 110200.
+        XCTAssertEqual(AmazonTurnstileAuth.challengeOrigin.absoluteString, "https://monochrome.tf/")
+    }
+
+    func testTurnstileExchangeErrorDetailReadsFastAPIValidationArrays() {
+        let body = Data(#"{"detail":[{"loc":["body","song_name"],"msg":"String should have at least 1 character"}]}"#.utf8)
+        XCTAssertEqual(AmazonTurnstileAuth.exchangeErrorDetail(in: body),
+                       "String should have at least 1 character")
+    }
+
     func testAmazonTurnstileSiteKeyEscapesQuotes() {
         let html = AmazonTurnstileAuth.challengeHTML(siteKey: "key'\\x", mode: .interactionOnly)
         XCTAssertTrue(html.contains("sitekey: 'key\\'\\\\x'"))

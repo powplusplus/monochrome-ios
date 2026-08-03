@@ -77,7 +77,11 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
     private var solveQueue: Task<Void, Never>?
     private var mode: ChallengeMode = .interactionOnly
     private var siteKeyForRetry: String = ""
+    private var actionForRetry: String = ""
     private var allowInteractive = true
+    /// Last code Cloudflare handed the widget's `error-callback`, kept across the
+    /// invisible → visible retry so the surfaced failure still names the cause.
+    private var lastChallengeErrorCode: String?
 
     func cachedJWT(for exchange: Exchange = .amazon) -> String? {
         let jwt = UserDefaults.standard.string(forKey: exchange.tokenKey) ?? ""
@@ -106,7 +110,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
     /// two challenges on screen at launch to save a round trip the second leg
     /// usually never makes.
     func prewarm() {
-        guard let (exchange, base, bypass, siteKey) = Self.prewarmTarget() else { return }
+        guard let (exchange, base, bypass, siteKey, action) = Self.prewarmTarget() else { return }
         guard bypass.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               cachedJWT(for: exchange) == nil,
               inFlight[exchange.id] == nil else { return }
@@ -120,6 +124,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
                 apiBaseURL: base,
                 exchange: exchange,
                 siteKey: siteKey,
+                action: action,
                 allowInteractive: false,
                 timeout: 15
             )
@@ -132,18 +137,20 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
     /// its key would solve the wrong widget the moment either side rotates or a
     /// user overrides one in Settings.
     nonisolated static func prewarmTarget()
-        -> (exchange: Exchange, base: String, bypass: String, siteKey: String)? {
+        -> (exchange: Exchange, base: String, bypass: String, siteKey: String, action: String)? {
         if PlaybackSourceSettings.rythmEnabled {
             return (.rythm,
                     PlaybackSourceSettings.rythmBaseURL,
                     PlaybackSourceSettings.rythmBypassToken,
-                    PlaybackSourceSettings.rythmTurnstileSiteKey)
+                    PlaybackSourceSettings.rythmTurnstileSiteKey,
+                    PlaybackSourceSettings.rythmTurnstileAction)
         }
         if PlaybackSourceSettings.amazonEnabled {
             return (.amazon,
                     PlaybackSourceSettings.amazonApiBaseURL,
                     PlaybackSourceSettings.amazonBypassToken,
-                    PlaybackSourceSettings.amazonTurnstileSiteKey)
+                    PlaybackSourceSettings.amazonTurnstileSiteKey,
+                    PlaybackSourceSettings.amazonTurnstileAction)
         }
         return nil
     }
@@ -152,6 +159,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         apiBaseURL: String,
         exchange: Exchange = .amazon,
         siteKey: String = PlaybackSourceSettings.amazonTurnstileSiteKey,
+        action: String = PlaybackSourceSettings.amazonTurnstileAction,
         forceRefresh: Bool = false,
         allowInteractive: Bool = true,
         timeout: TimeInterval = 60
@@ -169,6 +177,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
             if forceRefresh { clearCache(for: exchange) }
             let turnstileToken = try await serializedSolve(
                 siteKey: siteKey,
+                action: action,
                 allowInteractive: allowInteractive,
                 timeout: timeout
             )
@@ -283,16 +292,27 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         return Data(base64Encoded: text)
     }
 
+    /// The origin the challenge document is served as. Cloudflare matches this
+    /// hostname against the site key's allowed domains, so it has to be the
+    /// Monochrome web origin the keys were issued for.
+    nonisolated static let challengeOrigin = URL(string: "https://monochrome.tf/")!
+
     /// HTML loaded into WKWebView. Exposed for unit tests.
-    nonisolated static func challengeHTML(siteKey: String, mode: ChallengeMode) -> String {
-        let escapedKey = siteKey
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "'", with: "\\'")
+    nonisolated static func challengeHTML(
+        siteKey: String,
+        mode: ChallengeMode,
+        action: String = ""
+    ) -> String {
+        let escapedKey = escapeForJS(siteKey)
+        // Rendering `action: ''` is not the same as omitting it — an exchange
+        // that expects no action rejects an empty one just as loudly as a wrong
+        // one, so the line exists only when there is an action to send.
+        let actionLine = action.isEmpty ? "" : "\n      action: '\(escapeForJS(action))',"
         let renderOptions: String
         switch mode {
         case .interactionOnly:
             renderOptions = """
-                  sitekey: '\(escapedKey)',
+                  sitekey: '\(escapedKey)',\(actionLine)
                   execution: 'execute',
                   appearance: 'interaction-only',
                   theme: 'dark',
@@ -302,8 +322,10 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
                   callback: function(token) {
                     window.webkit.messageHandlers.monochromeTurnstile.postMessage({ ok: true, token: token });
                   },
-                  'error-callback': function() {
-                    window.webkit.messageHandlers.monochromeTurnstile.postMessage({ ok: false, error: 'turnstile_failed' });
+                  'error-callback': function(code) {
+                    window.webkit.messageHandlers.monochromeTurnstile.postMessage({
+                      ok: false, error: 'turnstile_failed', code: code ? String(code) : ''
+                    });
                   },
                   'expired-callback': function() {
                     window.webkit.messageHandlers.monochromeTurnstile.postMessage({ ok: false, error: 'turnstile_expired' });
@@ -311,7 +333,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
             """
         case .alwaysVisible:
             renderOptions = """
-                  sitekey: '\(escapedKey)',
+                  sitekey: '\(escapedKey)',\(actionLine)
                   size: 'compact',
                   execution: 'render',
                   appearance: 'always',
@@ -319,8 +341,10 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
                   callback: function(token) {
                     window.webkit.messageHandlers.monochromeTurnstile.postMessage({ ok: true, token: token });
                   },
-                  'error-callback': function() {
-                    window.webkit.messageHandlers.monochromeTurnstile.postMessage({ ok: false, error: 'turnstile_failed' });
+                  'error-callback': function(code) {
+                    window.webkit.messageHandlers.monochromeTurnstile.postMessage({
+                      ok: false, error: 'turnstile_failed', code: code ? String(code) : ''
+                    });
                   },
                   'expired-callback': function() {
                     window.webkit.messageHandlers.monochromeTurnstile.postMessage({ ok: false, error: 'turnstile_expired' });
@@ -358,12 +382,19 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         """
     }
 
+    nonisolated private static func escapeForJS(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "'", with: "\'")
+    }
+
     /// `solveTurnstile` owns a single WKWebView and cancels whatever solve was
     /// already pending, which is correct for a retry but destructive when two
     /// exchanges ask independently. Queue them so the second waits for the first
     /// to finish (or fail) instead of tearing its challenge down mid-flight.
     private func serializedSolve(
         siteKey: String,
+        action: String,
         allowInteractive: Bool,
         timeout: TimeInterval
     ) async throws -> String {
@@ -373,6 +404,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
             guard let self else { throw CancellationError() }
             return try await self.solveTurnstile(
                 siteKey: siteKey,
+                action: action,
                 allowInteractive: allowInteractive,
                 timeout: timeout
             )
@@ -383,6 +415,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
 
     private func solveTurnstile(
         siteKey: String,
+        action: String,
         allowInteractive: Bool,
         timeout: TimeInterval
     ) async throws -> String {
@@ -390,7 +423,9 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
             self.finishPending(with: .failure(CancellationError()))
             self.continuation = continuation
             self.siteKeyForRetry = siteKey
+            self.actionForRetry = action
             self.mode = .interactionOnly
+            self.lastChallengeErrorCode = nil
             self.allowInteractive = allowInteractive
 
             guard Self.foregroundWindowScene != nil else {
@@ -399,7 +434,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
                 return
             }
 
-            presentChallenge(siteKey: siteKey, mode: .interactionOnly, showOverlay: false)
+            presentChallenge(siteKey: siteKey, action: action, mode: .interactionOnly, showOverlay: false)
 
             let deadline = DispatchWorkItem { [weak self] in
                 self?.finishPending(with: .failure(ServiceError.unavailable("Turnstile timed out")))
@@ -409,7 +444,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         }
     }
 
-    private func presentChallenge(siteKey: String, mode: ChallengeMode, showOverlay: Bool) {
+    private func presentChallenge(siteKey: String, action: String, mode: ChallengeMode, showOverlay: Bool) {
         tearDownWebViewOnly()
 
         guard let scene = Self.foregroundWindowScene else {
@@ -454,8 +489,23 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         }
         self.hostWindow = window
 
-        // baseURL must be an allowlisted Monochrome host so Turnstile accepts the site key.
-        webView.loadHTMLString(Self.challengeHTML(siteKey: siteKey, mode: mode), baseURL: URL(string: "https://monochrome.tf/"))
+        // The document must *be* an allowlisted Monochrome page, not merely claim
+        // one as its base URL: `loadHTMLString(_:baseURL:)` leaves the content in
+        // an opaque origin, so `window.origin` is null and storage access throws
+        // — which Turnstile reports as a plain widget error. `loadSimulatedRequest`
+        // gives the same HTML a real `https://monochrome.tf/` origin.
+        let request = URLRequest(url: Self.challengeOrigin)
+        let response = HTTPURLResponse(
+            url: Self.challengeOrigin,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "text/html; charset=utf-8"]
+        )!
+        webView.loadSimulatedRequest(
+            request,
+            response: response,
+            responseData: Data(Self.challengeHTML(siteKey: siteKey, mode: mode, action: action).utf8)
+        )
     }
 
     private func revealOverlay() {
@@ -467,16 +517,24 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         overlay.setChromeVisible(true)
     }
 
+    /// Cloudflare's numeric codes are the difference between a configuration
+    /// problem and a transient one, so keep them in the surfaced text.
+    nonisolated static func describe(_ detail: String, code: String?) -> String {
+        guard let code, !code.isEmpty else { return detail }
+        return "\(detail) [\(code)]"
+    }
+
     private func retryVisibleFallback() {
         guard allowInteractive else {
             finishPending(with: .failure(ServiceError.unavailable("Turnstile needs interaction")))
             return
         }
         guard mode == .interactionOnly else {
-            finishPending(with: .failure(ServiceError.unavailable("Turnstile: turnstile_failed")))
+            finishPending(with: .failure(ServiceError.unavailable(
+                "Turnstile: \(Self.describe("turnstile_failed", code: lastChallengeErrorCode))")))
             return
         }
-        presentChallenge(siteKey: siteKeyForRetry, mode: .alwaysVisible, showOverlay: true)
+        presentChallenge(siteKey: siteKeyForRetry, action: actionForRetry, mode: .alwaysVisible, showOverlay: true)
     }
 
     nonisolated func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -500,11 +558,16 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
                 finishPending(with: .success(token))
             } else {
                 let detail = body["error"] as? String ?? "turnstile_failed"
+                // Cloudflare's error code is the only thing that distinguishes
+                // "this domain is not on the site key" (110200) from "this
+                // browser/embedding is refused" (600010) from a plain network
+                // failure. Without it every cause read as `turnstile_failed`.
+                if let code = body["code"] as? String, !code.isEmpty { lastChallengeErrorCode = code }
                 if detail == "turnstile_failed", mode == .interactionOnly {
                     retryVisibleFallback()
                     return
                 }
-                finishPending(with: .failure(ServiceError.unavailable("Turnstile: \(detail)")))
+                finishPending(with: .failure(ServiceError.unavailable("Turnstile: \(Self.describe(detail, code: lastChallengeErrorCode))")))
             }
         }
     }

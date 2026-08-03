@@ -362,6 +362,7 @@ struct SettingsView: View {
     @AppStorage("native.rythmEnabled") private var rythmEnabled = true
     @AppStorage("native.rythmBaseURL") private var rythmBaseURL = "https://track-api.monochrome.tf"
     @AppStorage("native.rythmBypassToken") private var rythmBypassToken = ""
+    @AppStorage("native.rythmTurnstileAction") private var rythmTurnstileAction = "auth"
     @AppStorage("native.amazonEnabled") private var amazonEnabled = true
     @AppStorage("native.amazonApiBaseURL") private var amazonApiBaseURL = "https://amz.geeked.wtf"
     @AppStorage("native.amazonBypassToken") private var amazonBypassToken = ""
@@ -399,6 +400,12 @@ struct SettingsView: View {
                             .keyboardType(.URL)
                             .disableAutocorrection(true)
                         SecureField("Rythm bypass token (optional)", text: $rythmBypassToken)
+                            .textInputAutocapitalization(.never)
+                            .disableAutocorrection(true)
+                        // Must match `turnstile_action` from the resolver's
+                        // `GET /config`, or the exchange answers "turnstile
+                        // action mismatch" and the whole leg fails.
+                        TextField("Rythm Turnstile action", text: $rythmTurnstileAction)
                             .textInputAutocapitalization(.never)
                             .disableAutocorrection(true)
                     }

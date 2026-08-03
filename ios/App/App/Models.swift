@@ -241,6 +241,19 @@ enum PlaybackSourceSettings {
         set { UserDefaults.standard.set(newValue, forKey: "native.rythmTurnstileSiteKey") }
     }
 
+    /// Rythm verifies the `action` the widget was rendered with against the one
+    /// it publishes at `GET /config` (`"auth"`), and answers a token solved
+    /// without one with `turnstile action mismatch`. Cloudflare treats `action`
+    /// as free-form metadata, so nothing on the client side catches this —
+    /// the whole leg just fails at the exchange.
+    static var rythmTurnstileAction: String {
+        get {
+            let value = UserDefaults.standard.string(forKey: "native.rythmTurnstileAction")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (value?.isEmpty == false) ? value! : "auth"
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "native.rythmTurnstileAction") }
+    }
+
     static var amazonEnabled: Bool {
         get { UserDefaults.standard.object(forKey: "native.amazonEnabled") as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: "native.amazonEnabled") }
@@ -265,6 +278,14 @@ enum PlaybackSourceSettings {
             return (value?.isEmpty == false) ? value! : "0x4AAAAAADgxqF6QVMm0GLHH"
         }
         set { UserDefaults.standard.set(newValue, forKey: "native.amazonTurnstileSiteKey") }
+    }
+
+    /// Amazon's exchange does not check the action — web solves without one and
+    /// is accepted — so this stays empty unless a user is pointed at a fork that
+    /// does. Empty means "render no action at all", not "render an empty one".
+    static var amazonTurnstileAction: String {
+        get { UserDefaults.standard.string(forKey: "native.amazonTurnstileAction")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "native.amazonTurnstileAction") }
     }
 
     static var deezerEnabled: Bool {

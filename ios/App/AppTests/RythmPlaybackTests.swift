@@ -25,6 +25,8 @@ final class RythmPlaybackTests: XCTestCase {
         "native.rythmBaseURL",
         "native.rythmBypassToken",
         "native.rythmTurnstileSiteKey",
+        "native.rythmTurnstileAction",
+        "native.amazonTurnstileAction",
         "native.amazonEnabled",
         "native.amazonApiBaseURL",
         "native.amazonBypassToken",
@@ -463,12 +465,13 @@ final class RythmPlaybackTests: XCTestCase {
 
     // MARK: - Launch prewarm
 
-    func testPrewarmSolvesRythmWithRythmsOwnSiteKey() throws {
+    func testPrewarmSolvesRythmWithRythmsOwnSiteKeyAndAction() throws {
         PlaybackSourceSettings.amazonTurnstileSiteKey = "0xAMAZON"
         PlaybackSourceSettings.rythmTurnstileSiteKey = "0xRYTHM"
         let target = try XCTUnwrap(AmazonTurnstileAuth.prewarmTarget())
         XCTAssertEqual(target.exchange.id, "rythm")
         XCTAssertEqual(target.siteKey, "0xRYTHM")
+        XCTAssertEqual(target.action, "auth")
         XCTAssertEqual(target.base, "https://track-api.monochrome.tf")
     }
 
@@ -478,6 +481,44 @@ final class RythmPlaybackTests: XCTestCase {
         let target = try XCTUnwrap(AmazonTurnstileAuth.prewarmTarget())
         XCTAssertEqual(target.exchange.id, "amazon")
         XCTAssertEqual(target.siteKey, "0xAMAZON")
+        // Amazon's exchange does not check the action; sending one it does not
+        // expect is the same failure in the other direction.
+        XCTAssertEqual(target.action, "")
+    }
+
+    // MARK: - Turnstile action
+
+    func testRythmDefaultsToTheActionTheResolverPublishes() {
+        // `GET /config` reports `"turnstile_action":"auth"`, and the exchange
+        // rejects a token solved without it as "turnstile action mismatch".
+        XCTAssertEqual(PlaybackSourceSettings.rythmTurnstileAction, "auth")
+    }
+
+    func testChallengeRendersTheActionForBothChallengeModes() {
+        for mode in [AmazonTurnstileAuth.ChallengeMode.interactionOnly, .alwaysVisible] {
+            let html = AmazonTurnstileAuth.challengeHTML(siteKey: "0xTEST", mode: mode, action: "auth")
+            XCTAssertTrue(html.contains("action: 'auth',"), "\(mode)")
+        }
+    }
+
+    func testChallengeOmitsTheActionEntirelyWhenThereIsNone() {
+        // An empty `action: ''` is not the same as no action — Amazon accepts a
+        // token with neither, and would reject one carrying an empty string.
+        let html = AmazonTurnstileAuth.challengeHTML(siteKey: "0xTEST", mode: .interactionOnly, action: "")
+        XCTAssertFalse(html.contains("action:"))
+    }
+
+    func testChallengeActionIsEscapedLikeTheSiteKey() {
+        let html = AmazonTurnstileAuth.challengeHTML(
+            siteKey: "0xTEST", mode: .interactionOnly, action: "a'\\b"
+        )
+        XCTAssertTrue(html.contains("action: 'a\\'\\\\b',"))
+    }
+
+    func testRythmActionIsConfigurable() {
+        PlaybackSourceSettings.rythmTurnstileAction = "playback"
+        XCTAssertEqual(PlaybackSourceSettings.rythmTurnstileAction, "playback")
+        XCTAssertEqual(AmazonTurnstileAuth.prewarmTarget()?.action, "playback")
     }
 
     func testPrewarmDoesNothingWhenBothGatedLegsAreOff() {

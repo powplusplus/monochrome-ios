@@ -23,6 +23,7 @@ enum RythmPlaybackService {
             apiBaseURL: base,
             exchange: .rythm,
             siteKey: PlaybackSourceSettings.rythmTurnstileSiteKey,
+            action: PlaybackSourceSettings.rythmTurnstileAction,
             forceRefresh: forceRefresh
         )
     }
