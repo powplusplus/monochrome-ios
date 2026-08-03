@@ -23,6 +23,7 @@
 		A10000000000000000000017 /* Views.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000007 /* Views.swift */; };
 		A20000000000000000000011 /* AppTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* AppTests.swift */; };
 		A20000000000000000000091 /* RecommendationMathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000090 /* RecommendationMathTests.swift */; };
+		A20000000000000000000093 /* RythmPlaybackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000092 /* RythmPlaybackTests.swift */; };
 		504EC30F1FED79650016851F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 504EC30E1FED79650016851F /* Assets.xcassets */; };
 		504EC3121FED79650016851F /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 504EC3101FED79650016851F /* LaunchScreen.storyboard */; };
 /* End PBXBuildFile section */
@@ -55,6 +56,7 @@
 		A1000000000000000000000C /* RythmPlaybackService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RythmPlaybackService.swift; sourceTree = "<group>"; };
 		A20000000000000000000001 /* AppTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000090 /* RecommendationMathTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecommendationMathTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000092 /* RythmPlaybackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RythmPlaybackTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000002 /* AppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		504EC30E1FED79650016851F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		504EC3111FED79650016851F /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
@@ -126,6 +128,7 @@
 			children = (
 				A20000000000000000000001 /* AppTests.swift */,
 				A20000000000000000000090 /* RecommendationMathTests.swift */,
+				A20000000000000000000092 /* RythmPlaybackTests.swift */,
 			);
 			path = AppTests;
 			sourceTree = "<group>";
@@ -250,6 +253,7 @@
 			files = (
 				A20000000000000000000011 /* AppTests.swift in Sources */,
 				A20000000000000000000091 /* RecommendationMathTests.swift in Sources */,
+				A20000000000000000000093 /* RythmPlaybackTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

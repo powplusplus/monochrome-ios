@@ -106,20 +106,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
     /// two challenges on screen at launch to save a round trip the second leg
     /// usually never makes.
     func prewarm() {
-        let exchange: Exchange
-        let base: String
-        let bypass: String
-        if PlaybackSourceSettings.rythmEnabled {
-            exchange = .rythm
-            base = PlaybackSourceSettings.rythmBaseURL
-            bypass = PlaybackSourceSettings.rythmBypassToken
-        } else if PlaybackSourceSettings.amazonEnabled {
-            exchange = .amazon
-            base = PlaybackSourceSettings.amazonApiBaseURL
-            bypass = PlaybackSourceSettings.amazonBypassToken
-        } else {
-            return
-        }
+        guard let (exchange, base, bypass, siteKey) = Self.prewarmTarget() else { return }
         guard bypass.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               cachedJWT(for: exchange) == nil,
               inFlight[exchange.id] == nil else { return }
@@ -132,10 +119,33 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
             _ = try? await self.accessToken(
                 apiBaseURL: base,
                 exchange: exchange,
+                siteKey: siteKey,
                 allowInteractive: false,
                 timeout: 15
             )
         }
+    }
+
+    /// Which leg the launch prewarm solves for, and the settings it must use.
+    /// Each leg publishes its own Cloudflare site key: they match today, but
+    /// `accessToken` defaults to Amazon's, so prewarming Rythm without naming
+    /// its key would solve the wrong widget the moment either side rotates or a
+    /// user overrides one in Settings.
+    nonisolated static func prewarmTarget()
+        -> (exchange: Exchange, base: String, bypass: String, siteKey: String)? {
+        if PlaybackSourceSettings.rythmEnabled {
+            return (.rythm,
+                    PlaybackSourceSettings.rythmBaseURL,
+                    PlaybackSourceSettings.rythmBypassToken,
+                    PlaybackSourceSettings.rythmTurnstileSiteKey)
+        }
+        if PlaybackSourceSettings.amazonEnabled {
+            return (.amazon,
+                    PlaybackSourceSettings.amazonApiBaseURL,
+                    PlaybackSourceSettings.amazonBypassToken,
+                    PlaybackSourceSettings.amazonTurnstileSiteKey)
+        }
+        return nil
     }
 
     func accessToken(
@@ -227,6 +237,13 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }
         for key in ["detail", "error", "message"] {
             if let value = object[key] as? String, !value.isEmpty { return value }
+            // FastAPI states a schema rejection as `detail: [{loc, msg, …}]` —
+            // an array, unlike every other error these services return. Without
+            // this the caller only ever saw a bare "HTTP 422".
+            if let issues = object[key] as? [[String: Any]] {
+                let messages = issues.compactMap { $0["msg"] as? String }
+                if !messages.isEmpty { return messages.joined(separator: "; ") }
+            }
             guard let nested = object[key] as? [String: Any] else { continue }
             let code = (nested["code"] as? String) ?? (nested["message"] as? String)
             let errors = (nested["errors"] as? [String])?.joined(separator: ", ")

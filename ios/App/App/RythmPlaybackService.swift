@@ -13,6 +13,20 @@ import Foundation
 /// `/auth/turnstile`, then send the bearer token. A `bypass_token` skips the
 /// challenge entirely when the user has one.
 enum RythmPlaybackService {
+    /// Where the `/playback` bearer comes from. Production solves Turnstile in a
+    /// WKWebView, which needs a foreground window and a real Cloudflare round
+    /// trip — neither exists in a test bundle, so the seam lets the session
+    /// handling (first solve, 401 re-solve, single retry) be exercised directly.
+    static var sessionTokenProvider: (_ base: String, _ forceRefresh: Bool) async throws -> String = {
+        base, forceRefresh in
+        try await AmazonTurnstileAuth.shared.accessToken(
+            apiBaseURL: base,
+            exchange: .rythm,
+            siteKey: PlaybackSourceSettings.rythmTurnstileSiteKey,
+            forceRefresh: forceRefresh
+        )
+    }
+
     /// `quality` is accepted for call-site symmetry with the other resolvers but
     /// deliberately not sent: `PlaybackRequest` has no tier field, so the badge
     /// is read off the media URL Rythm actually returns rather than the tier the
@@ -36,11 +50,7 @@ enum RythmPlaybackService {
 
         var bearer: String?
         if bypass.isEmpty {
-            bearer = try await AmazonTurnstileAuth.shared.accessToken(
-                apiBaseURL: base,
-                exchange: .rythm,
-                siteKey: PlaybackSourceSettings.rythmTurnstileSiteKey
-            )
+            bearer = try await sessionTokenProvider(base, false)
         }
 
         do {
@@ -54,12 +64,7 @@ enum RythmPlaybackService {
             // than handing the track to a fallback that is very likely dead.
             guard case .http(let status) = error, status == 401 || status == 403 else { throw error }
             await AmazonTurnstileAuth.shared.clearCache(for: .rythm)
-            let fresh = try await AmazonTurnstileAuth.shared.accessToken(
-                apiBaseURL: base,
-                exchange: .rythm,
-                siteKey: PlaybackSourceSettings.rythmTurnstileSiteKey,
-                forceRefresh: true
-            )
+            let fresh = try await sessionTokenProvider(base, true)
             return try await fetchPlayback(
                 track: track, title: title, artist: artist,
                 base: base, bypass: "", bearer: fresh, session: session
