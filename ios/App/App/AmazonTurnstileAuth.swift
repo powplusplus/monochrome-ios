@@ -385,7 +385,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
     nonisolated private static func escapeForJS(_ value: String) -> String {
         value
             .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "'", with: "\'")
+            .replacingOccurrences(of: "'", with: "\\'")
     }
 
     /// `solveTurnstile` owns a single WKWebView and cancels whatever solve was
