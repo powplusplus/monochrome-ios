@@ -59,18 +59,40 @@ enum RythmPlaybackService {
                 track: track, title: title, artist: artist,
                 base: base, bypass: bypass, bearer: bearer, session: session
             )
-        } catch let error as ServiceError {
+        } catch let failure as PlaybackFailure {
             // `session_required` / `session_expired` arrive as 401 or 403 once the
             // hour-long session lapses. Re-solve once with a fresh token rather
             // than handing the track to a fallback that is very likely dead.
-            guard case .http(let status) = error, status == 401 || status == 403 else { throw error }
-            await AmazonTurnstileAuth.shared.clearCache(for: .rythm)
-            let fresh = try await sessionTokenProvider(base, true)
+            if failure.status == 401 || failure.status == 403 {
+                await AmazonTurnstileAuth.shared.clearCache(for: .rythm)
+                let fresh = try await sessionTokenProvider(base, true)
+                return try await fetchPlayback(
+                    track: track, title: title, artist: artist,
+                    base: base, bypass: "", bearer: fresh, session: session
+                )
+            }
+            // A 404 is Rythm saying nothing matched. The duration only narrows the
+            // match, and the catalog's figure routinely disagrees with the one the
+            // resolver holds — the TV-size edit of "Caste Room" is listed at 90s
+            // against a 94.2s recording, so the narrowing throws away a match the
+            // ISRC on its own would have made. Retry once without it before giving
+            // the track to a fallback leg.
+            guard failure.status == 404, track.duration > 0 else { throw failure }
             return try await fetchPlayback(
                 track: track, title: title, artist: artist,
-                base: base, bypass: "", bearer: fresh, session: session
+                base: base, bypass: bypass, bearer: bearer, session: session,
+                includeDuration: false
             )
         }
+    }
+
+    /// Carries the status alongside the message so `resolveStream` can branch on
+    /// it — the re-solve is for 401/403 only and the duration retry for 404 only —
+    /// while the chain error still reports the upstream detail verbatim.
+    private struct PlaybackFailure: Error, LocalizedError {
+        let status: Int
+        let service: ServiceError
+        var errorDescription: String? { service.errorDescription }
     }
 
     private static func fetchPlayback(
@@ -81,7 +103,8 @@ enum RythmPlaybackService {
         bypass: String,
         bearer: String?,
         session: URLSession,
-        timeout: TimeInterval = 30
+        timeout: TimeInterval = 30,
+        includeDuration: Bool = true
     ) async throws -> StreamResponse {
         var components = URLComponents(string: base + "/playback")
         if !bypass.isEmpty {
@@ -96,7 +119,7 @@ enum RythmPlaybackService {
            (5...32).contains(isrc.count) {
             body["isrc"] = isrc
         }
-        if track.duration > 0 { body["duration"] = track.duration }
+        if includeDuration, track.duration > 0 { body["duration"] = track.duration }
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
         request.httpMethod = "POST"
@@ -117,13 +140,16 @@ enum RythmPlaybackService {
         }
         guard let http = response as? HTTPURLResponse else { throw ServiceError.invalidResponse }
         guard (200..<300).contains(http.statusCode) else {
-            // 401/403 must stay structured — the caller re-solves the session on
-            // those and only those.
-            if http.statusCode == 401 || http.statusCode == 403 { throw ServiceError.http(http.statusCode) }
-            if let detail = AmazonTurnstileAuth.exchangeErrorDetail(in: data) {
-                throw ServiceError.unavailable("Rythm: \(detail)")
+            // 401/403 must stay bare — their bodies say `session_required`, which
+            // names the mechanism rather than anything the user can act on, and
+            // the caller re-solves on them anyway.
+            if http.statusCode == 401 || http.statusCode == 403 {
+                throw PlaybackFailure(status: http.statusCode, service: .http(http.statusCode))
             }
-            throw ServiceError.http(http.statusCode)
+            if let detail = AmazonTurnstileAuth.exchangeErrorDetail(in: data) {
+                throw PlaybackFailure(status: http.statusCode, service: .unavailable("Rythm: \(detail)"))
+            }
+            throw PlaybackFailure(status: http.statusCode, service: .http(http.statusCode))
         }
 
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

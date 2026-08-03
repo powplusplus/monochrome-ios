@@ -327,9 +327,57 @@ final class RythmPlaybackTests: XCTestCase {
         await assertFails(Self.track(), matching: "Rythm: upstream_unavailable")
     }
 
-    func testNoMatchIsSurfacedVerbatim() async {
+    func testNoMatchIsSurfacedVerbatimOnceTheDurationRetryAlsoMisses() async {
+        RythmStub.enqueue(status: 404, body: #"{"detail":"No match found"}"#)
         RythmStub.enqueue(status: 404, body: #"{"detail":"No match found"}"#)
         await assertFails(Self.track(), matching: "Rythm: No match found")
+        XCTAssertEqual(RythmStub.requests.count, 2)
+    }
+
+    // MARK: - Duration narrowing
+
+    func testNoMatchIsRetriedWithoutTheDurationNarrowing() async throws {
+        // The catalog duration disagrees with the resolver's often enough to lose
+        // a match the ISRC alone would have made — a TV-size edit listed at 90s
+        // against a 94.2s recording.
+        RythmStub.enqueue(status: 404, body: #"{"detail":"No match found"}"#)
+        RythmStub.enqueue(ok: Self.playbackBody())
+
+        let stream = try await resolve(Self.track(duration: 90, isrc: "JPI101701230"))
+        XCTAssertEqual(stream.provider, .rythm)
+        XCTAssertEqual(RythmStub.requests.count, 2)
+
+        let retry = try XCTUnwrap(RythmStub.bodies.last)
+        XCTAssertNil(retry["duration"])
+        // The ISRC is what finds the recording — it must survive the retry.
+        XCTAssertEqual(retry["isrc"] as? String, "JPI101701230")
+    }
+
+    func testTheDurationRetryHappensAtMostOnce() async {
+        RythmStub.enqueue(status: 404, body: #"{"detail":"No match found"}"#)
+        RythmStub.enqueue(status: 404, body: #"{"detail":"No match found"}"#)
+        RythmStub.enqueue(ok: Self.playbackBody())
+
+        await assertFails(Self.track(), matching: "No match found")
+        XCTAssertEqual(RythmStub.requests.count, 2)
+    }
+
+    func testNoMatchIsNotRetriedWhenNoDurationWasSent() async {
+        // Nothing was narrowed away, so a second identical request is pure latency.
+        RythmStub.enqueue(status: 404, body: #"{"detail":"No match found"}"#)
+        await assertFails(Self.track(duration: 0), matching: "Rythm: No match found")
+        XCTAssertEqual(RythmStub.requests.count, 1)
+    }
+
+    func testOtherFailuresAreNotRetriedWithoutTheDuration() async {
+        // Only a 404 means "nothing matched"; a 5xx or a 422 retried unchanged
+        // just doubles the cost of a leg that is already failing.
+        for status in [422, 500, 502, 503] {
+            RythmStub.reset()
+            RythmStub.enqueue(status: status, body: #"{"detail":"upstream_unavailable"}"#)
+            await assertFails(Self.track(), matching: "upstream_unavailable")
+            XCTAssertEqual(RythmStub.requests.count, 1, "status \(status)")
+        }
     }
 
     func testStatusOnlyFailureFallsBackToTheCode() async {
