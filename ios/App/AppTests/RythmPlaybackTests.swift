@@ -181,7 +181,7 @@ final class RythmPlaybackTests: XCTestCase {
 
     func testBodyCarriesNothingBeyondTheSchema() async throws {
         RythmStub.enqueue(ok: Self.playbackBody())
-        _ = try await resolve(Self.track(isrc: "GBTDG0900132", duration: 191))
+        _ = try await resolve(Self.track(duration: 191, isrc: "GBTDG0900132"))
         let keys = Set(try XCTUnwrap(RythmStub.bodies.first).keys)
         XCTAssertEqual(keys, ["song_name", "artist", "isrc", "duration"])
     }
