@@ -1,7 +1,7 @@
 import Foundation
 
 enum Provider: String, Codable, CaseIterable, Identifiable {
-    case tidal, amazon, qobuz, deezer, podcast
+    case tidal, amazon, qobuz, deezer, podcast, rythm
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -10,8 +10,10 @@ enum Provider: String, Codable, CaseIterable, Identifiable {
         }
     }
 
-    /// Catalog/provider picker — exclude podcasts (not a music catalog source).
-    static var musicCases: [Provider] { allCases.filter { $0 != .podcast } }
+    /// Catalog/provider picker — exclude podcasts and Rythm. Neither is a music
+    /// catalog: Rythm only resolves a stream for a name/artist pair, it has no
+    /// search, album or artist routes to browse.
+    static var musicCases: [Provider] { allCases.filter { $0 != .podcast && $0 != .rythm } }
 }
 
 /// Mirrors web `playback-quality` tokens (mapped to Amazon UHD/HD/SD and Deezer formats).
@@ -207,6 +209,38 @@ enum PlaybackQuality: String, CaseIterable, Identifiable, Codable {
 }
 
 enum PlaybackSourceSettings {
+    /// Rythm (`track-api.monochrome.tf`) is the resolver the web client reaches
+    /// for first. It aggregates server-side, so it keeps resolving while the
+    /// HiFi pool answers `Upstream API error` for `/track/` and while the Deezer
+    /// account pool is dead. ON by default; the legacy chain stays behind it.
+    static var rythmEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "native.rythmEnabled") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "native.rythmEnabled") }
+    }
+
+    static var rythmBaseURL: String {
+        get {
+            let value = UserDefaults.standard.string(forKey: "native.rythmBaseURL")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (value?.isEmpty == false) ? value! : "https://track-api.monochrome.tf"
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "native.rythmBaseURL") }
+    }
+
+    static var rythmBypassToken: String {
+        get { UserDefaults.standard.string(forKey: "native.rythmBypassToken") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "native.rythmBypassToken") }
+    }
+
+    /// Rythm publishes its own key at `GET /config`; it is currently the same one
+    /// Amazon uses, so the stored default is shared and the fetch is skipped.
+    static var rythmTurnstileSiteKey: String {
+        get {
+            let value = UserDefaults.standard.string(forKey: "native.rythmTurnstileSiteKey")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (value?.isEmpty == false) ? value! : "0x4AAAAAADgxqF6QVMm0GLHH"
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "native.rythmTurnstileSiteKey") }
+    }
+
     static var amazonEnabled: Bool {
         get { UserDefaults.standard.object(forKey: "native.amazonEnabled") as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: "native.amazonEnabled") }
@@ -525,6 +559,28 @@ enum Artwork {
 }
 
 enum ModelMapper {
+    /// TIDAL v1 payloads use numeric seconds while OpenAPI search results use
+    /// ISO-8601 durations such as `PT3M11S`. Normalize both at the model edge so
+    /// selecting a search result does not look like a zero-duration track and
+    /// trigger an unnecessary metadata request before playback can start.
+    static func durationSeconds(_ value: Any?) -> Double {
+        if let number = value as? NSNumber { return number.doubleValue }
+        guard let raw = value as? String else { return 0 }
+        if let seconds = Double(raw) { return seconds }
+
+        let expression = #"^PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?$"#
+        guard let regex = try? NSRegularExpression(pattern: expression, options: [.caseInsensitive]),
+              let match = regex.firstMatch(in: raw, range: NSRange(raw.startIndex..., in: raw)),
+              match.range.location != NSNotFound else { return 0 }
+
+        func component(_ index: Int) -> Double {
+            guard match.range(at: index).location != NSNotFound,
+                  let range = Range(match.range(at: index), in: raw) else { return 0 }
+            return Double(String(raw[range])) ?? 0
+        }
+        return component(1) * 3_600 + component(2) * 60 + component(3)
+    }
+
     static func unwrap(_ object: Any) -> Any {
         guard let dict = object as? [String: Any] else { return object }
         if let data = dict["data"] { return unwrap(data) }
@@ -590,7 +646,7 @@ enum ModelMapper {
         } else if let cover = string(dict, ["cover", "artwork"]) {
             album = AlbumSummary(id: "", title: string(dict, ["albumTitle"]) ?? "", cover: cover)
         }
-        let seconds = (dict["duration"] as? NSNumber)?.doubleValue ?? 0
+        let seconds = durationSeconds(dict["duration"])
         let prefixed = id.contains(":") ? id : "tidal:\(id)"
         let directURL = string(dict, ["streamUrl", "streamURL"]).flatMap(URL.init(string:))
 

@@ -52,6 +52,11 @@ final class PlaybackEngine: ObservableObject {
     private var itemStatusObservation: NSKeyValueObservation?
     private var pendingAutoplay = false
     private var fadeTask: Task<Void, Never>?
+    /// Background audio keeps the process alive only while AVPlayer is producing
+    /// audio. During a skip or a cold start we deliberately remove the old item
+    /// before resolving the new stream, leaving a suspension window where the
+    /// resolver would otherwise resume only after the app returns to foreground.
+    private var backgroundLoadTask: UIBackgroundTaskIdentifier = .invalid
     private let fadeDuration: TimeInterval = 0.25
     private let levelMonitor = AudioLevelMonitor()
     private var meterAttachTask: Task<Void, Never>?
@@ -171,7 +176,7 @@ final class PlaybackEngine: ObservableObject {
                       let failed = notification.object as? AVPlayerItem,
                       failed === self.player.currentItem,
                       let provider = self.currentStreamProvider,
-                      [.amazon, .qobuz, .deezer].contains(provider) else { return }
+                      [.rythm, .amazon, .qobuz, .deezer].contains(provider) else { return }
                 self.recoverPlaybackFailure(provider: provider, autoplay: true)
             }
         }
@@ -182,7 +187,7 @@ final class PlaybackEngine: ObservableObject {
                       let stalled = notification.object as? AVPlayerItem,
                       stalled === self.player.currentItem,
                       let provider = self.currentStreamProvider,
-                      [.amazon, .qobuz, .deezer].contains(provider) else { return }
+                      [.rythm, .amazon, .qobuz, .deezer].contains(provider) else { return }
                 let position = self.player.currentTime().seconds
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
                 guard !Task.isCancelled, stalled === self.player.currentItem,
@@ -225,6 +230,7 @@ final class PlaybackEngine: ObservableObject {
 
     func pause() {
         isPlaying = false
+        endBackgroundLoad()
         audioMeter.reset()
         updateNowPlaying()
         savePodcastProgressIfNeeded(force: true)
@@ -282,6 +288,7 @@ final class PlaybackEngine: ObservableObject {
         else if repeatMode == .all { currentIndex = 0 }
         else if autoplayEnabled {
             // Queue is exhausted: fetch more rather than silently stopping.
+            beginBackgroundLoad()
             Task { await self.extendQueue(advanceAfterwards: true) }
             return
         } else { pause(); return }
@@ -442,8 +449,16 @@ final class PlaybackEngine: ObservableObject {
     }
 
     private func loadCurrent(autoplay: Bool, usePrefetch: Bool = true) {
-        guard let track = currentTrack else { return }
+        guard let track = currentTrack else {
+            endBackgroundLoad()
+            return
+        }
         loadTask?.cancel()
+        // Acquire this before stopping the outgoing item. Once that item is
+        // removed there may be no playing audio to prevent iOS suspending us.
+        // Keeping one lease across provider retries lets the replacement item
+        // become ready and start even if the phone locks during resolution.
+        beginBackgroundLoad()
         pendingAutoplay = false
         isLoading = true
         loadedTrackID = nil
@@ -540,6 +555,7 @@ final class PlaybackEngine: ObservableObject {
                                 self.pendingAutoplay = false
                                 self.resume()
                             }
+                            self.endBackgroundLoad()
                             self.updateNowPlaying()
                         case .failed:
                             self.pendingAutoplay = false
@@ -550,7 +566,7 @@ final class PlaybackEngine: ObservableObject {
                                 return
                             }
                             if !fromLocalFile,
-                               [.amazon, .qobuz, .deezer].contains(failedProvider) {
+                               [.rythm, .amazon, .qobuz, .deezer].contains(failedProvider) {
                                 self.recoverPlaybackFailure(provider: failedProvider, autoplay: autoplay)
                                 return
                             }
@@ -558,6 +574,7 @@ final class PlaybackEngine: ObservableObject {
                             self.loadedTrackID = track.id
                             self.isPlaying = false
                             self.errorMessage = item.error?.localizedDescription ?? "This song could not be played."
+                            self.endBackgroundLoad()
                         case .unknown:
                             break
                         @unknown default:
@@ -582,6 +599,7 @@ final class PlaybackEngine: ObservableObject {
                         pendingAutoplay = false
                         resume()
                     }
+                    endBackgroundLoad()
                 }
                 LibraryRepository.shared.recordPlayback(track)
                 if !track.isPodcast {
@@ -608,8 +626,30 @@ final class PlaybackEngine: ObservableObject {
                 skippedProviders = []
                 loadedTrackID = track.id
                 isLoading = false; isPlaying = false; errorMessage = error.localizedDescription
+                endBackgroundLoad()
             }
         }
+    }
+
+    /// Requests the finite amount of execution time iOS provides for an audio
+    /// transition. This is intentionally not a permanent background assertion:
+    /// once AVPlayer starts, the `audio` background mode owns process lifetime.
+    private func beginBackgroundLoad() {
+        guard backgroundLoadTask == .invalid else { return }
+        backgroundLoadTask = UIApplication.shared.beginBackgroundTask(withName: "Prepare next song") { [weak self] in
+            Task { @MainActor in
+                // Do not cancel the resolver. If the system suspends us at expiry,
+                // it can still finish naturally on the next foreground activation.
+                self?.endBackgroundLoad()
+            }
+        }
+    }
+
+    private func endBackgroundLoad() {
+        guard backgroundLoadTask != .invalid else { return }
+        let identifier = backgroundLoadTask
+        backgroundLoadTask = .invalid
+        UIApplication.shared.endBackgroundTask(identifier)
     }
 
     /// The next `limit` tracks in play order, or none when the next pick is unpredictable

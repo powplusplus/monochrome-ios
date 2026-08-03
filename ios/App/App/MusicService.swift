@@ -173,8 +173,20 @@ final class MusicService {
             return StreamResponse(url: url, provider: track.provider, quality: token, replayGain: nil, peak: nil)
         }
 
-        // Match web Monochrome `getStreamUrl` (js/api.js):
-        // Amazon Music first → Lucida-Qobuz → Deezer. TIDAL is catalog-only.
+        // Rythm (`track-api.monochrome.tf`) first, then the legacy web chain from
+        // `getStreamUrl` (js/api.js): Amazon Music → Lucida-Qobuz → Deezer.
+        // TIDAL is catalog-only.
+        //
+        // Rythm leads because it is the only leg that is not a single upstream:
+        // it runs Monochrome/Qobuz/Amazon/Deezer server-side and answers with one
+        // resolved URL. The legs behind it have all degraded independently — the
+        // HiFi pool returns `Upstream API error` for every `/track/`, the web
+        // `/qobuz-lucida/*` routes now serve the SPA HTML instead of JSON, and
+        // the Deezer instance reports its whole account pool dead — so keeping
+        // them ahead of Rythm only spends their timeouts before the leg that
+        // still resolves is asked. They stay as fallbacks: each one comes back
+        // on its own schedule, and Amazon in particular is still reachable
+        // directly.
         //
         // Enrichment used to run unconditionally in front of Amazon, but Amazon
         // matches on title/artist/album/duration and never reads the ISRC — only
@@ -188,7 +200,11 @@ final class MusicService {
         // `skipping` lets PlaybackEngine drop a provider that already handed us a
         // URL AVPlayer rejected (signed CDN expire, CENC decode fail) and continue
         // down the chain — without that, Amazon "success" permanently blocked Lucida.
-        var enriched = track.duration > 0 ? track : await enrichTrackMetadata(track)
+        // Amazon can resolve from title/artist/album even when a search result has
+        // no duration. Do not make the less reliable `/info` instance pool a hard
+        // prerequisite for the first provider; enrich only if the fallback legs
+        // actually need an ISRC below.
+        var enriched = track
 
         // The legs are hedged, not raced: Lucida starts while Amazon is still
         // working, but Amazon still wins whenever it resolves, so the preference
@@ -205,6 +221,20 @@ final class MusicService {
                 var hedged = candidate
                 if hedged.isrc?.isEmpty != false { hedged = await self.enrichTrackMetadata(hedged) }
                 return try await self.resolveLucidaStream(for: hedged, quality: quality)
+            }
+        }
+
+        var rythmError: Error?
+        if !skipped.contains(.rythm), PlaybackSourceSettings.rythmEnabled {
+            do {
+                let response = try await RythmPlaybackService.resolveStream(
+                    for: enriched, quality: quality, session: session
+                )
+                lucidaHedge?.cancel()
+                return response
+            } catch {
+                rythmError = error
+                // Fall through to the legacy chain when Rythm cannot resolve.
             }
         }
 
@@ -237,31 +267,39 @@ final class MusicService {
         } else {
             lucidaHedge?.cancel()
         }
+        let rythmDetail = Self.legDetail(
+            rythmError,
+            fallback: skipped.contains(.rythm) ? "Rythm skipped"
+                : (PlaybackSourceSettings.rythmEnabled ? "Rythm unavailable" : "Rythm disabled")
+        )
+        let amazonDetail = Self.legDetail(
+            amazonError,
+            fallback: skipped.contains(.amazon) ? "Amazon skipped" : "Amazon Music unavailable"
+        )
+        let lucidaDetail = Self.legDetail(
+            lucidaError,
+            fallback: skipped.contains(.qobuz) ? "Lucida skipped" : "Lucida unavailable"
+        )
         if !skipped.contains(.deezer) {
             do {
                 return try await resolveDeezerStream(for: enriched, quality: quality)
             } catch {
-                let amazonDetail = (amazonError as? LocalizedError)?.errorDescription
-                    ?? amazonError?.localizedDescription
-                    ?? (skipped.contains(.amazon) ? "Amazon skipped" : "Amazon Music unavailable")
-                let lucidaDetail = (lucidaError as? LocalizedError)?.errorDescription
-                    ?? lucidaError?.localizedDescription
-                    ?? (skipped.contains(.qobuz) ? "Lucida skipped" : "Lucida unavailable")
-                let deezerDetail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                let deezerDetail = Self.legDetail(error, fallback: "Deezer unavailable")
                 throw ServiceError.unavailable(
-                    "Could not resolve stream URL from Amazon Music, Lucida, or Deezer. Amazon: \(amazonDetail) Lucida: \(lucidaDetail) Deezer: \(deezerDetail)"
+                    "Could not resolve stream URL from Rythm, Amazon Music, Lucida, or Deezer. Rythm: \(rythmDetail) Amazon: \(amazonDetail) Lucida: \(lucidaDetail) Deezer: \(deezerDetail)"
                 )
             }
         }
-        let amazonDetail = (amazonError as? LocalizedError)?.errorDescription
-            ?? amazonError?.localizedDescription
-            ?? (skipped.contains(.amazon) ? "Amazon skipped" : "Amazon Music unavailable")
-        let lucidaDetail = (lucidaError as? LocalizedError)?.errorDescription
-            ?? lucidaError?.localizedDescription
-            ?? (skipped.contains(.qobuz) ? "Lucida skipped" : "Lucida unavailable")
         throw ServiceError.unavailable(
-            "Could not resolve stream URL. Amazon: \(amazonDetail) Lucida: \(lucidaDetail)"
+            "Could not resolve stream URL. Rythm: \(rythmDetail) Amazon: \(amazonDetail) Lucida: \(lucidaDetail)"
         )
+    }
+
+    /// Provider errors are surfaced verbatim so the message names which leg gave
+    /// up and why, rather than a single "no stream" for four different causes.
+    private static func legDetail(_ error: Error?, fallback: String) -> String {
+        guard let error else { return fallback }
+        return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
 
     /// Pull ISRC / duration when search cards omit them. The ISRC is what the

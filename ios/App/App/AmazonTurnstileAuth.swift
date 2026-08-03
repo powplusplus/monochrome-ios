@@ -2,8 +2,48 @@ import Foundation
 import UIKit
 import WebKit
 
+/// A Turnstile-gated provider. The solved Cloudflare token is single-use, so
+/// each exchange keeps its own session token and its own in-flight slot.
+///
+/// Declared outside `AmazonTurnstileAuth` so the descriptors stay reachable from
+/// the non-isolated resolvers that need them.
+struct TurnstileExchange: Sendable {
+    let id: String
+    /// Path appended to the provider base URL.
+    let path: String
+    /// Name of the JSON field the exchange expects the Turnstile token in.
+    let tokenField: String
+    /// Prefix for surfaced errors, so a failure names the leg that produced it.
+    let label: String
+    let tokenKey: String
+    let expiryKey: String
+
+    static let amazon = TurnstileExchange(
+        id: "amazon",
+        path: "/api/auth/turnstile",
+        tokenField: "cf_turnstile_response",
+        label: "Amazon Turnstile",
+        tokenKey: "native.amazonTurnstileJwt",
+        expiryKey: "native.amazonTurnstileExpiry"
+    )
+
+    /// Rythm answers with an opaque bearer token plus `expires_in`, not a JWT.
+    static let rythm = TurnstileExchange(
+        id: "rythm",
+        path: "/auth/turnstile",
+        tokenField: "turnstile_token",
+        label: "Rythm Turnstile",
+        tokenKey: "native.rythmTurnstileToken",
+        expiryKey: "native.rythmTurnstileExpiry"
+    )
+}
+
 /// Mirrors web Monochrome `getTurnstileJwt`: solve Cloudflare Turnstile on
-/// `monochrome.tf` origin, exchange token at Amazon `/api/auth/turnstile`.
+/// `monochrome.tf` origin, exchange the token for a provider session.
+///
+/// Amazon and Rythm sit behind the same Cloudflare site key and the same origin
+/// check, so the solve itself is shared; only the exchange endpoint, its request
+/// field and the token cache differ (see `Exchange`).
 ///
 /// Invisible / interaction-only first (no UI flash). Overlay only when CF needs
 /// a click, or when the invisible attempt fails and we fall back to compact.
@@ -18,84 +58,112 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         case alwaysVisible
     }
 
-    private let jwtKey = "native.amazonTurnstileJwt"
-    private let expiryKey = "native.amazonTurnstileExpiry"
+    typealias Exchange = TurnstileExchange
+
     private var webView: WKWebView?
     private var hostWindow: UIWindow?
     private var overlay: TurnstileOverlayViewController?
     private var continuation: CheckedContinuation<String, Error>?
     private var timeoutItem: DispatchWorkItem?
-    private var inFlight: Task<String, Error>?
+    private var inFlight: [String: Task<String, Error>] = [:]
     /// Whether the solve currently in flight is allowed to put a challenge card
     /// on screen. A silent prewarm must never be reused to satisfy a caller that
     /// the user is actively waiting on — see `accessToken`.
-    private var inFlightAllowsInteractive = true
-    private var inFlightGeneration = 0
+    private var inFlightAllowsInteractive: [String: Bool] = [:]
+    private var inFlightGeneration: [String: Int] = [:]
+    /// Only one WKWebView challenge can be on screen at a time. Two exchanges
+    /// asking at once (Rythm prewarm + a tapped play falling through to Amazon)
+    /// used to have the second solve cancel the first out from under it.
+    private var solveQueue: Task<Void, Never>?
     private var mode: ChallengeMode = .interactionOnly
     private var siteKeyForRetry: String = ""
     private var allowInteractive = true
 
-    func cachedJWT() -> String? {
-        let jwt = UserDefaults.standard.string(forKey: jwtKey) ?? ""
-        let expiry = UserDefaults.standard.double(forKey: expiryKey)
+    func cachedJWT(for exchange: Exchange = .amazon) -> String? {
+        let jwt = UserDefaults.standard.string(forKey: exchange.tokenKey) ?? ""
+        let expiry = UserDefaults.standard.double(forKey: exchange.expiryKey)
         guard !jwt.isEmpty, Date().timeIntervalSince1970 * 1000 < expiry else { return nil }
         return jwt
     }
 
-    func clearCache() {
-        UserDefaults.standard.removeObject(forKey: jwtKey)
-        UserDefaults.standard.removeObject(forKey: expiryKey)
+    func clearCache(for exchange: Exchange = .amazon) {
+        UserDefaults.standard.removeObject(forKey: exchange.tokenKey)
+        UserDefaults.standard.removeObject(forKey: exchange.expiryKey)
     }
 
     /// Solve the challenge ahead of time so the first play does not pay for it.
     ///
-    /// Amazon is gated: every `/api/track/` call 428s until a JWT exists, so the
-    /// very first track of a session waited on a WKWebView boot plus a full
-    /// Cloudflare round trip before the lookup even started. That work does not
-    /// depend on which track is chosen, so do it while the user is still
-    /// browsing. Silent by construction — if Cloudflare wants a tap, this gives
-    /// up rather than throwing a verification card at someone who has not asked
-    /// for anything yet, and the interactive path runs as before on first play.
+    /// Both resolvers are gated: every lookup is rejected until a session token
+    /// exists, so the very first track of a session waited on a WKWebView boot
+    /// plus a full Cloudflare round trip before the lookup even started. That
+    /// work does not depend on which track is chosen, so do it while the user is
+    /// still browsing. Silent by construction — if Cloudflare wants a tap, this
+    /// gives up rather than throwing a verification card at someone who has not
+    /// asked for anything yet, and the interactive path runs as before on first
+    /// play.
+    ///
+    /// Only the leg that actually runs first is prewarmed; solving both would put
+    /// two challenges on screen at launch to save a round trip the second leg
+    /// usually never makes.
     func prewarm() {
-        guard PlaybackSourceSettings.amazonEnabled,
-              PlaybackSourceSettings.amazonBypassToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              cachedJWT() == nil,
-              inFlight == nil else { return }
-        let base = PlaybackSourceSettings.amazonApiBaseURL
+        let exchange: Exchange
+        let base: String
+        let bypass: String
+        if PlaybackSourceSettings.rythmEnabled {
+            exchange = .rythm
+            base = PlaybackSourceSettings.rythmBaseURL
+            bypass = PlaybackSourceSettings.rythmBypassToken
+        } else if PlaybackSourceSettings.amazonEnabled {
+            exchange = .amazon
+            base = PlaybackSourceSettings.amazonApiBaseURL
+            bypass = PlaybackSourceSettings.amazonBypassToken
+        } else {
+            return
+        }
+        guard bypass.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              cachedJWT(for: exchange) == nil,
+              inFlight[exchange.id] == nil else { return }
         Task { [weak self] in
             // The solve puts an alert-level window on screen (transparent, and
             // non-interactive, but still key). Let the app finish presenting its
             // own UI before doing that at launch.
             try? await Task.sleep(nanoseconds: 2_000_000_000)
-            guard let self, self.cachedJWT() == nil, self.inFlight == nil else { return }
-            _ = try? await self.accessToken(apiBaseURL: base, allowInteractive: false, timeout: 15)
+            guard let self, self.cachedJWT(for: exchange) == nil, self.inFlight[exchange.id] == nil else { return }
+            _ = try? await self.accessToken(
+                apiBaseURL: base,
+                exchange: exchange,
+                allowInteractive: false,
+                timeout: 15
+            )
         }
     }
 
     func accessToken(
         apiBaseURL: String,
+        exchange: Exchange = .amazon,
         siteKey: String = PlaybackSourceSettings.amazonTurnstileSiteKey,
         forceRefresh: Bool = false,
         allowInteractive: Bool = true,
         timeout: TimeInterval = 60
     ) async throws -> String {
-        if !forceRefresh, let cached = cachedJWT() { return cached }
+        if !forceRefresh, let cached = cachedJWT(for: exchange) { return cached }
         // Only ride along on a solve that is at least as capable as this one
         // needs. Without this check a play tapped during a silent prewarm would
         // inherit the prewarm's failure and never get its own visible attempt.
-        if let inFlight, !forceRefresh, inFlightAllowsInteractive || !allowInteractive {
-            return try await inFlight.value
+        if let pending = inFlight[exchange.id], !forceRefresh,
+           inFlightAllowsInteractive[exchange.id] == true || !allowInteractive {
+            return try await pending.value
         }
 
         let task = Task<String, Error> {
-            if forceRefresh { clearCache() }
-            let turnstileToken = try await solveTurnstile(
+            if forceRefresh { clearCache(for: exchange) }
+            let turnstileToken = try await serializedSolve(
                 siteKey: siteKey,
                 allowInteractive: allowInteractive,
                 timeout: timeout
             )
             let base = apiBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            guard let url = URL(string: base + "/api/auth/turnstile") else {
+            guard let url = URL(string: base + exchange.path) else {
                 throw ServiceError.invalidResponse
             }
             var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
@@ -106,7 +174,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
             request.setValue("https://monochrome.tf", forHTTPHeaderField: "Origin")
             request.setValue("https://monochrome.tf/", forHTTPHeaderField: "Referer")
             request.httpBody = try JSONSerialization.data(withJSONObject: [
-                "cf_turnstile_response": turnstileToken
+                exchange.tokenField: turnstileToken
             ])
             let data: Data
             let response: URLResponse
@@ -115,21 +183,28 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
             } catch let error as URLError where error.code == .timedOut {
                 // Naming the leg matters: a bare "The request timed out." was
                 // indistinguishable from the track lookup timing out.
-                throw ServiceError.unavailable("Amazon Turnstile exchange timed out")
+                throw ServiceError.unavailable("\(exchange.label) exchange timed out")
             }
             guard let http = response as? HTTPURLResponse else { throw ServiceError.invalidResponse }
             guard (200..<300).contains(http.statusCode) else {
-                let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                let detail = (body?["detail"] as? String) ?? (body?["error"] as? String)
-                throw detail.map { ServiceError.unavailable("Amazon Turnstile: \($0)") } ?? ServiceError.http(http.statusCode)
+                let detail = Self.exchangeErrorDetail(in: data)
+                throw detail.map { ServiceError.unavailable("\(exchange.label): \($0)") } ?? ServiceError.http(http.statusCode)
             }
             let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             guard let jwt = object?["access_token"] as? String, !jwt.isEmpty else {
-                throw ServiceError.malformed("Amazon Turnstile JWT")
+                throw ServiceError.malformed("\(exchange.label) token")
             }
-            let expiry = Self.expiryMilliseconds(forJWT: jwt)
-            UserDefaults.standard.set(jwt, forKey: jwtKey)
-            UserDefaults.standard.set(expiry, forKey: expiryKey)
+            // Rythm hands back an opaque token, so there is no `exp` to read —
+            // it states the lifetime separately. Prefer it when present and fall
+            // back to the JWT claim for Amazon.
+            let expiry: Double
+            if let expiresIn = (object?["expires_in"] as? NSNumber)?.doubleValue, expiresIn > 0 {
+                expiry = (Date().timeIntervalSince1970 + max(expiresIn - 60, 30)) * 1000
+            } else {
+                expiry = Self.expiryMilliseconds(forJWT: jwt)
+            }
+            UserDefaults.standard.set(jwt, forKey: exchange.tokenKey)
+            UserDefaults.standard.set(expiry, forKey: exchange.expiryKey)
             return jwt
         }
         // An interactive caller that refuses to ride along on a silent prewarm
@@ -137,12 +212,32 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         // swap, so clearing unconditionally would drop the live solve on the
         // floor and let a third caller start a second WKWebView. Only the task
         // that still owns the slot may clear it.
-        inFlightGeneration &+= 1
-        let generation = inFlightGeneration
-        inFlight = task
-        inFlightAllowsInteractive = allowInteractive
-        defer { if inFlightGeneration == generation { inFlight = nil } }
+        let generation = (inFlightGeneration[exchange.id] ?? 0) &+ 1
+        inFlightGeneration[exchange.id] = generation
+        inFlight[exchange.id] = task
+        inFlightAllowsInteractive[exchange.id] = allowInteractive
+        defer { if inFlightGeneration[exchange.id] == generation { inFlight[exchange.id] = nil } }
         return try await task.value
+    }
+
+    /// Both exchanges state failures in their body — Amazon as `{"error": …}`,
+    /// Rythm as `{"detail": {"code": "turnstile_failed", "errors": [...]}}`.
+    /// A bare status code hid which one it was.
+    nonisolated static func exchangeErrorDetail(in body: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }
+        for key in ["detail", "error", "message"] {
+            if let value = object[key] as? String, !value.isEmpty { return value }
+            guard let nested = object[key] as? [String: Any] else { continue }
+            let code = (nested["code"] as? String) ?? (nested["message"] as? String)
+            let errors = (nested["errors"] as? [String])?.joined(separator: ", ")
+            switch (code, errors) {
+            case let (code?, errors?) where !errors.isEmpty: return "\(code) (\(errors))"
+            case let (code?, _): return code
+            case let (_, errors?) where !errors.isEmpty: return errors
+            default: continue
+            }
+        }
+        return nil
     }
 
     /// The provider signs the JWT with its own `exp`. Assuming a flat hour past
@@ -246,6 +341,29 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         """
     }
 
+    /// `solveTurnstile` owns a single WKWebView and cancels whatever solve was
+    /// already pending, which is correct for a retry but destructive when two
+    /// exchanges ask independently. Queue them so the second waits for the first
+    /// to finish (or fail) instead of tearing its challenge down mid-flight.
+    private func serializedSolve(
+        siteKey: String,
+        allowInteractive: Bool,
+        timeout: TimeInterval
+    ) async throws -> String {
+        let previous = solveQueue
+        let solve = Task<String, Error> { [weak self] in
+            if let previous { await previous.value }
+            guard let self else { throw CancellationError() }
+            return try await self.solveTurnstile(
+                siteKey: siteKey,
+                allowInteractive: allowInteractive,
+                timeout: timeout
+            )
+        }
+        solveQueue = Task { _ = try? await solve.value }
+        return try await solve.value
+    }
+
     private func solveTurnstile(
         siteKey: String,
         allowInteractive: Bool,
@@ -260,14 +378,14 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
 
             guard Self.foregroundWindowScene != nil else {
                 self.continuation = nil
-                continuation.resume(throwing: ServiceError.unavailable("Amazon Turnstile needs an active window"))
+                continuation.resume(throwing: ServiceError.unavailable("Turnstile needs an active window"))
                 return
             }
 
             presentChallenge(siteKey: siteKey, mode: .interactionOnly, showOverlay: false)
 
             let deadline = DispatchWorkItem { [weak self] in
-                self?.finishPending(with: .failure(ServiceError.unavailable("Amazon Turnstile timed out")))
+                self?.finishPending(with: .failure(ServiceError.unavailable("Turnstile timed out")))
             }
             timeoutItem = deadline
             DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: deadline)
@@ -278,7 +396,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         tearDownWebViewOnly()
 
         guard let scene = Self.foregroundWindowScene else {
-            finishPending(with: .failure(ServiceError.unavailable("Amazon Turnstile needs an active window")))
+            finishPending(with: .failure(ServiceError.unavailable("Turnstile needs an active window")))
             return
         }
 
@@ -298,7 +416,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         self.webView = webView
 
         let overlay = TurnstileOverlayViewController(webView: webView) { [weak self] in
-            self?.finishPending(with: .failure(ServiceError.unavailable("Amazon Turnstile cancelled")))
+            self?.finishPending(with: .failure(ServiceError.unavailable("Turnstile cancelled")))
         }
         self.overlay = overlay
 
@@ -334,11 +452,11 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
 
     private func retryVisibleFallback() {
         guard allowInteractive else {
-            finishPending(with: .failure(ServiceError.unavailable("Amazon Turnstile needs interaction")))
+            finishPending(with: .failure(ServiceError.unavailable("Turnstile needs interaction")))
             return
         }
         guard mode == .interactionOnly else {
-            finishPending(with: .failure(ServiceError.unavailable("Amazon Turnstile: turnstile_failed")))
+            finishPending(with: .failure(ServiceError.unavailable("Turnstile: turnstile_failed")))
             return
         }
         presentChallenge(siteKey: siteKeyForRetry, mode: .alwaysVisible, showOverlay: true)
@@ -355,7 +473,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
                 // A silent prewarm bows out here rather than surfacing a card the
                 // user never asked for; first play then solves it interactively.
                 guard allowInteractive else {
-                    finishPending(with: .failure(ServiceError.unavailable("Amazon Turnstile needs interaction")))
+                    finishPending(with: .failure(ServiceError.unavailable("Turnstile needs interaction")))
                     return
                 }
                 revealOverlay()
@@ -369,7 +487,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
                     retryVisibleFallback()
                     return
                 }
-                finishPending(with: .failure(ServiceError.unavailable("Amazon Turnstile: \(detail)")))
+                finishPending(with: .failure(ServiceError.unavailable("Turnstile: \(detail)")))
             }
         }
     }
@@ -438,7 +556,7 @@ private final class TurnstileOverlayViewController: UIViewController {
         titleLabel.textAlignment = .center
 
         subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
-        subtitleLabel.text = "Amazon Music playback needs a quick browser check."
+        subtitleLabel.text = "Playback needs a quick browser check."
         subtitleLabel.font = .systemFont(ofSize: 13)
         subtitleLabel.textColor = .secondaryLabel
         subtitleLabel.numberOfLines = 0

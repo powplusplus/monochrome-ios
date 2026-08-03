@@ -16,6 +16,27 @@ final class AppTests: XCTestCase {
         XCTAssertNotNil(track.artworkURL)
     }
 
+    func testTrackMappingAcceptsOpenAPISearchDuration() throws {
+        let payload: [String: Any] = [
+            "id": 447580805,
+            "title": "Ghosts 'n' Stuff",
+            "duration": "PT3M11S",
+            "isrc": "GBTDG0900132",
+            "artist": ["id": 3523908, "name": "deadmau5"],
+        ]
+
+        let track = try XCTUnwrap(ModelMapper.track(payload))
+        XCTAssertEqual(track.duration, 191)
+        XCTAssertEqual(track.isrc, "GBTDG0900132")
+    }
+
+    func testTrackMappingAcceptsFractionalOpenAPIDuration() throws {
+        let track = try XCTUnwrap(ModelMapper.track([
+            "id": 1, "title": "Song", "artist": "Artist", "duration": "PT1H2M3.5S",
+        ]))
+        XCTAssertEqual(track.duration, 3_723.5)
+    }
+
     func testProviderPrefixIsPreserved() throws {
         let track = try XCTUnwrap(ModelMapper.track(["id": "qobuz:42", "title": "Song", "artist": "Artist"]))
         XCTAssertEqual(track.provider, .qobuz)
@@ -63,6 +84,55 @@ final class AppTests: XCTestCase {
         UserDefaults.standard.set(Date().timeIntervalSince1970 * 1000 - 1000, forKey: "native.amazonTurnstileExpiry")
         XCTAssertNil(auth.cachedJWT())
         auth.clearCache()
+    }
+
+    @MainActor
+    func testTurnstileSessionCachesAreIsolatedPerExchange() {
+        let auth = AmazonTurnstileAuth.shared
+        auth.clearCache(for: .amazon)
+        auth.clearCache(for: .rythm)
+
+        // Cloudflare tokens are single-use, so each exchange holds its own
+        // session. Sharing one slot would let an Amazon JWT be sent to Rythm.
+        let expiry = Date().timeIntervalSince1970 * 1000 + 60 * 60 * 1000
+        UserDefaults.standard.set("rythm-session", forKey: AmazonTurnstileAuth.Exchange.rythm.tokenKey)
+        UserDefaults.standard.set(expiry, forKey: AmazonTurnstileAuth.Exchange.rythm.expiryKey)
+
+        XCTAssertEqual(auth.cachedJWT(for: .rythm), "rythm-session")
+        XCTAssertNil(auth.cachedJWT(for: .amazon))
+
+        auth.clearCache(for: .rythm)
+        XCTAssertNil(auth.cachedJWT(for: .rythm))
+    }
+
+    func testRythmExchangeMatchesResolverContract() {
+        let rythm = AmazonTurnstileAuth.Exchange.rythm
+        XCTAssertEqual(rythm.path, "/auth/turnstile")
+        XCTAssertEqual(rythm.tokenField, "turnstile_token")
+        XCTAssertNotEqual(rythm.tokenKey, AmazonTurnstileAuth.Exchange.amazon.tokenKey)
+        XCTAssertEqual(AmazonTurnstileAuth.Exchange.amazon.path, "/api/auth/turnstile")
+        XCTAssertEqual(AmazonTurnstileAuth.Exchange.amazon.tokenField, "cf_turnstile_response")
+    }
+
+    func testTurnstileExchangeErrorDetailReadsBothProviderShapes() {
+        let rythm = Data(#"{"detail":{"code":"turnstile_failed","errors":["invalid-input-response"]}}"#.utf8)
+        XCTAssertEqual(
+            AmazonTurnstileAuth.exchangeErrorDetail(in: rythm),
+            "turnstile_failed (invalid-input-response)"
+        )
+        let session = Data(#"{"detail":{"code":"session_required"}}"#.utf8)
+        XCTAssertEqual(AmazonTurnstileAuth.exchangeErrorDetail(in: session), "session_required")
+        let amazon = Data(#"{"error":"turnstile_required","message":"Missing X-Turnstile-JWT header."}"#.utf8)
+        XCTAssertEqual(AmazonTurnstileAuth.exchangeErrorDetail(in: amazon), "turnstile_required")
+        XCTAssertNil(AmazonTurnstileAuth.exchangeErrorDetail(in: Data("<!doctype html>".utf8)))
+    }
+
+    func testRythmIsAStreamResolverNotACatalogProvider() {
+        XCTAssertFalse(Provider.musicCases.contains(.rythm))
+        XCTAssertFalse(Provider.musicCases.contains(.podcast))
+        XCTAssertTrue(Provider.musicCases.contains(.tidal))
+        // Persisted stream responses decode by raw value — keep it stable.
+        XCTAssertEqual(Provider.rythm.rawValue, "rythm")
     }
 
     func testAmazonTurnstileChallengeHTMLInteractionOnlyParity() {

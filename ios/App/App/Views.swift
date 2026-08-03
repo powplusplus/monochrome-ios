@@ -359,6 +359,9 @@ struct SettingsView: View {
     @AppStorage("native.playbackQuality") private var playbackQuality = PlaybackQuality.lossless.rawValue
     @AppStorage("native.downloadQuality") private var downloadQuality = PlaybackQuality.hiResLossless.rawValue
     @AppStorage("native.gapless") private var gapless = true
+    @AppStorage("native.rythmEnabled") private var rythmEnabled = true
+    @AppStorage("native.rythmBaseURL") private var rythmBaseURL = "https://track-api.monochrome.tf"
+    @AppStorage("native.rythmBypassToken") private var rythmBypassToken = ""
     @AppStorage("native.amazonEnabled") private var amazonEnabled = true
     @AppStorage("native.amazonApiBaseURL") private var amazonApiBaseURL = "https://amz.geeked.wtf"
     @AppStorage("native.amazonBypassToken") private var amazonBypassToken = ""
@@ -388,7 +391,17 @@ struct SettingsView: View {
                     Toggle("Gapless transitions", isOn: $gapless)
                     Picker("Playback speed", selection: $playback.playbackRate) { Text("0.75×").tag(Float(0.75)); Text("1×").tag(Float(1)); Text("1.25×").tag(Float(1.25)); Text("1.5×").tag(Float(1.5)); Text("2×").tag(Float(2)) }
                 }
-                Section(header: Text("Sources"), footer: Text("Amazon Music first. If Amazon cannot resolve — or AVPlayer rejects its URL — Lucida (Qobuz) is tried next (ISRC or artist/title search), then Deezer. TIDAL is catalog only.")) {
+                Section(header: Text("Sources"), footer: Text("Rythm first — it resolves across Monochrome, Qobuz, Amazon and Deezer on the server and needs one Cloudflare check per hour. If it cannot resolve — or AVPlayer rejects its URL — Amazon Music is tried, then Lucida (Qobuz) by ISRC or artist/title, then Deezer. TIDAL is catalog only.")) {
+                    Toggle("Rythm resolver", isOn: $rythmEnabled)
+                    if rythmEnabled {
+                        TextField("Rythm base URL", text: $rythmBaseURL)
+                            .textInputAutocapitalization(.never)
+                            .keyboardType(.URL)
+                            .disableAutocorrection(true)
+                        SecureField("Rythm bypass token (optional)", text: $rythmBypassToken)
+                            .textInputAutocapitalization(.never)
+                            .disableAutocorrection(true)
+                    }
                     Toggle("Amazon Music", isOn: $amazonEnabled)
                     if amazonEnabled {
                         TextField("Amazon API base URL", text: $amazonApiBaseURL)
@@ -2053,7 +2066,7 @@ struct ProviderSettingsView: View {
             Picker("Preferred catalog provider", selection: $provider) {
                 ForEach(Provider.musicCases) { Text($0.title).tag($0.rawValue) }
             }
-            Text("Catalog search uses TIDAL metadata. Full audio resolves Amazon → Lucida → Deezer like web Monochrome — not TIDAL stream manifests. Podcasts play enclosure media directly (video episodes show in now playing).")
+            Text("Catalog search uses TIDAL metadata. Full audio resolves Rythm → Amazon → Lucida → Deezer like web Monochrome — not TIDAL stream manifests. Podcasts play enclosure media directly (video episodes show in now playing).")
                 .font(.footnote)
                 .foregroundColor(.secondary)
         }
