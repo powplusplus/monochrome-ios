@@ -359,6 +359,7 @@ struct SettingsView: View {
     @AppStorage("native.playbackQuality") private var playbackQuality = PlaybackQuality.lossless.rawValue
     @AppStorage("native.downloadQuality") private var downloadQuality = PlaybackQuality.hiResLossless.rawValue
     @AppStorage("native.gapless") private var gapless = true
+    @AppStorage("native.audioAnalysis") private var audioAnalysis = true
     @AppStorage("native.rythmEnabled") private var rythmEnabled = true
     @AppStorage("native.rythmBaseURL") private var rythmBaseURL = "https://track-api.monochrome.tf"
     @AppStorage("native.rythmBypassToken") private var rythmBypassToken = ""
@@ -391,6 +392,9 @@ struct SettingsView: View {
                     }
                     Toggle("Gapless transitions", isOn: $gapless)
                     Picker("Playback speed", selection: $playback.playbackRate) { Text("0.75×").tag(Float(0.75)); Text("1×").tag(Float(1)); Text("1.25×").tag(Float(1.25)); Text("1.5×").tag(Float(1.5)); Text("2×").tag(Float(2)) }
+                }
+                Section(footer: Text("Decodes a few seconds of each lossless track and reads its spectrum, so the badge shows what the file actually is — a FLAC made from an MP3, or a CD rip resampled to 96 kHz, is flagged instead of trusted. Costs roughly 1–3 MB per new track when streaming; downloads are free to check.")) {
+                    Toggle("Verify audio quality", isOn: $audioAnalysis)
                 }
                 Section(header: Text("Sources"), footer: Text("Rythm first — it resolves across Monochrome, Qobuz, Amazon and Deezer on the server and needs one Cloudflare check per hour. If it cannot resolve — or AVPlayer rejects its URL — Amazon Music is tried, then Lucida (Qobuz) by ISRC or artist/title, then Deezer. TIDAL is catalog only.")) {
                     Toggle("Rythm resolver", isOn: $rythmEnabled)
@@ -1398,14 +1402,14 @@ struct NowPlayingView: View {
                                     .frame(width: 24, height: 13)
                             }
                             Text(badge.label)
-                            if let detail = playback.currentStreamQualityDetail {
+                            if let detail = qualityDetailText {
                                 Text(detail)
                                     .foregroundStyle(.secondary)
                             }
                         }
                         .accessibilityElement(children: .combine)
                         .accessibilityLabel(
-                            playback.currentStreamQualityDetail.map { "\(badge.label), \($0) bit depth over kilohertz" }
+                            qualityDetailText.map { "\(badge.label), \($0) bit depth over kilohertz" }
                                 ?? badge.label
                         )
                         .font(.caption2.weight(.semibold))
@@ -1414,6 +1418,15 @@ struct NowPlayingView: View {
                         .padding(.horizontal, 10)
                         .padding(.vertical, 4)
                         .background(.thinMaterial, in: Capsule())
+                    }
+                    // The analyzer decoded the file and it is not what the
+                    // container claims — say so rather than quietly downgrading
+                    // the badge and leaving the user to wonder.
+                    if let warning = playback.currentStreamAnalysis?.warning {
+                        Label(warning, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(Color(red: 0.85, green: 0.55, blue: 0.2))
+                            .accessibilityLabel("Audio check: \(warning)")
                     }
                 }
             }
@@ -1495,6 +1508,12 @@ struct NowPlayingView: View {
                     )
                 }
                 Spacer()
+                Button { playback.keepAwakeEnabled.toggle() } label: {
+                    Image(systemName: playback.keepAwakeEnabled ? "sun.max.fill" : "sun.max")
+                        .foregroundColor(playback.keepAwakeEnabled ? .pink : .primary)
+                }
+                .accessibilityLabel(playback.keepAwakeEnabled ? "Keep screen awake on" : "Keep screen awake off")
+                Spacer()
                 Button { showQueue = true } label: {
                     Image(systemName: "list.bullet")
                 }
@@ -1510,13 +1529,18 @@ struct NowPlayingView: View {
         }
     }
 
-    /// Honest badge only: stream we got, else catalog claim. Never the user's
-    /// quality preference — that used to paint "Lossless (HiFi)" on MP3 podcasts.
+    /// Honest badge only: measured audio first, then the stream we got, else the
+    /// catalog claim. Never the user's quality preference — that used to paint
+    /// "Lossless (HiFi)" on MP3 podcasts.
     private var qualityBadge: (tier: PlaybackQuality?, label: String)? {
         guard let track = playback.currentTrack else { return nil }
+        // `AudioAnalyzer` decoded the file, so its tier outranks every claim:
+        // a transcode drops the wave mark, a real 24/96 earns the gold.
+        let measured = playback.currentStreamAnalysis?.tier
         if let raw = playback.currentStreamQuality, !raw.isEmpty {
-            let tier = PlaybackQuality(providerToken: raw)
+            let tier = measured ?? PlaybackQuality(providerToken: raw)
             let label = PlaybackQuality.badgeLabel(forToken: raw)
+                ?? playback.currentStreamAnalysis?.codec
                 ?? tier?.title.uppercased()
                 ?? raw.uppercased()
             return (tier, label)
@@ -1524,9 +1548,15 @@ struct NowPlayingView: View {
         if let catalog = track.catalogQuality {
             let token = track.audioQuality ?? catalog.rawValue
             let label = PlaybackQuality.badgeLabel(forToken: token) ?? catalog.title.uppercased()
-            return (catalog, label)
+            return (measured ?? catalog, label)
         }
         return nil
+    }
+
+    /// Measured `24/96` beats the provider's, since the point of the analysis is
+    /// that the provider's number can be a claim about a file it never opened.
+    private var qualityDetailText: String? {
+        playback.currentStreamAnalysis?.detailLabel ?? playback.currentStreamQualityDetail
     }
 
 

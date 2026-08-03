@@ -314,6 +314,14 @@ enum PlaybackSourceSettings {
         }
         set { UserDefaults.standard.set(newValue, forKey: "native.lucidaBaseURL") }
     }
+
+    /// Decode a few seconds of each lossless stream and check the spectrum
+    /// against the container's claim (`AudioAnalyzer`). Costs ~1–3 MB per new
+    /// track on a stream, nothing on a download, so it is a toggle.
+    static var audioAnalysisEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "native.audioAnalysis") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "native.audioAnalysis") }
+    }
 }
 
 struct Artist: Codable, Identifiable, Hashable {

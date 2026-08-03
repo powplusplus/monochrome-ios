@@ -22,6 +22,16 @@ final class PlaybackEngine: ObservableObject {
             if autoplayEnabled { maybePrefetchContinuation() }
         }
     }
+    /// Holds the display on while the app is in the foreground — for lyrics,
+    /// the visualizer, or a phone propped up as a now-playing screen. The system
+    /// clears the idle-timer override on every background transition, so this is
+    /// re-applied from `warmForeground()`.
+    @Published var keepAwakeEnabled: Bool = UserDefaults.standard.bool(forKey: "native.keepAwakeEnabled") {
+        didSet {
+            UserDefaults.standard.set(keepAwakeEnabled, forKey: "native.keepAwakeEnabled")
+            applyIdleTimer()
+        }
+    }
     /// True while a recommendation batch is in flight, for the "finding more
     /// songs" affordance in the player UI.
     @Published private(set) var isFindingMore = false
@@ -36,6 +46,10 @@ final class PlaybackEngine: ObservableObject {
     @Published private(set) var loadedTrackID: String?
     /// `24/96` when the provider reports bit depth and sample rate.
     @Published private(set) var currentStreamQualityDetail: String?
+    /// What the decoded audio itself turned out to be, once `AudioAnalyzer` has
+    /// looked at it. Arrives a few seconds after playback starts, so the badge
+    /// shows the provider's claim first and corrects itself.
+    @Published private(set) var currentStreamAnalysis: AudioAnalysis?
     /// Active stream provider — drives the Lucida badge above the lossless indicator.
     @Published private(set) var currentStreamProvider: Provider?
     /// Loudness for playlist now-playing bars. Separate store so ~30 Hz meter
@@ -60,6 +74,9 @@ final class PlaybackEngine: ObservableObject {
     private let fadeDuration: TimeInterval = 0.25
     private let levelMonitor = AudioLevelMonitor()
     private var meterAttachTask: Task<Void, Never>?
+    private var analysisTask: Task<Void, Never>?
+    /// Analyses stay for the session so replays and queue loops cost nothing.
+    private var audioAnalysisCache: [String: AudioAnalysis] = [:]
 
     /// A stream that has already been resolved and whose asset header has been fetched.
     /// `AVURLAsset` is not `Sendable`, but this one is only ever touched on the main actor.
@@ -129,6 +146,7 @@ final class PlaybackEngine: ObservableObject {
         player.automaticallyWaitsToMinimizeStalling = true
         restoreQueue()
         configureRemoteCommands()
+        applyIdleTimer()
         levelMonitor.onLevel = { [weak self] level in
             Task { @MainActor in
                 guard let self else { return }
@@ -466,6 +484,8 @@ final class PlaybackEngine: ObservableObject {
         currentStreamQuality = nil
         currentStreamQualityDetail = nil
         currentStreamProvider = nil
+        analysisTask?.cancel()
+        currentStreamAnalysis = nil
         pendingPodcastSeek = track.isPodcast
             ? PodcastProgressStore.shared.resumePosition(for: track.id, duration: track.duration)
             : nil
@@ -550,6 +570,7 @@ final class PlaybackEngine: ObservableObject {
                             self.isLoading = false
                             self.loadedTrackID = track.id
                             self.attachMeter(to: item)
+                            self.startAudioAnalysis(for: track, stream: stream)
                             self.applyPendingPodcastSeekIfNeeded()
                             if self.pendingAutoplay {
                                 self.pendingAutoplay = false
@@ -712,6 +733,7 @@ final class PlaybackEngine: ObservableObject {
     /// ahead of the user instead: refresh auth/pool, drop warms old enough that the
     /// URL may be dead, then warm the current track (when stopped) and the queue.
     func warmForeground() {
+        applyIdleTimer()
         savePodcastProgressIfNeeded(force: true)
         Task { await InstanceDirectory.shared.refreshIfStale() }
         AmazonTurnstileAuth.shared.prewarm()
@@ -722,6 +744,10 @@ final class PlaybackEngine: ObservableObject {
         }
         if let track = currentTrack, loadedTrackID != track.id, !isLoading { warm(track) }
         prefetchUpcoming()
+    }
+
+    private func applyIdleTimer() {
+        UIApplication.shared.isIdleTimerDisabled = keepAwakeEnabled
     }
 
     /// Installs a pass-through audio tap so playlist rows can bounce with loudness.
@@ -742,6 +768,58 @@ final class PlaybackEngine: ObservableObject {
         meterAttachTask = nil
         levelMonitor.detach()
         audioMeter.reset()
+    }
+
+    /// Reads the audio itself so the badge can stop repeating the container's
+    /// claim: a FLAC transcoded from an MP3 and a CD rip resampled to 96 kHz both
+    /// look lossless in every header we get. Runs once the item is ready, off the
+    /// main actor, and only for streams whose claim is worth checking — a track
+    /// already badged AAC has nothing to expose.
+    private func startAudioAnalysis(for track: Track, stream: StreamResponse) {
+        analysisTask?.cancel()
+        analysisTask = nil
+        guard PlaybackSourceSettings.audioAnalysisEnabled, !track.isPodcast else { return }
+        // Keyed by provider and claimed tier as well as track: the same song from
+        // Amazon HD and from a Deezer MP3 fallback are different files, and a
+        // quality-preference change re-resolves to a different one again.
+        let key = "\(track.id)|\(stream.provider.rawValue)|\(stream.quality)"
+        if let cached = audioAnalysisCache[key] {
+            currentStreamAnalysis = cached
+            return
+        }
+        guard Self.deservesAudioAnalysis(stream) else { return }
+        let url = stream.url
+        let headers = stream.requestHeaders
+        let trackID = track.id
+        analysisTask = Task { [weak self] in
+            // The analyzer pulls its own byte ranges. Let the player's opening
+            // buffer fill first so a slow connection stalls the audio for nobody.
+            if !url.isFileURL {
+                try? await Task.sleep(for: .seconds(5))
+                guard !Task.isCancelled else { return }
+            }
+            let analysis = await AudioAnalyzer.analyze(url: url, headers: headers)
+            guard let self, !Task.isCancelled, let analysis else { return }
+            // Cheap bound: a listening session is nowhere near this many tracks,
+            // and dropping the lot beats evicting in play order.
+            if self.audioAnalysisCache.count >= 256 { self.audioAnalysisCache.removeAll() }
+            self.audioAnalysisCache[key] = analysis
+            guard self.loadedTrackID == trackID else { return }
+            self.currentStreamAnalysis = analysis
+        }
+    }
+
+    /// Only lossless-ish claims are worth the bandwidth: MP3/AAC/OPUS tokens are
+    /// already honest, and adaptive manifests cannot be read frame-accurately.
+    private static func deservesAudioAnalysis(_ stream: StreamResponse) -> Bool {
+        guard !AudioAnalyzer.isAdaptiveManifest(stream.url) else { return false }
+        guard let label = PlaybackQuality.badgeLabel(forToken: stream.quality) else {
+            // Tier tokens (`LOSSLESS`, `HI_RES_LOSSLESS`, `HD`, …) and `UNKNOWN`
+            // say nothing about the file — exactly the case worth measuring.
+            return (PlaybackQuality(providerToken: stream.quality)?.rank ?? PlaybackQuality.lossless.rank)
+                >= PlaybackQuality.lossless.rank
+        }
+        return ["FLAC", "WAV", "ALAC"].contains(label)
     }
 
     /// Hands back the warmed task for `track` (possibly still in flight) and stops tracking it.
