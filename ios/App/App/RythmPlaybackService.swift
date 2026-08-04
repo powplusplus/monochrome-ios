@@ -54,45 +54,73 @@ enum RythmPlaybackService {
             bearer = try await sessionTokenProvider(base, false)
         }
 
-        do {
-            return try await fetchPlayback(
-                track: track, title: title, artist: artist,
-                base: base, bypass: bypass, bearer: bearer, session: session
-            )
-        } catch let failure as PlaybackFailure {
-            // `session_required` / `session_expired` arrive as 401 or 403 once the
-            // hour-long session lapses. Re-solve once with a fresh token rather
-            // than handing the track to a fallback that is very likely dead.
-            if failure.status == 401 || failure.status == 403 {
-                await AmazonTurnstileAuth.shared.clearCache(for: .rythm)
-                let fresh = try await sessionTokenProvider(base, true)
+        // A 404 is Rythm saying nothing matched. Only `song_name` and `artist`
+        // identify the recording; the ISRC and the duration narrow it, and both
+        // narrowers routinely disagree with what the resolver holds:
+        //
+        //   * the duration is the catalog's figure, not the recording's — the
+        //     TV-size edit of "Caste Room" is listed at 90s against a 94.2s
+        //     recording;
+        //   * the ISRC belongs to whichever *release* the catalog surfaced, so a
+        //     reissue carries a code the original recording never had — "Gangsta's
+        //     Paradise" comes back as the 2023 Tommy Boy `USTB10250016` while
+        //     Rythm indexes the 1995 recording.
+        //
+        // Either one alone drops a match name + artist would have made, so widen
+        // the request a step at a time instead of handing the track to a fallback
+        // leg that is very likely dead. Steps that would repeat the previous
+        // request are skipped — a track with no ISRC has nothing left to drop.
+        var attempts: [(isrc: Bool, duration: Bool)] = [(true, true)]
+        if track.duration > 0 { attempts.append((true, false)) }
+        if Self.narrowingISRC(for: track) != nil { attempts.append((false, false)) }
+
+        var lastFailure: PlaybackFailure?
+        for attempt in attempts {
+            do {
                 return try await fetchPlayback(
                     track: track, title: title, artist: artist,
-                    base: base, bypass: "", bearer: fresh, session: session
+                    base: base, bypass: bypass, bearer: bearer, session: session,
+                    includeISRC: attempt.isrc, includeDuration: attempt.duration
                 )
+            } catch let failure as PlaybackFailure {
+                // `session_required` / `session_expired` arrive as 401 or 403 once
+                // the hour-long session lapses. Re-solve once with a fresh token,
+                // then let that answer stand — a second lapse inside one play is
+                // the session mechanism failing, not a narrowing problem.
+                if failure.status == 401 || failure.status == 403 {
+                    await AmazonTurnstileAuth.shared.clearCache(for: .rythm)
+                    let fresh = try await sessionTokenProvider(base, true)
+                    return try await fetchPlayback(
+                        track: track, title: title, artist: artist,
+                        base: base, bypass: "", bearer: fresh, session: session,
+                        includeISRC: attempt.isrc, includeDuration: attempt.duration
+                    )
+                }
+                guard failure.status == 404 else { throw failure }
+                lastFailure = failure
             }
-            // A 404 is Rythm saying nothing matched. The duration only narrows the
-            // match, and the catalog's figure routinely disagrees with the one the
-            // resolver holds — the TV-size edit of "Caste Room" is listed at 90s
-            // against a 94.2s recording, so the narrowing throws away a match the
-            // ISRC on its own would have made. Retry once without it before giving
-            // the track to a fallback leg.
-            guard failure.status == 404, track.duration > 0 else { throw failure }
-            return try await fetchPlayback(
-                track: track, title: title, artist: artist,
-                base: base, bypass: bypass, bearer: bearer, session: session,
-                includeDuration: false
-            )
         }
+        throw lastFailure ?? PlaybackFailure(status: 404, service: .unavailable("Rythm found no match"))
     }
 
     /// Carries the status alongside the message so `resolveStream` can branch on
-    /// it — the re-solve is for 401/403 only and the duration retry for 404 only —
+    /// it — the re-solve is for 401/403 only and the widening ladder for 404 only —
     /// while the chain error still reports the upstream detail verbatim.
     private struct PlaybackFailure: Error, LocalizedError {
         let status: Int
         let service: ServiceError
         var errorDescription: String? { service.errorDescription }
+    }
+
+    /// The ISRC as the schema will accept it, or nil when there is nothing to
+    /// send. `resolveStream` uses this to decide whether dropping the ISRC would
+    /// actually change the request, so it has to apply the same rule the body
+    /// does — the schema rejects anything outside 5…32 characters and a 422 costs
+    /// the whole leg.
+    private static func narrowingISRC(for track: Track) -> String? {
+        guard let isrc = track.isrc?.trimmingCharacters(in: .whitespacesAndNewlines),
+              (5...32).contains(isrc.count) else { return nil }
+        return isrc
     }
 
     private static func fetchPlayback(
@@ -104,6 +132,7 @@ enum RythmPlaybackService {
         bearer: String?,
         session: URLSession,
         timeout: TimeInterval = 30,
+        includeISRC: Bool = true,
         includeDuration: Bool = true
     ) async throws -> StreamResponse {
         var components = URLComponents(string: base + "/playback")
@@ -113,12 +142,9 @@ enum RythmPlaybackService {
         guard let url = components?.url else { throw ServiceError.invalidResponse }
 
         var body: [String: Any] = ["song_name": String(title.prefix(300)), "artist": String(artist.prefix(300))]
-        // The schema rejects an ISRC outside 5…32 characters and a non-positive
-        // duration, and a 422 costs the whole leg — so send them only when valid.
-        if let isrc = track.isrc?.trimmingCharacters(in: .whitespacesAndNewlines),
-           (5...32).contains(isrc.count) {
-            body["isrc"] = isrc
-        }
+        // The schema also rejects a non-positive duration, and a 422 costs the
+        // whole leg — so send either narrower only when it is valid.
+        if includeISRC, let isrc = narrowingISRC(for: track) { body["isrc"] = isrc }
         if includeDuration, track.duration > 0 { body["duration"] = track.duration }
 
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)

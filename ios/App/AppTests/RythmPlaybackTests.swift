@@ -334,6 +334,14 @@ final class RythmPlaybackTests: XCTestCase {
         XCTAssertEqual(RythmStub.requests.count, 2)
     }
 
+    func testTheLastNoMatchIsTheOneReportedAfterEveryNarrowerIsDropped() async {
+        RythmStub.enqueue(status: 404, body: #"{"detail":"No match found"}"#)
+        RythmStub.enqueue(status: 404, body: #"{"detail":"No match found"}"#)
+        RythmStub.enqueue(status: 404, body: #"{"detail":"still nothing"}"#)
+        await assertFails(Self.track(duration: 242, isrc: "USTB10250016"), matching: "Rythm: still nothing")
+        XCTAssertEqual(RythmStub.requests.count, 3)
+    }
+
     // MARK: - Duration narrowing
 
     func testNoMatchIsRetriedWithoutTheDurationNarrowing() async throws {
@@ -367,6 +375,64 @@ final class RythmPlaybackTests: XCTestCase {
         RythmStub.enqueue(status: 404, body: #"{"detail":"No match found"}"#)
         await assertFails(Self.track(duration: 0), matching: "Rythm: No match found")
         XCTAssertEqual(RythmStub.requests.count, 1)
+    }
+
+    // MARK: - ISRC narrowing
+
+    func testNoMatchIsRetriedWithoutTheISRCOnceTheDurationRetryAlsoMisses() async throws {
+        // The catalog's ISRC is the one on the release it surfaced, not the one on
+        // the recording: "Gangsta's Paradise" comes back as the 2023 Tommy Boy
+        // reissue `USTB10250016` while the resolver indexes the 1995 recording, so
+        // the narrowing turns a match into a 404.
+        RythmStub.enqueue(status: 404, body: #"{"detail":"No match found"}"#)
+        RythmStub.enqueue(status: 404, body: #"{"detail":"No match found"}"#)
+        RythmStub.enqueue(ok: Self.playbackBody())
+
+        let stream = try await resolve(Self.track(title: "Gangsta's Paradise", artist: "Coolio",
+                                                  duration: 242, isrc: "USTB10250016"))
+        XCTAssertEqual(stream.provider, .rythm)
+        XCTAssertEqual(RythmStub.requests.count, 3)
+
+        let widest = try XCTUnwrap(RythmStub.bodies.last)
+        // Name + artist are what identify the recording; nothing else survives.
+        XCTAssertEqual(Set(widest.keys), ["song_name", "artist"])
+        XCTAssertEqual(widest["song_name"] as? String, "Gangsta's Paradise")
+        XCTAssertEqual(widest["artist"] as? String, "Coolio")
+    }
+
+    func testTheISRCIsDroppedEvenWhenNoDurationWasSent() async throws {
+        // With no duration there is only one narrower, so the ladder is two rungs.
+        RythmStub.enqueue(status: 404, body: #"{"detail":"No match found"}"#)
+        RythmStub.enqueue(ok: Self.playbackBody())
+
+        _ = try await resolve(Self.track(duration: 0, isrc: "USTB10250016"))
+        XCTAssertEqual(RythmStub.requests.count, 2)
+        XCTAssertNil(RythmStub.bodies.last?["isrc"])
+    }
+
+    func testAnOutOfRangeISRCIsNotTreatedAsANarrowerToDrop() async {
+        // It was never sent, so dropping it would repeat the request unchanged.
+        RythmStub.enqueue(status: 404, body: #"{"detail":"No match found"}"#)
+        RythmStub.enqueue(status: 404, body: #"{"detail":"No match found"}"#)
+        await assertFails(Self.track(duration: 242, isrc: "AB"), matching: "Rythm: No match found")
+        XCTAssertEqual(RythmStub.requests.count, 2)
+    }
+
+    func testTheSessionRetryKeepsTheNarrowingOfTheRungItFailedOn() async throws {
+        // A 401 on the widened request is about the credential, not the match —
+        // re-sending it with the ISRC back would undo the widening that got there.
+        PlaybackSourceSettings.rythmBypassToken = ""
+        RythmPlaybackService.sessionTokenProvider = { _, force in force ? "fresh" : "stale" }
+        RythmStub.enqueue(status: 404, body: #"{"detail":"No match found"}"#)
+        RythmStub.enqueue(status: 404, body: #"{"detail":"No match found"}"#)
+        RythmStub.enqueue(status: 401, body: #"{"detail":{"code":"session_expired"}}"#)
+        RythmStub.enqueue(ok: Self.playbackBody())
+
+        _ = try await resolve(Self.track(duration: 242, isrc: "USTB10250016"))
+        XCTAssertEqual(RythmStub.requests.count, 4)
+        let retry = try XCTUnwrap(RythmStub.bodies.last)
+        XCTAssertEqual(Set(retry.keys), ["song_name", "artist"])
+        XCTAssertEqual(RythmStub.requests.last?.value(forHTTPHeaderField: "Authorization"), "Bearer fresh")
     }
 
     func testOtherFailuresAreNotRetriedWithoutTheDuration() async {
