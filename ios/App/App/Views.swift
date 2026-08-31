@@ -360,14 +360,10 @@ struct SettingsView: View {
     @AppStorage("native.downloadQuality") private var downloadQuality = PlaybackQuality.hiResLossless.rawValue
     @AppStorage("native.gapless") private var gapless = true
     @AppStorage("native.audioAnalysis") private var audioAnalysis = true
-    @AppStorage("native.rythmEnabled") private var rythmEnabled = true
-    @AppStorage("native.rythmBaseURL") private var rythmBaseURL = "https://track-api.monochrome.tf"
-    @AppStorage("native.rythmBypassToken") private var rythmBypassToken = ""
-    @AppStorage("native.rythmTurnstileAction") private var rythmTurnstileAction = "auth"
-    @AppStorage("native.amazonEnabled") private var amazonEnabled = true
-    @AppStorage("native.amazonApiBaseURL") private var amazonApiBaseURL = "https://amz.geeked.wtf"
-    @AppStorage("native.amazonBypassToken") private var amazonBypassToken = ""
-    @AppStorage("native.lucidaEnabled") private var lucidaEnabled = true
+    @AppStorage("native.unifiedEnabled") private var unifiedEnabled = true
+    @AppStorage("native.unifiedApiBaseURL") private var unifiedApiBaseURL = PlaybackSourceSettings.defaultUnifiedApiBaseURL
+    @AppStorage("native.unifiedApiToken") private var unifiedApiToken = PlaybackSourceSettings.defaultUnifiedApiToken
+    @AppStorage("native.unifiedTurnstileAction") private var unifiedTurnstileAction = "auth"
     @AppStorage("native.deezerEnabled") private var deezerEnabled = true
     @AppStorage("native.deezerApiBaseURL") private var deezerApiBaseURL = "https://dzr.tabs-vs-spaces.wtf"
 
@@ -396,34 +392,24 @@ struct SettingsView: View {
                 Section(footer: Text("Decodes a few seconds of each lossless track and reads its spectrum, so the badge shows what the file actually is — a FLAC made from an MP3, or a CD rip resampled to 96 kHz, is flagged instead of trusted. Costs roughly 1–3 MB per new track when streaming; downloads are free to check.")) {
                     Toggle("Verify audio quality", isOn: $audioAnalysis)
                 }
-                Section(header: Text("Sources"), footer: Text("Rythm first — it resolves across Monochrome, Qobuz, Amazon and Deezer on the server and needs one Cloudflare check per hour. If it cannot resolve — or AVPlayer rejects its URL — Amazon Music is tried, then Lucida (Qobuz) by ISRC or artist/title, then Deezer. TIDAL is catalog only.")) {
-                    Toggle("Rythm resolver", isOn: $rythmEnabled)
-                    if rythmEnabled {
-                        TextField("Rythm base URL", text: $rythmBaseURL)
+                Section(header: Text("Sources"), footer: Text("Unified Playback first — it resolves across Monochrome, Amazon and TIDAL on the server and, on the shared token, needs one Cloudflare check per hour. If it cannot resolve — or AVPlayer rejects its URL — Deezer is tried by ISRC. TIDAL is catalog only.")) {
+                    Toggle("Unified Playback", isOn: $unifiedEnabled)
+                    if unifiedEnabled {
+                        TextField("Unified Playback base URL", text: $unifiedApiBaseURL)
                             .textInputAutocapitalization(.never)
                             .keyboardType(.URL)
                             .disableAutocorrection(true)
-                        SecureField("Rythm bypass token (optional)", text: $rythmBypassToken)
+                        // Clients on the shared token must also pass Turnstile;
+                        // one with its own token is admitted without it.
+                        SecureField("Unified Playback API token", text: $unifiedApiToken)
                             .textInputAutocapitalization(.never)
                             .disableAutocorrection(true)
-                        // Must match `turnstile_action` from the resolver's
-                        // `GET /config`, or the exchange answers "turnstile
-                        // action mismatch" and the whole leg fails.
-                        TextField("Rythm Turnstile action", text: $rythmTurnstileAction)
-                            .textInputAutocapitalization(.never)
-                            .disableAutocorrection(true)
-                    }
-                    Toggle("Amazon Music", isOn: $amazonEnabled)
-                    if amazonEnabled {
-                        TextField("Amazon API base URL", text: $amazonApiBaseURL)
-                            .textInputAutocapitalization(.never)
-                            .keyboardType(.URL)
-                            .disableAutocorrection(true)
-                        SecureField("Amazon bypass token (optional)", text: $amazonBypassToken)
+                        // Must match the `action` the exchange verifies, or it
+                        // answers with an action mismatch and the leg fails.
+                        TextField("Unified Playback Turnstile action", text: $unifiedTurnstileAction)
                             .textInputAutocapitalization(.never)
                             .disableAutocorrection(true)
                     }
-                    Toggle("Lucida fallback", isOn: $lucidaEnabled)
                     Toggle("Deezer fallback", isOn: $deezerEnabled)
                     if deezerEnabled {
                         TextField("Deezer API base URL", text: $deezerApiBaseURL)
@@ -1383,17 +1369,19 @@ struct NowPlayingView: View {
                 .foregroundColor(.secondary)
             }
 
-            if playback.currentStreamProvider == .qobuz || qualityBadge != nil {
+            if playback.currentStreamProvider == .monochrome || qualityBadge != nil {
                 VStack(spacing: 4) {
-                    if playback.currentStreamProvider == .qobuz {
-                        Text("Lucida")
+                    // Unified Playback can serve its own lossless source; say so,
+                    // the way the Lucida badge used to name that leg.
+                    if playback.currentStreamProvider == .monochrome {
+                        Text("Monochrome")
                             .font(.caption2.weight(.semibold))
                             .kerning(0.6)
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 3)
                             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
-                            .accessibilityLabel("Streaming via Lucida")
+                            .accessibilityLabel("Streaming via the Monochrome source")
                     }
                     if let badge = qualityBadge {
                         HStack(spacing: 5) {
@@ -2103,7 +2091,7 @@ struct ProviderSettingsView: View {
             Picker("Preferred catalog provider", selection: $provider) {
                 ForEach(Provider.musicCases) { Text($0.title).tag($0.rawValue) }
             }
-            Text("Catalog search uses TIDAL metadata. Full audio resolves Rythm → Amazon → Lucida → Deezer like web Monochrome — not TIDAL stream manifests. Podcasts play enclosure media directly (video episodes show in now playing).")
+            Text("Catalog search uses TIDAL metadata. Full audio resolves Unified Playback → Deezer like web Monochrome — not TIDAL stream manifests. Podcasts play enclosure media directly (video episodes show in now playing).")
                 .font(.footnote)
                 .foregroundColor(.secondary)
         }

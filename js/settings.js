@@ -32,9 +32,8 @@ import {
     pwaUpdateSettings,
     contentBlockingSettings,
     musicProviderSettings,
-    amazonMusicSettings,
+    unifiedPlaybackSettings,
     deezerFallbackSettings,
-    lucidaQobuzSettings,
     gaplessPlaybackSettings,
     autoplaySettings,
     analyticsSettings,
@@ -844,35 +843,27 @@ export async function initializeSettings(scrobbler, player, api, ui) {
         });
     }
 
-    const amazonMusicToggle = document.getElementById('amazon-music-toggle');
-    if (amazonMusicToggle) {
-        amazonMusicToggle.checked = amazonMusicSettings.isEnabled();
-        amazonMusicToggle.addEventListener('change', (e) => {
-            amazonMusicSettings.setEnabled(e.target.checked);
+    const unifiedPlaybackToggle = document.getElementById('unified-playback-toggle');
+    if (unifiedPlaybackToggle) {
+        unifiedPlaybackToggle.checked = unifiedPlaybackSettings.isEnabled();
+        unifiedPlaybackToggle.addEventListener('change', (e) => {
+            unifiedPlaybackSettings.setEnabled(e.target.checked);
         });
     }
 
-    const amazonApiBaseUrlInput = document.getElementById('amazon-music-api-base-url');
-    if (amazonApiBaseUrlInput) {
-        amazonApiBaseUrlInput.value = amazonMusicSettings.getApiBaseUrl();
-        amazonApiBaseUrlInput.addEventListener('change', (e) => {
-            amazonMusicSettings.setApiBaseUrl(e.target.value.trim());
+    const unifiedApiBaseUrlInput = document.getElementById('unified-playback-api-base-url');
+    if (unifiedApiBaseUrlInput) {
+        unifiedApiBaseUrlInput.value = unifiedPlaybackSettings.getApiBaseUrl();
+        unifiedApiBaseUrlInput.addEventListener('change', (e) => {
+            unifiedPlaybackSettings.setApiBaseUrl(e.target.value.trim());
         });
     }
 
-    const amazonTurnstileSiteKeyInput = document.getElementById('amazon-music-turnstile-site-key');
-    if (amazonTurnstileSiteKeyInput) {
-        amazonTurnstileSiteKeyInput.value = amazonMusicSettings.getTurnstileSiteKey();
-        amazonTurnstileSiteKeyInput.addEventListener('change', (e) => {
-            amazonMusicSettings.setTurnstileSiteKey(e.target.value.trim());
-        });
-    }
-
-    const amazonTurnstileBypassTokenInput = document.getElementById('amazon-music-turnstile-bypass-token');
-    if (amazonTurnstileBypassTokenInput) {
-        amazonTurnstileBypassTokenInput.value = amazonMusicSettings.getTurnstileBypassToken();
-        amazonTurnstileBypassTokenInput.addEventListener('change', (e) => {
-            amazonMusicSettings.setTurnstileBypassToken(e.target.value.trim());
+    const unifiedApiTokenInput = document.getElementById('unified-playback-api-token');
+    if (unifiedApiTokenInput) {
+        unifiedApiTokenInput.value = unifiedPlaybackSettings.getApiToken();
+        unifiedApiTokenInput.addEventListener('change', (e) => {
+            unifiedPlaybackSettings.setApiToken(e.target.value.trim());
         });
     }
 
@@ -889,14 +880,6 @@ export async function initializeSettings(scrobbler, player, api, ui) {
         deezerApiBaseUrlInput.value = deezerFallbackSettings.getApiBaseUrl();
         deezerApiBaseUrlInput.addEventListener('change', (e) => {
             deezerFallbackSettings.setApiBaseUrl(e.target.value.trim());
-        });
-    }
-
-    const lucidaQobuzToggle = document.getElementById('lucida-qobuz-toggle');
-    if (lucidaQobuzToggle) {
-        lucidaQobuzToggle.checked = lucidaQobuzSettings.isEnabled();
-        lucidaQobuzToggle.addEventListener('change', (e) => {
-            lucidaQobuzSettings.setEnabled(e.target.checked);
         });
     }
 

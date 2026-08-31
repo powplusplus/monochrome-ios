@@ -1,5 +1,5 @@
 import { describe, expect, test, vi, beforeEach, afterEach } from 'vitest';
-import { amazonMusicSettings, lucidaQobuzSettings } from '../storage.js';
+import { unifiedPlaybackSettings } from '../storage.js';
 
 vi.mock('../utils.js', () => ({
     RATE_LIMIT_ERROR_MESSAGE: 'rate limited',
@@ -26,9 +26,14 @@ vi.mock('../storage.js', async (importOriginal) => {
             getTurnstileSiteKey: vi.fn(() => 'test-key'),
             getApiBaseUrl: vi.fn(() => 'https://amz.example'),
         },
-        lucidaQobuzSettings: {
+        unifiedPlaybackSettings: {
             isEnabled: vi.fn(() => true),
             setEnabled: vi.fn(),
+            getApiBaseUrl: vi.fn(() => 'https://music-api.example'),
+            getApiToken: vi.fn(() => 'amp_private'),
+            isDefaultApiToken: vi.fn(() => false),
+            TURNSTILE_SITE_KEY: '0xTEST',
+            TURNSTILE_ACTION: 'auth',
         },
     };
 });
@@ -85,11 +90,9 @@ describe('LosslessAPI stream source fallback', () => {
     beforeEach(() => {
         api = new LosslessAPI({});
         api.streamCache?.clear?.();
-        amazonMusicSettings.isEnabled.mockReturnValue(true);
-        lucidaQobuzSettings.isEnabled.mockReturnValue(true);
+        unifiedPlaybackSettings.isEnabled.mockReturnValue(true);
         vi.spyOn(api, 'getTrackMetadata').mockResolvedValue({ id: '123', isrc: 'TESTISRC123' });
-        vi.spyOn(api, 'getAmazonMusicStreamUrl').mockResolvedValue(null);
-        vi.spyOn(api, 'getQobuzStreamUrl').mockResolvedValue(null);
+        vi.spyOn(api, 'getUnifiedPlaybackStreamUrl').mockResolvedValue(null);
         vi.spyOn(api, 'getDeezerStreamUrl').mockResolvedValue(null);
         vi.spyOn(api, 'getTrack').mockResolvedValue(null);
     });
@@ -98,12 +101,13 @@ describe('LosslessAPI stream source fallback', () => {
         vi.restoreAllMocks();
     });
 
-    test('uses Amazon Music before Lucida when Amazon resolves', async () => {
-        api.getAmazonMusicStreamUrl.mockResolvedValue({
-            url: 'blob:https://app.example/amazon',
-            provider: 'amazon',
+    test('plays what Unified Playback resolves without touching Deezer', async () => {
+        api.getUnifiedPlaybackStreamUrl.mockResolvedValue({
+            url: 'https://cdn.example/audio/track.flac',
+            sourceUrl: 'https://cdn.example/audio/track.flac',
+            provider: 'monochrome',
             playbackType: 'direct',
-            quality: 'HD_44',
+            quality: 'LOSSLESS',
             rgInfo: {
                 trackReplayGain: 0,
                 trackPeakAmplitude: 1,
@@ -111,45 +115,38 @@ describe('LosslessAPI stream source fallback', () => {
                 albumPeakAmplitude: 1,
             },
         });
-        api.getQobuzStreamUrl.mockResolvedValue({
-            url: 'https://audio.example/qobuz.flac',
-            provider: 'qobuz',
-        });
 
         const result = await api.getStreamUrl('123', 'LOSSLESS');
 
         expect(result).toMatchObject({
-            url: 'blob:https://app.example/amazon',
-            provider: 'amazon',
+            url: 'https://cdn.example/audio/track.flac',
+            provider: 'monochrome',
             playbackType: 'direct',
-            quality: 'HD_44',
+            quality: 'LOSSLESS',
         });
-        expect(api.getAmazonMusicStreamUrl).toHaveBeenCalled();
-        expect(api.getQobuzStreamUrl).not.toHaveBeenCalled();
+        expect(api.getUnifiedPlaybackStreamUrl).toHaveBeenCalled();
+        expect(api.getDeezerStreamUrl).not.toHaveBeenCalled();
         expect(api.getTrack).not.toHaveBeenCalled();
     });
 
-    test('falls back to Lucida when Amazon cannot resolve a stream URL', async () => {
-        api.getQobuzStreamUrl.mockResolvedValue({
-            url: 'https://audio.example/qobuz.flac',
-            rgInfo: {
-                trackReplayGain: -2,
-                trackPeakAmplitude: 0.8,
-                albumReplayGain: -3,
-                albumPeakAmplitude: 0.85,
-            },
+    test('asks Unified Playback for the stream intent and the requested tier', async () => {
+        api.getUnifiedPlaybackStreamUrl.mockResolvedValue({
+            url: 'https://cdn.example/audio/track.flac',
+            provider: 'monochrome',
+            playbackType: 'direct',
+            quality: 'LOSSLESS',
         });
 
-        const result = await api.getStreamUrl('123', 'LOSSLESS');
+        await api.getStreamUrl('123', 'HI_RES_LOSSLESS');
 
-        expect(result.url).toBe('https://audio.example/qobuz.flac');
-        expect(result.provider).toBe('qobuz');
-        expect(api.getAmazonMusicStreamUrl).toHaveBeenCalled();
-        expect(api.getQobuzStreamUrl).toHaveBeenCalled();
-        expect(api.getTrack).not.toHaveBeenCalled();
+        expect(api.getUnifiedPlaybackStreamUrl).toHaveBeenCalledWith(
+            '123',
+            'HI_RES_LOSSLESS',
+            expect.objectContaining({ intent: 'stream' })
+        );
     });
 
-    test('falls back to Deezer when Amazon and Lucida both miss', async () => {
+    test('falls back to Deezer when Unified Playback cannot resolve the track', async () => {
         api.getDeezerStreamUrl.mockResolvedValue({
             url: 'https://audio.example/deezer.flac',
             format: 'FLAC',
@@ -162,146 +159,70 @@ describe('LosslessAPI stream source fallback', () => {
             provider: 'deezer',
             deezerFormat: 'FLAC',
         });
-        expect(api.getAmazonMusicStreamUrl).toHaveBeenCalled();
-        expect(api.getQobuzStreamUrl).toHaveBeenCalled();
+        expect(api.getUnifiedPlaybackStreamUrl).toHaveBeenCalled();
         expect(api.getTrack).not.toHaveBeenCalled();
     });
 
-    test('throws when Amazon, Lucida, and Deezer all miss', async () => {
+    test('throws when Unified Playback and Deezer both miss', async () => {
         await expect(api.getStreamUrl('123', 'LOSSLESS')).rejects.toThrow(
-            'Could not resolve stream URL from Amazon Music, Qobuz, or Deezer'
+            'Could not resolve stream URL from Unified Playback or Deezer'
         );
         expect(api.getTrack).not.toHaveBeenCalled();
     });
-});
 
-describe('LosslessAPI Lucida hedge', () => {
-    let api;
+    test('names the missing ISRC when there is nothing for Deezer to look up', async () => {
+        api.getTrackMetadata.mockResolvedValue({ id: '123', title: 'Song', artist: { name: 'Artist' } });
 
-    const deferred = () => {
-        let settle;
-        const promise = new Promise((resolve) => {
-            settle = resolve;
-        });
-        return { promise, settle };
-    };
-
-    beforeEach(() => {
-        api = new LosslessAPI({});
-        api.streamCache?.clear?.();
-        // Fire the hedge immediately instead of sitting through the real 2s window.
-        api.amazonHedgeDelayMs = 0;
-        amazonMusicSettings.isEnabled.mockReturnValue(true);
-        lucidaQobuzSettings.isEnabled.mockReturnValue(true);
-        vi.spyOn(api, 'getTrackMetadata').mockResolvedValue({ id: '123', isrc: 'TESTISRC123' });
-        vi.spyOn(api, 'getDeezerStreamUrl').mockResolvedValue(null);
-        vi.spyOn(api, 'getTrack').mockResolvedValue(null);
+        await expect(api.getStreamUrl('123', 'LOSSLESS')).rejects.toThrow('has no ISRC for Deezer lookup');
+        expect(api.getDeezerStreamUrl).not.toHaveBeenCalled();
     });
 
-    afterEach(() => {
-        vi.restoreAllMocks();
-    });
-
-    test('starts Lucida while a stalling Amazon is still in flight', async () => {
-        const amazon = deferred();
-        vi.spyOn(api, 'getAmazonMusicStreamUrl').mockReturnValue(amazon.promise);
-        vi.spyOn(api, 'getQobuzStreamUrl').mockResolvedValue({
-            url: 'https://audio.example/qobuz.flac',
-            provider: 'qobuz',
-        });
-
-        const pending = api.getStreamUrl('123', 'LOSSLESS');
-        await new Promise((r) => setTimeout(r, 5));
-
-        // Lucida is already resolving even though Amazon has not answered yet.
-        expect(api.getQobuzStreamUrl).toHaveBeenCalled();
-
-        amazon.settle(null);
-        const result = await pending;
-        expect(result.provider).toBe('qobuz');
-    });
-
-    test('Amazon still wins when it resolves after the hedge started', async () => {
-        const amazon = deferred();
-        vi.spyOn(api, 'getAmazonMusicStreamUrl').mockReturnValue(amazon.promise);
-        vi.spyOn(api, 'getQobuzStreamUrl').mockResolvedValue({
-            url: 'https://audio.example/qobuz.flac',
-            provider: 'qobuz',
-        });
-
-        const pending = api.getStreamUrl('123', 'LOSSLESS');
-        await new Promise((r) => setTimeout(r, 5));
-        expect(api.getQobuzStreamUrl).toHaveBeenCalled();
-
-        amazon.settle({
-            url: 'blob:https://app.example/amazon',
-            provider: 'amazon',
+    test('caches the resolved stream so a repeat play costs no lookup', async () => {
+        api.getUnifiedPlaybackStreamUrl.mockResolvedValue({
+            url: 'https://cdn.example/audio/track.flac',
+            provider: 'monochrome',
             playbackType: 'direct',
-            quality: 'HD_44',
-        });
-
-        const result = await pending;
-        expect(result.provider).toBe('amazon');
-    });
-
-    test('leaves Lucida alone when Amazon answers inside the hedge window', async () => {
-        api.amazonHedgeDelayMs = 50_000;
-        vi.spyOn(api, 'getAmazonMusicStreamUrl').mockResolvedValue({
-            url: 'blob:https://app.example/amazon',
-            provider: 'amazon',
-            playbackType: 'direct',
-            quality: 'HD_44',
-        });
-        vi.spyOn(api, 'getQobuzStreamUrl').mockResolvedValue(null);
-
-        const result = await api.getStreamUrl('123', 'LOSSLESS');
-
-        expect(result.provider).toBe('amazon');
-        expect(api.getQobuzStreamUrl).not.toHaveBeenCalled();
-    });
-
-    test('runs the Lucida leg only once when hedge and fallback both want it', async () => {
-        vi.spyOn(api, 'getAmazonMusicStreamUrl').mockResolvedValue(null);
-        vi.spyOn(api, 'getQobuzStreamUrl').mockResolvedValue({
-            url: 'https://audio.example/qobuz.flac',
-            provider: 'qobuz',
+            quality: 'LOSSLESS',
         });
 
         await api.getStreamUrl('123', 'LOSSLESS');
+        await api.getStreamUrl('123', 'LOSSLESS');
 
-        expect(api.getQobuzStreamUrl).toHaveBeenCalledTimes(1);
+        expect(api.getUnifiedPlaybackStreamUrl).toHaveBeenCalledTimes(1);
     });
 });
 
-describe('LosslessAPI Lucida without ISRC', () => {
+describe('LosslessAPI Unified Playback CENC routing', () => {
     let api;
 
     beforeEach(() => {
         api = new LosslessAPI({});
         api.streamCache?.clear?.();
-        amazonMusicSettings.isEnabled.mockReturnValue(true);
-        lucidaQobuzSettings.isEnabled.mockReturnValue(true);
-        vi.spyOn(api, 'getTrackMetadata').mockResolvedValue({
-            id: '123',
-            title: 'Song',
-            artist: { name: 'Artist' },
-        });
-        vi.spyOn(api, 'getAmazonMusicStreamUrl').mockResolvedValue(null);
-        vi.spyOn(api, 'getQobuzStreamUrl').mockResolvedValue({
-            url: 'https://audio.example/qobuz.flac',
-            provider: 'qobuz',
-        });
+        unifiedPlaybackSettings.isEnabled.mockReturnValue(true);
+        vi.spyOn(api, 'getTrackMetadata').mockResolvedValue({ id: '123', isrc: 'TESTISRC123' });
         vi.spyOn(api, 'getDeezerStreamUrl').mockResolvedValue(null);
-        vi.spyOn(api, 'getTrack').mockResolvedValue(null);
     });
 
     afterEach(() => {
         vi.restoreAllMocks();
     });
 
-    test('falls back to Lucida via artist title when ISRC missing', async () => {
-        const result = await api.getStreamUrl('123', 'LOSSLESS');
-        expect(result.provider).toBe('qobuz');
-        expect(api.getQobuzStreamUrl).toHaveBeenCalledWith('Artist Song', 'LOSSLESS');
+    test('leaves an Amazon CENC manifest alone where EME works', async () => {
+        // `canUseNativeAmazonCenc` is stubbed true for this suite, so the DASH
+        // manifest goes to the player untouched.
+        vi.spyOn(api, 'getUnifiedPlaybackStreamUrl').mockResolvedValue({
+            url: 'blob:https://app.example/manifest',
+            sourceUrl: 'https://cdn.example/audio/track.mp4',
+            provider: 'amazon',
+            playbackType: 'dash-cenc',
+            quality: 'UHD_96_24',
+            decryptionKey: '00112233445566778899aabbccddeeff',
+            codec: 'flac',
+        });
+
+        const result = await api.getStreamUrl('123', 'HI_RES_LOSSLESS');
+
+        expect(result.url).toBe('blob:https://app.example/manifest');
+        expect(result.playbackType).toBe('dash-cenc');
     });
 });

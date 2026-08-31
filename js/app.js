@@ -15,7 +15,7 @@ import {
     pwaUpdateSettings,
     modalSettings,
     keyboardShortcuts,
-    amazonMusicSettings,
+    unifiedPlaybackSettings,
 } from './storage.js';
 import { UIRenderer } from './ui.js';
 import { Player } from './player.js';
@@ -581,8 +581,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     await MusicAPI.initialize(apiSettings);
 
-    if (amazonMusicSettings.isEnabled() && !amazonMusicSettings.getTurnstileBypassToken().trim()) {
-        MusicAPI.instance.tidalAPI.getTurnstileJwt().catch(() => null);
+    // Only a client on the shared token has to solve Turnstile at all, and the
+    // solve does not depend on which track is played — do it while the user is
+    // still browsing rather than in front of the first play.
+    if (unifiedPlaybackSettings.isEnabled() && unifiedPlaybackSettings.isDefaultApiToken()) {
+        MusicAPI.instance.tidalAPI.getUnifiedTurnstileJwt().catch(() => null);
     }
 
     const audioPlayer = document.getElementById('audio-player');

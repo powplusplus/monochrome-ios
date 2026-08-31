@@ -50,7 +50,7 @@ final class PlaybackEngine: ObservableObject {
     /// looked at it. Arrives a few seconds after playback starts, so the badge
     /// shows the provider's claim first and corrects itself.
     @Published private(set) var currentStreamAnalysis: AudioAnalysis?
-    /// Active stream provider — drives the Lucida badge above the lossless indicator.
+    /// Active stream provider — drives the source badge above the lossless indicator.
     @Published private(set) var currentStreamProvider: Provider?
     /// Loudness for playlist now-playing bars. Separate store so ~30 Hz meter
     /// ticks do not rebuild every `TrackRow` via `PlaybackEngine.objectWillChange`.
@@ -108,8 +108,10 @@ final class PlaybackEngine: ObservableObject {
     /// pulling the whole file up front once bandwidth allows.
     private let forwardBufferSeconds: TimeInterval = 30
     /// Providers whose stream URL already failed AVPlayer for the current track.
-    /// Cleared when playback moves to a different track. Lets Amazon "success"
-    /// that AVPlayer rejects fall through to Lucida automatically.
+    /// Cleared when playback moves to a different track. Lets a Unified Playback
+    /// "success" that AVPlayer rejects fall through to Deezer automatically —
+    /// and, when only one of its sources is exhausted, back to Unified Playback
+    /// for a different one.
     private var skippedProviders: Set<Provider> = []
     private var providerFailureCounts: [Provider: Int] = [:]
     private var recoveryQuality: PlaybackQuality?
@@ -194,7 +196,7 @@ final class PlaybackEngine: ObservableObject {
                       let failed = notification.object as? AVPlayerItem,
                       failed === self.player.currentItem,
                       let provider = self.currentStreamProvider,
-                      [.rythm, .amazon, .qobuz, .deezer].contains(provider) else { return }
+                      [.amazon, .tidal, .monochrome, .deezer].contains(provider) else { return }
                 self.recoverPlaybackFailure(provider: provider, autoplay: true)
             }
         }
@@ -205,7 +207,7 @@ final class PlaybackEngine: ObservableObject {
                       let stalled = notification.object as? AVPlayerItem,
                       stalled === self.player.currentItem,
                       let provider = self.currentStreamProvider,
-                      [.rythm, .amazon, .qobuz, .deezer].contains(provider) else { return }
+                      [.amazon, .tidal, .monochrome, .deezer].contains(provider) else { return }
                 let position = self.player.currentTime().seconds
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
                 guard !Task.isCancelled, stalled === self.player.currentItem,
@@ -587,7 +589,7 @@ final class PlaybackEngine: ObservableObject {
                                 return
                             }
                             if !fromLocalFile,
-                               [.rythm, .amazon, .qobuz, .deezer].contains(failedProvider) {
+                               [.amazon, .tidal, .monochrome, .deezer].contains(failedProvider) {
                                 self.recoverPlaybackFailure(provider: failedProvider, autoplay: autoplay)
                                 return
                             }
@@ -839,10 +841,10 @@ final class PlaybackEngine: ObservableObject {
         recoveryQuality = nil
     }
 
-    /// A provider can resolve successfully and still hand AVPlayer an expired,
+    /// A source can resolve successfully and still hand AVPlayer an expired,
     /// truncated, or non-seekable asset. Re-resolve automatically (fresh signed
     /// URL / file), downgrade Amazon from FLAC to its simpler AAC path when needed,
-    /// then exclude an exhausted provider. The user never has to hammer Play.
+    /// then exclude an exhausted source. The user never has to hammer Play.
     private func recoverPlaybackFailure(provider: Provider, autoplay: Bool) {
         guard currentTrack != nil else { return }
         // The Amazon resolver intentionally reuses decrypted local files. If
@@ -1335,7 +1337,8 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
                 try Task.checkCancellation()
                 let stream = try await MusicService.shared.resolveStream(
                     for: track,
-                    quality: PlaybackQuality.downloadStored
+                    quality: PlaybackQuality.downloadStored,
+                    intent: "download"
                 )
                 try Task.checkCancellation()
                 try await self.persist(stream.url, for: track)

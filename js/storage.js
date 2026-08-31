@@ -3188,6 +3188,75 @@ export const amazonMusicSettings = {
     },
 };
 
+// Unified Playback (`music-api.geeked.wtf`) — the single resolver in front of
+// the Deezer fallback. It aggregates Monochrome, Amazon and TIDAL server-side,
+// so it replaces the separate Amazon Music and Lucida-Qobuz legs.
+//
+// The legacy `amazon-music-*` keys are read as fallbacks so a client that
+// configured the old Amazon leg keeps its preference, and a stored base URL
+// naming a host the API has moved off is ignored rather than left to 404.
+export const unifiedPlaybackSettings = {
+    ENABLED_KEY: 'unified-playback-enabled',
+    API_BASE_URL_KEY: 'unified-playback-api-base-url',
+    API_TOKEN_KEY: 'unified-playback-api-token',
+    DEFAULT_API_BASE_URL: 'https://music-api.geeked.wtf',
+    LEGACY_API_BASE_URLS: ['https://amz.geeked.wtf', 'https://track-api.monochrome.tf', 'https://mono.geeked.wtf'],
+    DEFAULT_API_TOKEN: 'amp_29b2lIr4mze4tK-P8QDOxfMZ9anCgJ9_uGTUks3nIyo',
+    TURNSTILE_SITE_KEY: '0x4AAAAAADgxqF6QVMm0GLHH',
+    TURNSTILE_ACTION: 'auth',
+
+    isEnabled() {
+        try {
+            return (localStorage.getItem(this.ENABLED_KEY) ?? localStorage.getItem('amazon-music-enabled')) !== 'false';
+        } catch {
+            return true;
+        }
+    },
+
+    setEnabled(enabled) {
+        localStorage.setItem(this.ENABLED_KEY, enabled ? 'true' : 'false');
+    },
+
+    getApiBaseUrl() {
+        try {
+            const stored =
+                localStorage.getItem(this.API_BASE_URL_KEY) || localStorage.getItem('amazon-music-api-base-url');
+            if (!stored || this.LEGACY_API_BASE_URLS.includes(stored.replace(/\/+$/, ''))) {
+                return this.DEFAULT_API_BASE_URL;
+            }
+            return stored;
+        } catch {
+            return this.DEFAULT_API_BASE_URL;
+        }
+    },
+
+    setApiBaseUrl(url) {
+        localStorage.setItem(this.API_BASE_URL_KEY, url || this.DEFAULT_API_BASE_URL);
+    },
+
+    getApiToken() {
+        try {
+            return (
+                localStorage.getItem(this.API_TOKEN_KEY) ||
+                localStorage.getItem('amazon-music-turnstile-bypass-token') ||
+                this.DEFAULT_API_TOKEN
+            );
+        } catch {
+            return this.DEFAULT_API_TOKEN;
+        }
+    },
+
+    setApiToken(token) {
+        localStorage.setItem(this.API_TOKEN_KEY, token || '');
+    },
+
+    // Only the shared token needs a Turnstile JWT alongside it; a client with
+    // its own token is admitted on the bearer alone.
+    isDefaultApiToken(token) {
+        return (token || this.getApiToken() || '').trim() === (this.DEFAULT_API_TOKEN || '').trim();
+    },
+};
+
 export const deezerFallbackSettings = {
     ENABLED_KEY: 'deezer-fallback-enabled',
     API_BASE_URL_KEY: 'deezer-fallback-api-base-url',

@@ -1,7 +1,11 @@
 import Foundation
 
 enum Provider: String, Codable, CaseIterable, Identifiable {
-    case tidal, amazon, qobuz, deezer, podcast, rythm
+    /// `monochrome` is the in-house lossless source Unified Playback selects
+    /// (`source: "mono"`). `qobuz` and `rythm` no longer have a resolver behind
+    /// them — web dropped Lucida and the standalone Rythm API — but the cases
+    /// stay so libraries and downloads persisted under them still decode.
+    case tidal, amazon, qobuz, deezer, podcast, rythm, monochrome
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -10,10 +14,12 @@ enum Provider: String, Codable, CaseIterable, Identifiable {
         }
     }
 
-    /// Catalog/provider picker — exclude podcasts and Rythm. Neither is a music
-    /// catalog: Rythm only resolves a stream for a name/artist pair, it has no
-    /// search, album or artist routes to browse.
-    static var musicCases: [Provider] { allCases.filter { $0 != .podcast && $0 != .rythm } }
+    /// Catalog/provider picker — exclude podcasts and the stream-only sources.
+    /// Neither Rythm nor Monochrome is a music catalog: they resolve a stream
+    /// for a name/artist pair and have no search, album or artist routes.
+    static var musicCases: [Provider] {
+        allCases.filter { $0 != .podcast && $0 != .rythm && $0 != .monochrome }
+    }
 }
 
 /// Mirrors web `playback-quality` tokens (mapped to Amazon UHD/HD/SD and Deezer formats).
@@ -209,83 +215,73 @@ enum PlaybackQuality: String, CaseIterable, Identifiable, Codable {
 }
 
 enum PlaybackSourceSettings {
-    /// Rythm (`track-api.monochrome.tf`) is the resolver the web client reaches
-    /// for first. It aggregates server-side, so it keeps resolving while the
-    /// HiFi pool answers `Upstream API error` for `/track/` and while the Deezer
-    /// account pool is dead. ON by default; the legacy chain stays behind it.
-    static var rythmEnabled: Bool {
-        get { UserDefaults.standard.object(forKey: "native.rythmEnabled") as? Bool ?? true }
-        set { UserDefaults.standard.set(newValue, forKey: "native.rythmEnabled") }
+    /// Unified Playback (`music-api.geeked.wtf`) is the only resolver the web
+    /// client now runs in front of Deezer. It aggregates Monochrome, Amazon and
+    /// TIDAL server-side, so one lookup covers the three legs native used to
+    /// walk separately (Rythm, the direct Amazon API, Lucida).
+    static var unifiedEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "native.unifiedEnabled") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "native.unifiedEnabled") }
     }
 
-    static var rythmBaseURL: String {
+    static let defaultUnifiedApiBaseURL = "https://music-api.geeked.wtf"
+
+    /// Hosts the API moved off. Web keeps the same list and ignores a stored
+    /// value that names one of them, so a client that had pointed at the old
+    /// Amazon or Rythm host is migrated instead of left on a dead endpoint.
+    static let legacyUnifiedApiBaseURLs = [
+        "https://amz.geeked.wtf",
+        "https://track-api.monochrome.tf",
+        "https://mono.geeked.wtf",
+    ]
+
+    static var unifiedApiBaseURL: String {
         get {
-            let value = UserDefaults.standard.string(forKey: "native.rythmBaseURL")?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return (value?.isEmpty == false) ? value! : "https://track-api.monochrome.tf"
+            let stored = UserDefaults.standard.string(forKey: "native.unifiedApiBaseURL")?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let normalized = stored.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            guard !normalized.isEmpty, !legacyUnifiedApiBaseURLs.contains(normalized) else {
+                return defaultUnifiedApiBaseURL
+            }
+            return stored
         }
-        set { UserDefaults.standard.set(newValue, forKey: "native.rythmBaseURL") }
+        set { UserDefaults.standard.set(newValue, forKey: "native.unifiedApiBaseURL") }
     }
 
-    static var rythmBypassToken: String {
-        get { UserDefaults.standard.string(forKey: "native.rythmBypassToken") ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: "native.rythmBypassToken") }
-    }
+    /// Shared client token the web bundle ships. A client using it must also
+    /// present a Turnstile JWT; a client with its own token does not.
+    static let defaultUnifiedApiToken = "amp_29b2lIr4mze4tK-P8QDOxfMZ9anCgJ9_uGTUks3nIyo"
 
-    /// Rythm publishes its own key at `GET /config`; it is currently the same one
-    /// Amazon uses, so the stored default is shared and the fetch is skipped.
-    static var rythmTurnstileSiteKey: String {
+    static var unifiedApiToken: String {
         get {
-            let value = UserDefaults.standard.string(forKey: "native.rythmTurnstileSiteKey")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = UserDefaults.standard.string(forKey: "native.unifiedApiToken")?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return (value?.isEmpty == false) ? value! : defaultUnifiedApiToken
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "native.unifiedApiToken") }
+    }
+
+    static var unifiedTurnstileSiteKey: String {
+        get {
+            let value = UserDefaults.standard.string(forKey: "native.unifiedTurnstileSiteKey")?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             return (value?.isEmpty == false) ? value! : "0x4AAAAAADgxqF6QVMm0GLHH"
         }
-        set { UserDefaults.standard.set(newValue, forKey: "native.rythmTurnstileSiteKey") }
+        set { UserDefaults.standard.set(newValue, forKey: "native.unifiedTurnstileSiteKey") }
     }
 
-    /// Rythm verifies the `action` the widget was rendered with against the one
-    /// it publishes at `GET /config` (`"auth"`), and answers a token solved
-    /// without one with `turnstile action mismatch`. Cloudflare treats `action`
-    /// as free-form metadata, so nothing on the client side catches this —
+    /// The exchange verifies the `action` the widget was rendered with against
+    /// the one it expects (`"auth"`, which is what web renders), and answers a
+    /// token solved without one with an action mismatch. Cloudflare treats
+    /// `action` as free-form metadata, so nothing client-side catches this —
     /// the whole leg just fails at the exchange.
-    static var rythmTurnstileAction: String {
+    static var unifiedTurnstileAction: String {
         get {
-            let value = UserDefaults.standard.string(forKey: "native.rythmTurnstileAction")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = UserDefaults.standard.string(forKey: "native.unifiedTurnstileAction")?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             return (value?.isEmpty == false) ? value! : "auth"
         }
-        set { UserDefaults.standard.set(newValue, forKey: "native.rythmTurnstileAction") }
-    }
-
-    static var amazonEnabled: Bool {
-        get { UserDefaults.standard.object(forKey: "native.amazonEnabled") as? Bool ?? true }
-        set { UserDefaults.standard.set(newValue, forKey: "native.amazonEnabled") }
-    }
-
-    static var amazonApiBaseURL: String {
-        get {
-            let value = UserDefaults.standard.string(forKey: "native.amazonApiBaseURL")?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return (value?.isEmpty == false) ? value! : "https://amz.geeked.wtf"
-        }
-        set { UserDefaults.standard.set(newValue, forKey: "native.amazonApiBaseURL") }
-    }
-
-    static var amazonBypassToken: String {
-        get { UserDefaults.standard.string(forKey: "native.amazonBypassToken") ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: "native.amazonBypassToken") }
-    }
-
-    static var amazonTurnstileSiteKey: String {
-        get {
-            let value = UserDefaults.standard.string(forKey: "native.amazonTurnstileSiteKey")?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return (value?.isEmpty == false) ? value! : "0x4AAAAAADgxqF6QVMm0GLHH"
-        }
-        set { UserDefaults.standard.set(newValue, forKey: "native.amazonTurnstileSiteKey") }
-    }
-
-    /// Amazon's exchange does not check the action — web solves without one and
-    /// is accepted — so this stays empty unless a user is pointed at a fork that
-    /// does. Empty means "render no action at all", not "render an empty one".
-    static var amazonTurnstileAction: String {
-        get { UserDefaults.standard.string(forKey: "native.amazonTurnstileAction")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: "native.amazonTurnstileAction") }
+        set { UserDefaults.standard.set(newValue, forKey: "native.unifiedTurnstileAction") }
     }
 
     static var deezerEnabled: Bool {
@@ -299,20 +295,6 @@ enum PlaybackSourceSettings {
             return (value?.isEmpty == false) ? value! : "https://dzr.tabs-vs-spaces.wtf"
         }
         set { UserDefaults.standard.set(newValue, forKey: "native.deezerApiBaseURL") }
-    }
-
-    /// Qobuz-via-Lucida fallback. ON by default — same as web `lucidaQobuzSettings`.
-    static var lucidaEnabled: Bool {
-        get { UserDefaults.standard.object(forKey: "native.lucidaEnabled") as? Bool ?? true }
-        set { UserDefaults.standard.set(newValue, forKey: "native.lucidaEnabled") }
-    }
-
-    static var lucidaBaseURL: String {
-        get {
-            let value = UserDefaults.standard.string(forKey: "native.lucidaBaseURL")?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return (value?.isEmpty == false) ? value! : "https://monochrome.tf"
-        }
-        set { UserDefaults.standard.set(newValue, forKey: "native.lucidaBaseURL") }
     }
 
     /// Decode a few seconds of each lossless stream and check the spectrum
@@ -360,7 +342,8 @@ struct Track: Codable, Identifiable, Hashable {
     var streamURL: URL?
     /// PodcastIndex `enclosureType` (e.g. `video/mp4`) — video episodes play visually.
     var enclosureType: String?
-    /// Provider that filled the offline file (Amazon/Qobuz/Deezer). Drives Lucida badge on local play.
+    /// Provider that filled the offline file (Amazon/Monochrome/Deezer). Drives the
+    /// source badge on local play.
     var offlineProvider: Provider? = nil
     /// Quality token written with the offline file.
     var offlineQuality: String? = nil

@@ -38,7 +38,7 @@ describe('Amazon Music playback metadata', () => {
     });
 });
 
-describe('Amazon Music source selection', () => {
+describe('Unified Playback source selection', () => {
     let api;
 
     beforeEach(() => {
@@ -52,140 +52,123 @@ describe('Amazon Music source selection', () => {
                 isrc: 'USABC1234567',
             })
         );
-        localStorage.setItem('amazon-music-enabled', 'true');
-        localStorage.setItem('amazon-music-turnstile-bypass-token', 'test-bypass');
-        localStorage.removeItem('amazon-music-rate-limited-until');
+        // A client-owned token skips the Turnstile solve entirely.
+        localStorage.setItem('unified-playback-enabled', 'true');
+        localStorage.setItem('unified-playback-api-token', 'amp_private');
+        localStorage.removeItem('unified-playback-rate-limited-until');
         api.streamCache?.clear?.();
     });
 
     afterEach(() => {
-        localStorage.removeItem('amazon-music-enabled');
-        localStorage.removeItem('amazon-music-turnstile-bypass-token');
+        localStorage.removeItem('unified-playback-enabled');
+        localStorage.removeItem('unified-playback-api-token');
         vi.restoreAllMocks();
     });
 
-    test('tries Amazon first when the 50/50 playback roll prefers Amazon', async () => {
-        vi.spyOn(Math, 'random').mockReturnValue(0.75);
+    test('plays the Unified Playback stream and never asks Deezer', async () => {
         const calls = [];
-        api.getAmazonMusicStreamUrl = vi.fn(() => {
-            calls.push('amazon');
+        api.getUnifiedPlaybackStreamUrl = vi.fn(() => {
+            calls.push('unified');
             return Promise.resolve({
-                url: 'https://amazon.example/audio.mp4',
-                sourceUrl: 'https://amazon.example/audio.mp4',
-                provider: 'amazon',
+                url: 'https://cdn.example/audio/track.flac',
+                sourceUrl: 'https://cdn.example/audio/track.flac',
+                provider: 'monochrome',
                 playbackType: 'direct',
-                quality: 'HD',
-                qualityDisplay: 'FLAC',
+                quality: 'LOSSLESS',
             });
         });
-        api.getQobuzStreamUrl = vi.fn(() => {
-            calls.push('qobuz');
-            return Promise.resolve({ url: 'https://qobuz.example/audio.flac' });
+        api.getDeezerStreamUrl = vi.fn(() => {
+            calls.push('deezer');
+            return Promise.resolve({ url: 'https://deezer.example/audio.flac', format: 'FLAC' });
         });
 
         const result = await api.getStreamUrl('71513806', 'LOSSLESS');
 
-        expect(result.provider).toBe('amazon');
-        expect(calls).toEqual(['amazon']);
+        expect(result.provider).toBe('monochrome');
+        expect(calls).toEqual(['unified']);
     });
 
-    test('tries Qobuz first when the 50/50 playback roll prefers Qobuz', async () => {
-        vi.spyOn(Math, 'random').mockReturnValue(0.25);
+    test('falls through to Deezer when Unified Playback returns nothing', async () => {
         const calls = [];
-        api.getAmazonMusicStreamUrl = vi.fn(() => {
-            calls.push('amazon');
-            return Promise.resolve({
-                url: 'https://amazon.example/audio.mp4',
-                sourceUrl: 'https://amazon.example/audio.mp4',
-                provider: 'amazon',
-            });
-        });
-        api.getQobuzStreamUrl = vi.fn(() => {
-            calls.push('qobuz');
-            return Promise.resolve({ url: 'https://qobuz.example/audio.flac', rgInfo: null });
-        });
-
-        const result = await api.getStreamUrl('71513806', 'LOSSLESS');
-
-        expect(result.provider).toBe('qobuz');
-        expect(calls).toEqual(['qobuz']);
-    });
-
-    test('falls back to Qobuz when Amazon is preferred but cannot resolve a stream', async () => {
-        vi.spyOn(Math, 'random').mockReturnValue(0.75);
-        const calls = [];
-        api.getAmazonMusicStreamUrl = vi.fn(() => {
-            calls.push('amazon');
+        api.getUnifiedPlaybackStreamUrl = vi.fn(() => {
+            calls.push('unified');
             return Promise.resolve(null);
         });
-        api.getQobuzStreamUrl = vi.fn(() => {
-            calls.push('qobuz');
-            return Promise.resolve({ url: 'https://qobuz.example/audio.flac', rgInfo: null });
+        api.getDeezerStreamUrl = vi.fn(() => {
+            calls.push('deezer');
+            return Promise.resolve({ url: 'https://deezer.example/audio.flac', format: 'FLAC' });
         });
 
         const result = await api.getStreamUrl('71513806', 'LOSSLESS');
 
-        expect(result.provider).toBe('qobuz');
-        expect(calls).toEqual(['amazon', 'qobuz']);
+        expect(result.provider).toBe('deezer');
+        expect(calls).toEqual(['unified', 'deezer']);
     });
 
-    test('falls back to Amazon when Qobuz is preferred but cannot resolve a stream', async () => {
-        vi.spyOn(Math, 'random').mockReturnValue(0.25);
-        const calls = [];
-        api.getAmazonMusicStreamUrl = vi.fn(() => {
-            calls.push('amazon');
-            return Promise.resolve({
-                url: 'https://amazon.example/audio.mp4',
-                sourceUrl: 'https://amazon.example/audio.mp4',
-                provider: 'amazon',
-            });
-        });
-        api.getQobuzStreamUrl = vi.fn(() => {
-            calls.push('qobuz');
-            return Promise.resolve(null);
-        });
+    test('a rate-limited client does not spend a request on the next track', async () => {
+        localStorage.setItem('unified-playback-rate-limited-until', String(Date.now() + 60_000));
+        const fetchMock = vi.fn();
+        vi.stubGlobal('fetch', fetchMock);
 
-        const result = await api.getStreamUrl('71513806', 'LOSSLESS');
+        await expect(
+            api.fetchUnifiedPlaybackEnvelope({ title: 'Song', artist: { name: 'Artist' } }, 'LOSSLESS')
+        ).resolves.toBeNull();
+        expect(fetchMock).not.toHaveBeenCalled();
 
-        expect(result.provider).toBe('amazon');
-        expect(calls).toEqual(['qobuz', 'amazon']);
+        localStorage.removeItem('unified-playback-rate-limited-until');
+        vi.unstubAllGlobals();
     });
 });
 
-describe('Amazon Music combined API lookup', () => {
+describe('Unified Playback API lookup', () => {
     let api;
 
     beforeEach(() => {
         api = new LosslessAPI({});
-        localStorage.setItem('amazon-music-enabled', 'true');
-        localStorage.setItem('amazon-music-api-base-url', 'https://amz.geeked.wtf');
-        localStorage.setItem('amazon-music-turnstile-bypass-token', 'trusted-token');
-        localStorage.removeItem('amazon-music-rate-limited-until');
+        localStorage.setItem('unified-playback-enabled', 'true');
+        localStorage.setItem('unified-playback-api-base-url', 'https://music-api.geeked.wtf');
+        localStorage.setItem('unified-playback-api-token', 'amp_private');
+        localStorage.removeItem('unified-playback-rate-limited-until');
     });
 
     afterEach(() => {
-        localStorage.removeItem('amazon-music-api-base-url');
-        localStorage.removeItem('amazon-music-turnstile-bypass-token');
+        localStorage.removeItem('unified-playback-enabled');
+        localStorage.removeItem('unified-playback-api-base-url');
+        localStorage.removeItem('unified-playback-api-token');
         vi.unstubAllGlobals();
         vi.restoreAllMocks();
     });
 
-    test('requests the combined metadata-to-stream endpoint', async () => {
-        api.getAmazonCencMp4Info = vi.fn(() => Promise.resolve(null));
+    test('sends the envelope lookup the API documents', async () => {
         const fetchMock = vi.fn(() =>
             Promise.resolve({
                 ok: true,
                 status: 200,
+                headers: new Headers(),
                 json: () =>
                     Promise.resolve({
-                        stream_url: 'https://amazon.example/audio.mp4',
-                        quality_selected: 'HD',
+                        schema_version: '2.0',
+                        quality_requested: 'HI_RES_LOSSLESS',
+                        selected_source: 'mono',
+                        track: { id: 'REC1', duration_ms: 183400 },
+                        playback: [
+                            {
+                                kind: 'audio',
+                                delivery: 'direct',
+                                source: 'mono',
+                                quality: 'LOSSLESS',
+                                url: 'https://cdn.example/audio/track.flac',
+                                mime_type: 'audio/flac',
+                                bit_depth: 24,
+                                sample_rate_hz: 96000,
+                            },
+                        ],
                     }),
             })
         );
         vi.stubGlobal('fetch', fetchMock);
 
-        const result = await api.getAmazonMusicStreamUrl('71513806', 'LOSSLESS', {
+        const result = await api.getUnifiedPlaybackStreamUrl('71513806', 'HI_RES_LOSSLESS', {
             track: {
                 title: 'Song & More',
                 version: 'Live',
@@ -193,21 +176,68 @@ describe('Amazon Music combined API lookup', () => {
                 artists: [{ name: 'Artist Name' }, { name: 'Featured Name' }],
                 album: { title: 'Album Title' },
                 duration: 183.4,
+                isrc: 'usabc1234567',
             },
         });
 
-        expect(result.provider).toBe('amazon');
-        expect(result.sourceUrl).toBe('https://amazon.example/audio.mp4');
+        expect(result.provider).toBe('monochrome');
+        expect(result.url).toBe('https://cdn.example/audio/track.flac');
+        expect(result.playbackType).toBe('direct');
+        expect(result.bitDepth).toBe(24);
+        expect(result.sampleRate).toBe(96000);
 
         const requestUrl = new URL(fetchMock.mock.calls[0][0]);
-        expect(requestUrl.origin).toBe('https://amz.geeked.wtf');
-        expect(requestUrl.pathname).toBe('/api/track/');
+        expect(requestUrl.origin).toBe('https://music-api.geeked.wtf');
+        expect(requestUrl.pathname).toBe('/api/v2/track/');
         expect(requestUrl.searchParams.get('track')).toBe('Song & More (Live)');
         expect(requestUrl.searchParams.get('duration')).toBe('183');
         expect(requestUrl.searchParams.get('album')).toBe('Album Title');
         expect(requestUrl.searchParams.get('artist')).toBe('Artist Name, Featured Name');
-        expect(requestUrl.searchParams.get('quality')).toBe('HD');
-        expect(requestUrl.searchParams.get('bypass_token')).toBe('trusted-token');
+        expect(requestUrl.searchParams.get('isrc')).toBe('USABC1234567');
+        expect(requestUrl.searchParams.get('intent')).toBe('stream');
+        expect(requestUrl.searchParams.get('quality')).toBe('HI_RES_LOSSLESS');
+
+        const headers = fetchMock.mock.calls[0][1].headers;
+        expect(headers.Authorization).toBe('Bearer amp_private');
+    });
+
+    test('refuses an envelope whose schema version it cannot read', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(() =>
+                Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    headers: new Headers(),
+                    json: () => Promise.resolve({ schema_version: '3.0', playback: [] }),
+                })
+            )
+        );
+
+        // The resolver swallows the failure so the caller can drop to Deezer.
+        await expect(
+            api.getUnifiedPlaybackStreamUrl('71513806', 'LOSSLESS', { track: { title: 'Song' } })
+        ).resolves.toBeNull();
+    });
+
+    test('takes the whole leg out of service on a 429', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(() =>
+                Promise.resolve({
+                    ok: false,
+                    status: 429,
+                    headers: new Headers({ 'Retry-After': '120' }),
+                    json: () => Promise.resolve({ detail: 'rate limited' }),
+                })
+            )
+        );
+
+        await expect(
+            api.getUnifiedPlaybackStreamUrl('71513806', 'LOSSLESS', { track: { title: 'Song' } })
+        ).resolves.toBeNull();
+        expect(api.isUnifiedPlaybackRateLimited()).toBe(true);
+        localStorage.removeItem('unified-playback-rate-limited-until');
     });
 });
 
@@ -223,8 +253,6 @@ describe('Amazon Music Turnstile auth', () => {
     afterEach(() => {
         document.body.innerHTML = '';
         localStorage.removeItem('amazon-music-turnstile-site-key');
-        localStorage.removeItem('amazon_turnstile_jwt');
-        localStorage.removeItem('amazon_turnstile_expiry');
         vi.restoreAllMocks();
     });
 
@@ -303,16 +331,19 @@ describe('Amazon Music Turnstile auth', () => {
         expect(document.getElementById('amazon-music-turnstile-panel')).toBeNull();
     });
 
-    test('returns cached Turnstile JWT until expiry', async () => {
-        localStorage.setItem('amazon_turnstile_jwt', 'cached-jwt');
-        localStorage.setItem('amazon_turnstile_expiry', String(Date.now() + 60_000));
+    test('returns the cached Unified Playback JWT until it is close to expiry', async () => {
+        localStorage.setItem('unified-playback-turnstile-jwt', 'cached-jwt');
+        localStorage.setItem('unified-playback-turnstile-expiry', String(Math.floor(Date.now() / 1000) + 600));
         api.getTurnstileResponse = vi.fn();
 
-        await expect(api.getTurnstileJwt()).resolves.toBe('cached-jwt');
+        await expect(api.getUnifiedTurnstileJwt()).resolves.toBe('cached-jwt');
         expect(api.getTurnstileResponse).not.toHaveBeenCalled();
+
+        localStorage.removeItem('unified-playback-turnstile-jwt');
+        localStorage.removeItem('unified-playback-turnstile-expiry');
     });
 
-    test('exchanges a Turnstile token for a JWT', async () => {
+    test('exchanges a Turnstile token for a Unified Playback JWT', async () => {
         api.getTurnstileResponse = vi.fn(() => Promise.resolve('cf-token'));
         vi.stubGlobal(
             'fetch',
@@ -320,20 +351,28 @@ describe('Amazon Music Turnstile auth', () => {
                 Promise.resolve({
                     ok: true,
                     status: 200,
+                    headers: new Headers(),
                     json: () => Promise.resolve({ access_token: 'fresh-jwt' }),
                 })
             )
         );
 
-        await expect(api.getTurnstileJwt({ forceRefresh: true })).resolves.toBe('fresh-jwt');
-        expect(localStorage.getItem('amazon_turnstile_jwt')).toBe('fresh-jwt');
+        await expect(api.getUnifiedTurnstileJwt({ forceRefresh: true })).resolves.toBe('fresh-jwt');
+        expect(localStorage.getItem('unified-playback-turnstile-jwt')).toBe('fresh-jwt');
+        // The exchange verifies the action the widget was rendered with.
+        expect(api.getTurnstileResponse).toHaveBeenCalledWith(
+            expect.objectContaining({ action: 'auth' })
+        );
         expect(fetch).toHaveBeenCalledWith(
             expect.stringContaining('/api/auth/turnstile'),
             expect.objectContaining({
                 method: 'POST',
-                body: JSON.stringify({ cf_turnstile_response: 'cf-token' }),
+                body: JSON.stringify({ turnstile_token: 'cf-token' }),
             })
         );
+
+        localStorage.removeItem('unified-playback-turnstile-jwt');
+        localStorage.removeItem('unified-playback-turnstile-expiry');
     });
 });
 

@@ -1,47 +1,32 @@
 import { describe, expect, test, beforeEach, afterEach, vi } from 'vitest';
-import { LosslessAPI, turnstileJwtExpiry } from '../api.js';
+import { LosslessAPI } from '../api.js';
 
 const base64Url = (value) => btoa(value).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
 const jwtWithExp = (expSeconds) => `header.${base64Url(JSON.stringify({ exp: expSeconds }))}.signature`;
 
-describe('turnstileJwtExpiry', () => {
-    test('retires the token a minute before the server-signed exp', () => {
-        const exp = Math.floor(Date.now() / 1000) + 900;
-        expect(turnstileJwtExpiry(jwtWithExp(exp))).toBe((exp - 60) * 1000);
-    });
+const JWT_KEY = 'unified-playback-turnstile-jwt';
+const EXPIRY_KEY = 'unified-playback-turnstile-expiry';
 
-    test('never trusts a flat hour over a short-lived token', () => {
-        const now = Date.now();
-        const exp = Math.floor(now / 1000) + 300;
-        expect(turnstileJwtExpiry(jwtWithExp(exp), now)).toBeLessThan(now + 60 * 60 * 1000);
-    });
-
-    test('falls back to 55 minutes when the token carries no usable exp', () => {
-        const now = 1_700_000_000_000;
-        expect(turnstileJwtExpiry('not-a-jwt', now)).toBe(now + 55 * 60 * 1000);
-        expect(turnstileJwtExpiry(jwtWithExp(0), now)).toBe(now + 55 * 60 * 1000);
-        expect(turnstileJwtExpiry(`header.${base64Url('{oops')}.sig`, now)).toBe(now + 55 * 60 * 1000);
-    });
-});
-
-describe('LosslessAPI.getTurnstileJwt', () => {
+describe('LosslessAPI.getUnifiedTurnstileJwt', () => {
     let api;
 
     beforeEach(() => {
         api = new LosslessAPI({});
-        localStorage.removeItem('amazon_turnstile_jwt');
-        localStorage.removeItem('amazon_turnstile_expiry');
+        localStorage.removeItem(JWT_KEY);
+        localStorage.removeItem(EXPIRY_KEY);
     });
 
     afterEach(() => {
-        localStorage.removeItem('amazon_turnstile_jwt');
-        localStorage.removeItem('amazon_turnstile_expiry');
+        localStorage.removeItem(JWT_KEY);
+        localStorage.removeItem(EXPIRY_KEY);
         vi.restoreAllMocks();
         vi.unstubAllGlobals();
     });
 
     test('caches the JWT against its own exp, not a flat hour', async () => {
+        // The exchange signs its own lifetime; caching a flat hour would keep
+        // sending a token the API already considers dead.
         const exp = Math.floor(Date.now() / 1000) + 300;
         const jwt = jwtWithExp(exp);
         vi.spyOn(api, 'getTurnstileResponse').mockResolvedValue('cf-token');
@@ -50,15 +35,15 @@ describe('LosslessAPI.getTurnstileJwt', () => {
             vi.fn(async () => new Response(JSON.stringify({ access_token: jwt }), { status: 200 }))
         );
 
-        await expect(api.getTurnstileJwt()).resolves.toBe(jwt);
-        expect(Number(localStorage.getItem('amazon_turnstile_expiry'))).toBe((exp - 60) * 1000);
+        await expect(api.getUnifiedTurnstileJwt()).resolves.toBe(jwt);
+        expect(Number(localStorage.getItem(EXPIRY_KEY))).toBe(exp);
     });
 
     test('re-solves once the server-signed exp has passed', async () => {
         const expired = jwtWithExp(Math.floor(Date.now() / 1000) - 10);
         const fresh = jwtWithExp(Math.floor(Date.now() / 1000) + 900);
-        localStorage.setItem('amazon_turnstile_jwt', expired);
-        localStorage.setItem('amazon_turnstile_expiry', turnstileJwtExpiry(expired).toString());
+        localStorage.setItem(JWT_KEY, expired);
+        localStorage.setItem(EXPIRY_KEY, String(Math.floor(Date.now() / 1000) - 10));
 
         const solve = vi.spyOn(api, 'getTurnstileResponse').mockResolvedValue('cf-token');
         vi.stubGlobal(
@@ -66,52 +51,17 @@ describe('LosslessAPI.getTurnstileJwt', () => {
             vi.fn(async () => new Response(JSON.stringify({ access_token: fresh }), { status: 200 }))
         );
 
-        await expect(api.getTurnstileJwt()).resolves.toBe(fresh);
+        await expect(api.getUnifiedTurnstileJwt()).resolves.toBe(fresh);
         expect(solve).toHaveBeenCalledTimes(1);
     });
 
-    test('a forced refresh is not cancelled by the solve it replaced', async () => {
-        const slow = jwtWithExp(Math.floor(Date.now() / 1000) + 900);
-        const forced = jwtWithExp(Math.floor(Date.now() / 1000) + 1800);
+    test('retires a token that is inside the expiry skew rather than sending it once more', async () => {
+        const nearlyDone = jwtWithExp(Math.floor(Date.now() / 1000) + 5);
+        localStorage.setItem(JWT_KEY, nearlyDone);
+        localStorage.setItem(EXPIRY_KEY, String(Math.floor(Date.now() / 1000) + 5));
 
-        let releaseSlow;
-        let releaseForced;
-        const slowSolve = new Promise((resolve) => {
-            releaseSlow = resolve;
-        });
-        const forcedSolve = new Promise((resolve) => {
-            releaseForced = resolve;
-        });
-        let call = 0;
-        vi.spyOn(api, 'getTurnstileResponse').mockImplementation(async () => {
-            call += 1;
-            if (call === 1) {
-                await slowSolve;
-                return 'slow-token';
-            }
-            await forcedSolve;
-            return 'forced-token';
-        });
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (_url, init) => {
-                const token = JSON.parse(init.body).cf_turnstile_response;
-                return new Response(JSON.stringify({ access_token: token === 'forced-token' ? forced : slow }), {
-                    status: 200,
-                });
-            })
-        );
-
-        const first = api.getTurnstileJwt();
-        const second = api.getTurnstileJwt({ forceRefresh: true });
-        // The forced run owns the slot now; the first one finishing must not clear it.
-        releaseSlow();
-        await first;
-
-        expect(api._turnstileJwtPromise).not.toBeNull();
-        releaseForced();
-        await expect(second).resolves.toBe(forced);
-        expect(api._turnstileJwtPromise).toBeNull();
+        expect(api.getCachedUnifiedTurnstileJwt()).toBeNull();
+        expect(localStorage.getItem(JWT_KEY)).toBeNull();
     });
 
     test('rejects an exchange that answers without a token instead of caching undefined', async () => {
@@ -121,8 +71,24 @@ describe('LosslessAPI.getTurnstileJwt', () => {
             vi.fn(async () => new Response(JSON.stringify({}), { status: 200 }))
         );
 
-        await expect(api.getTurnstileJwt()).rejects.toThrow('no access token');
-        expect(localStorage.getItem('amazon_turnstile_jwt')).toBeNull();
+        await expect(api.getUnifiedTurnstileJwt()).rejects.toThrow('no JWT');
+        expect(localStorage.getItem(JWT_KEY)).toBeNull();
+    });
+
+    test('shares one in-flight solve between concurrent callers', async () => {
+        const jwt = jwtWithExp(Math.floor(Date.now() / 1000) + 900);
+        const solve = vi.spyOn(api, 'getTurnstileResponse').mockResolvedValue('cf-token');
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async () => new Response(JSON.stringify({ access_token: jwt }), { status: 200 }))
+        );
+
+        const [first, second] = await Promise.all([api.getUnifiedTurnstileJwt(), api.getUnifiedTurnstileJwt()]);
+
+        expect(first).toBe(jwt);
+        expect(second).toBe(jwt);
+        expect(solve).toHaveBeenCalledTimes(1);
+        expect(api._unifiedTurnstileJwtPromise).toBeNull();
     });
 });
 

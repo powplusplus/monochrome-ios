@@ -5828,26 +5828,26 @@
                             <div class="settings-group">
                                 <div class="setting-item">
                                     <div class="info">
-                                        <span class="label">Amazon Music</span>
+                                        <span class="label">Unified Playback</span>
                                         <span class="description"
-                                            >Use Amazon Music streams first, then fall back to Qobuz, then Deezer as a
+                                            >Resolve across Monochrome, Amazon and TIDAL in one lookup, with Deezer as a
                                             last resort.</span
                                         >
                                     </div>
                                     <label class="toggle-switch">
-                                        <input type="checkbox" id="amazon-music-toggle" checked />
+                                        <input type="checkbox" id="unified-playback-toggle" checked />
                                         <span class="slider"></span>
                                     </label>
                                 </div>
                                 <div class="setting-item">
                                     <div class="info">
-                                        <span class="label">Amazon Music API URL</span>
-                                        <span class="description">The Amazon Music API endpoint</span>
+                                        <span class="label">Unified Playback API URL</span>
+                                        <span class="description">The Unified Playback API endpoint</span>
                                     </div>
                                     <input
                                         type="text"
-                                        id="amazon-music-api-base-url"
-                                        placeholder="https://amz.geeked.wtf"
+                                        id="unified-playback-api-base-url"
+                                        placeholder="https://music-api.geeked.wtf"
                                         style="
                                             width: 220px;
                                             padding: 0.35rem 0.5rem;
@@ -5861,37 +5861,16 @@
                                 </div>
                                 <div class="setting-item">
                                     <div class="info">
-                                        <span class="label">Turnstile Site Key</span>
+                                        <span class="label">Unified Playback API Token</span>
                                         <span class="description"
-                                            >Required for Amazon Music requests protected by Turnstile</span
-                                        >
-                                    </div>
-                                    <input
-                                        type="text"
-                                        id="amazon-music-turnstile-site-key"
-                                        placeholder="0x..."
-                                        style="
-                                            width: 220px;
-                                            padding: 0.35rem 0.5rem;
-                                            border: 1px solid var(--border);
-                                            border-radius: var(--radius-md);
-                                            background: var(--card);
-                                            color: var(--foreground);
-                                            font-size: 0.8rem;
-                                        "
-                                    />
-                                </div>
-                                <div class="setting-item">
-                                    <div class="info">
-                                        <span class="label">Turnstile Bypass Token</span>
-                                        <span class="description"
-                                            >Optional server-side bypass token for trusted deployments</span
+                                            >Client token sent as the bearer. The shared default also needs a
+                                            Cloudflare check; your own token does not.</span
                                         >
                                     </div>
                                     <input
                                         type="password"
-                                        id="amazon-music-turnstile-bypass-token"
-                                        placeholder="Optional"
+                                        id="unified-playback-api-token"
+                                        placeholder="amp_..."
                                         autocomplete="off"
                                         style="
                                             width: 220px;
@@ -5911,26 +5890,12 @@
                                     <div class="info">
                                         <span class="label">Deezer Fallback</span>
                                         <span class="description"
-                                            >Last-resort source, used only when both Amazon Music and Qobuz fail. Tops
-                                            out at 16-bit lossless (FLAC).</span
+                                            >Last-resort source, used only when Unified Playback cannot resolve the
+                                            track. Tops out at 16-bit lossless (FLAC).</span
                                         >
                                     </div>
                                     <label class="toggle-switch">
                                         <input type="checkbox" id="deezer-fallback-toggle" checked />
-                                        <span class="slider"></span>
-                                    </label>
-                                </div>
-                                <div class="setting-item">
-                                    <div class="info">
-                                        <span class="label">Qobuz (Lucida)</span>
-                                        <span class="description"
-                                            >Fallback after Amazon fails: FLAC via Lucida (ISRC or artist/title). First
-                                            play of an uncached track takes ~10-35s while it is prepared, then it is
-                                            instant and seekable.</span
-                                        >
-                                    </div>
-                                    <label class="toggle-switch">
-                                        <input type="checkbox" id="lucida-qobuz-toggle" checked />
                                         <span class="slider"></span>
                                     </label>
                                 </div>

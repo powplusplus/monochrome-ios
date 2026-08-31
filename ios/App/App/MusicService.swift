@@ -13,10 +13,6 @@ final class MusicService {
     private let session: URLSession
     private let cache = NSCache<NSString, NSData>()
 
-    /// How long Amazon gets on its own before the Lucida leg starts alongside it.
-    /// Mirrors `AMAZON_HEDGE_DELAY_MS` in web `js/api.js`.
-    static let lucidaHedgeDelayNanos: UInt64 = 2_000_000_000
-
     init(session: URLSession = .shared) { self.session = session }
 
     /// Amazon/Deezer provider instances gate their media APIs behind a
@@ -150,7 +146,15 @@ final class MusicService {
         return candidates.first
     }
 
-    func resolveStream(for track: Track, quality: PlaybackQuality = .stored, skipping skipped: Set<Provider> = []) async throws -> StreamResponse {
+    /// `intent` is passed straight to Unified Playback: web asks for `download`
+    /// when it is saving a file rather than playing one, and the API can serve a
+    /// different resource for each.
+    func resolveStream(
+        for track: Track,
+        quality: PlaybackQuality = .stored,
+        skipping skipped: Set<Provider> = [],
+        intent: String = "stream"
+    ) async throws -> StreamResponse {
         // Podcasts play the enclosure URL directly — never run music providers.
         // Quality token comes from the enclosure MIME/extension (MP3/AAC/…), not
         // the user's streaming preference — badge must match what actually plays.
@@ -173,112 +177,42 @@ final class MusicService {
             return StreamResponse(url: url, provider: track.provider, quality: token, replayGain: nil, peak: nil)
         }
 
-        // Rythm (`track-api.monochrome.tf`) first, then the legacy web chain from
-        // `getStreamUrl` (js/api.js): Amazon Music → Lucida-Qobuz → Deezer.
-        // TIDAL is catalog-only.
+        // Unified Playback (`music-api.geeked.wtf`) first, then Deezer — the
+        // chain web `getStreamUrl` now runs. The three legs that used to sit in
+        // front of Deezer (Rythm, the direct Amazon API, Qobuz-via-Lucida) are
+        // gone: Unified Playback resolves Monochrome, Amazon and TIDAL itself,
+        // and web migrates clients off the old Rythm/Amazon hosts outright.
+        // TIDAL stays catalog-only.
         //
-        // Rythm leads because it is the only leg that is not a single upstream:
-        // it runs Monochrome/Qobuz/Amazon/Deezer server-side and answers with one
-        // resolved URL. The legs behind it have all degraded independently — the
-        // HiFi pool returns `Upstream API error` for every `/track/`, the web
-        // `/qobuz-lucida/*` routes now serve the SPA HTML instead of JSON, and
-        // the Deezer instance reports its whole account pool dead — so keeping
-        // them ahead of Rythm only spends their timeouts before the leg that
-        // still resolves is asked. They stay as fallbacks: each one comes back
-        // on its own schedule, and Amazon in particular is still reachable
-        // directly.
-        //
-        // Enrichment used to run unconditionally in front of Amazon, but Amazon
-        // matches on title/artist/album/duration and never reads the ISRC — only
-        // Lucida/Deezer need it. Search cards routinely omit the ISRC, so every play
-        // paid for an `/info/` fan-out across the whole instance pool (1.2s hedge
-        // per host, 12s ceiling) before Amazon was even asked. With the pool
-        // currently answering `Upstream API error`, that was a flat multi-second
-        // stall in front of the one provider that still works. Fetch only what
-        // the leg about to run actually needs.
-        //
-        // `skipping` lets PlaybackEngine drop a provider that already handed us a
-        // URL AVPlayer rejected (signed CDN expire, CENC decode fail) and continue
-        // down the chain — without that, Amazon "success" permanently blocked Lucida.
-        // Amazon can resolve from title/artist/album even when a search result has
-        // no duration. Do not make the less reliable `/info` instance pool a hard
-        // prerequisite for the first provider; enrich only if the fallback legs
-        // actually need an ISRC below.
+        // `skipping` lets PlaybackEngine drop a provider that already handed us
+        // a URL AVPlayer rejected (signed CDN expire, CENC decode fail) and
+        // continue down the chain. Unified Playback can answer as Amazon, TIDAL
+        // or Monochrome, so it is skipped only once every source it can select
+        // has been exhausted.
         var enriched = track
-
-        // The legs are hedged, not raced: Lucida starts while Amazon is still
-        // working, but Amazon still wins whenever it resolves, so the preference
-        // order is unchanged. What the hedge removes is the stacking — Amazon can
-        // spend two full timeout windows (30s, then 20s on retry) before Lucida is
-        // even asked, so a track only Lucida could serve waited for the sum of every
-        // leg. The delay keeps the common case untouched: a warm Amazon instance
-        // answers well inside it and the hedge never starts.
-        var lucidaHedge: Task<StreamResponse, Error>?
-        if !skipped.contains(.amazon), !skipped.contains(.qobuz), PlaybackSourceSettings.lucidaEnabled {
-            let candidate = enriched
-            lucidaHedge = Task {
-                try await Task.sleep(nanoseconds: Self.lucidaHedgeDelayNanos)
-                var hedged = candidate
-                if hedged.isrc?.isEmpty != false { hedged = await self.enrichTrackMetadata(hedged) }
-                return try await self.resolveLucidaStream(for: hedged, quality: quality)
-            }
-        }
-
-        var rythmError: Error?
-        if !skipped.contains(.rythm), PlaybackSourceSettings.rythmEnabled {
+        let unifiedSources: Set<Provider> = [.amazon, .tidal, .monochrome]
+        var unifiedError: Error?
+        if !unifiedSources.isSubset(of: skipped) {
             do {
-                let response = try await RythmPlaybackService.resolveStream(
-                    for: enriched, quality: quality, session: session
+                return try await resolveUnifiedStream(
+                    for: enriched, quality: quality, skipping: skipped, intent: intent
                 )
-                lucidaHedge?.cancel()
-                return response
             } catch {
-                rythmError = error
-                // Fall through to the legacy chain when Rythm cannot resolve.
+                unifiedError = error
             }
         }
 
-        var amazonError: Error?
-        if !skipped.contains(.amazon) {
-            do {
-                let response = try await resolveAmazonStream(for: enriched, quality: quality)
-                lucidaHedge?.cancel()
-                return response
-            } catch {
-                amazonError = error
-                // Fall through to Lucida, then Deezer, when Amazon cannot resolve.
-            }
-        }
-        // Lucida + Deezer key off the ISRC (or artist/title for Lucida), so pay for
-        // the lookup here instead.
+        // Deezer keys off the ISRC, so pay for the metadata lookup only once the
+        // leg that needs it is actually going to run. Search cards routinely omit
+        // the ISRC, and `/info/` fans out across the whole instance pool.
         if enriched.isrc?.isEmpty != false {
             enriched = await enrichTrackMetadata(enriched)
         }
-        var lucidaError: Error?
-        if !skipped.contains(.qobuz) {
-            do {
-                if let lucidaHedge {
-                    return try await lucidaHedge.value
-                }
-                return try await resolveLucidaStream(for: enriched, quality: quality)
-            } catch {
-                lucidaError = error
-            }
-        } else {
-            lucidaHedge?.cancel()
-        }
-        let rythmDetail = Self.legDetail(
-            rythmError,
-            fallback: skipped.contains(.rythm) ? "Rythm skipped"
-                : (PlaybackSourceSettings.rythmEnabled ? "Rythm unavailable" : "Rythm disabled")
-        )
-        let amazonDetail = Self.legDetail(
-            amazonError,
-            fallback: skipped.contains(.amazon) ? "Amazon skipped" : "Amazon Music unavailable"
-        )
-        let lucidaDetail = Self.legDetail(
-            lucidaError,
-            fallback: skipped.contains(.qobuz) ? "Lucida skipped" : "Lucida unavailable"
+        let unifiedDetail = Self.legDetail(
+            unifiedError,
+            fallback: unifiedSources.isSubset(of: skipped)
+                ? "Unified Playback skipped"
+                : (PlaybackSourceSettings.unifiedEnabled ? "Unified Playback unavailable" : "Unified Playback disabled")
         )
         if !skipped.contains(.deezer) {
             do {
@@ -286,13 +220,48 @@ final class MusicService {
             } catch {
                 let deezerDetail = Self.legDetail(error, fallback: "Deezer unavailable")
                 throw ServiceError.unavailable(
-                    "Could not resolve stream URL from Rythm, Amazon Music, Lucida, or Deezer. Rythm: \(rythmDetail) Amazon: \(amazonDetail) Lucida: \(lucidaDetail) Deezer: \(deezerDetail)"
+                    "Could not resolve stream URL from Unified Playback or Deezer. Unified Playback: \(unifiedDetail) Deezer: \(deezerDetail)"
                 )
             }
         }
         throw ServiceError.unavailable(
-            "Could not resolve stream URL. Rythm: \(rythmDetail) Amazon: \(amazonDetail) Lucida: \(lucidaDetail)"
+            "Could not resolve stream URL. Unified Playback: \(unifiedDetail)"
         )
+    }
+
+    /// Unified Playback with the transient-failure retry the old Amazon leg had:
+    /// the API searches the catalog and mints a signed CDN URL before it answers,
+    /// so a cold instance regularly needs more than one request window, and a
+    /// timeout there means work in progress rather than a dead endpoint.
+    ///
+    /// A source PlaybackEngine has already exhausted is not worth resolving to
+    /// again, so a response naming one is rejected and the track drops to Deezer.
+    private func resolveUnifiedStream(
+        for track: Track,
+        quality: PlaybackQuality,
+        skipping skipped: Set<Provider>,
+        intent: String
+    ) async throws -> StreamResponse {
+        var lastError: Error = ServiceError.unavailable("Unified Playback unavailable")
+        for attempt in 0..<3 {
+            do {
+                let response = try await UnifiedPlaybackService.resolveStream(
+                    for: track, quality: quality, intent: intent, session: session
+                )
+                guard !skipped.contains(response.provider) else {
+                    throw ServiceError.unavailable(
+                        "Unified Playback resolved to \(response.provider.title), which already failed for this track"
+                    )
+                }
+                return response
+            } catch {
+                lastError = error
+                guard Self.isTransientPlaybackError(error), attempt < 2 else { throw error }
+                try Task.checkCancellation()
+                try await Task.sleep(nanoseconds: UInt64(500 + attempt * 900) * 1_000_000)
+            }
+        }
+        throw lastError
     }
 
     /// Provider errors are surfaced verbatim so the message names which leg gave
@@ -303,8 +272,9 @@ final class MusicService {
     }
 
     /// Pull ISRC / duration when search cards omit them. The ISRC is what the
-    /// Deezer leg keys on; Amazon only benefits from the duration, so callers
-    /// should reach for this lazily rather than in front of every play.
+    /// Deezer leg keys on; Unified Playback matches on title/artist and only
+    /// narrows with them, so callers reach for this lazily rather than in front
+    /// of every play.
     private func enrichTrackMetadata(_ track: Track) async -> Track {
         if let isrc = track.isrc, !isrc.isEmpty, track.duration > 0 { return track }
         guard let object = try? await json(path: "/info/?id=\(track.playbackID.urlQueryEncoded)", cacheable: true) else {
@@ -323,21 +293,6 @@ final class MusicService {
         return enriched
     }
 
-    private func resolveAmazonStream(for track: Track, quality: PlaybackQuality) async throws -> StreamResponse {
-        var lastError: Error = ServiceError.unavailable("Amazon Music unavailable")
-        for attempt in 0..<3 {
-            do {
-                return try await resolveAmazonStreamOnce(for: track, quality: quality)
-            } catch {
-                lastError = error
-                guard Self.isTransientPlaybackError(error), attempt < 2 else { throw error }
-                try Task.checkCancellation()
-                try await Task.sleep(nanoseconds: UInt64(500 + attempt * 900) * 1_000_000)
-            }
-        }
-        throw lastError
-    }
-
     static func isTransientPlaybackError(_ error: Error) -> Bool {
         if let urlError = error as? URLError {
             return [.timedOut, .networkConnectionLost, .cannotConnectToHost, .cannotFindHost,
@@ -348,265 +303,6 @@ final class MusicService {
                 || status == 425 || status == 429 || status >= 500
         }
         return false
-    }
-
-    private func resolveAmazonStreamOnce(for track: Track, quality: PlaybackQuality) async throws -> StreamResponse {
-        guard PlaybackSourceSettings.amazonEnabled else {
-            throw ServiceError.unavailable("Amazon Music disabled")
-        }
-        let title = track.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let artist = track.artist.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty, !artist.isEmpty else {
-            throw ServiceError.unavailable("Amazon lookup needs title and artist")
-        }
-
-        let apiBase = PlaybackSourceSettings.amazonApiBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let bypass = PlaybackSourceSettings.amazonBypassToken.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // Prefer bypass token (web settings parity). Otherwise solve Turnstile → JWT.
-        var jwt: String?
-        if bypass.isEmpty {
-            jwt = try await AmazonTurnstileAuth.shared.accessToken(apiBaseURL: apiBase)
-        }
-
-        do {
-            return try await fetchAmazonTrack(
-                title: title,
-                artist: artist,
-                album: track.album?.title ?? "",
-                duration: track.duration,
-                quality: quality,
-                apiBase: apiBase,
-                bypass: bypass,
-                jwt: jwt
-            )
-        } catch let error as URLError where error.code == .timedOut {
-            // `/api/track/` searches the Amazon catalog and mints a signed CDN
-            // URL before it answers; a cold instance regularly needs longer than
-            // one request window. Errors reject in tens of milliseconds, so a
-            // timeout means work in progress, not a dead endpoint — give it one
-            // more window before handing the track to Deezer.
-            //
-            // The retry window is shorter than the first: the first request has
-            // already warmed the instance, and two full 30s windows back to back
-            // put a minute of silence in front of a track that was going to fail
-            // anyway.
-            do {
-                return try await fetchAmazonTrack(
-                    title: title,
-                    artist: artist,
-                    album: track.album?.title ?? "",
-                    duration: track.duration,
-                    quality: quality,
-                    apiBase: apiBase,
-                    bypass: bypass,
-                    jwt: jwt,
-                    timeout: 20
-                )
-            } catch let retryError as URLError where retryError.code == .timedOut {
-                throw ServiceError.unavailable("Amazon track lookup timed out twice at \(apiBase)")
-            }
-        } catch let error as ServiceError {
-            // 401 means the provider rejected the JWT we sent; 428 means it wants
-            // one it hasn't seen. Web answers both the same way — re-solve
-            // Turnstile and send the fresh JWT *instead of* the bypass token
-            // (`forceTurnstile` makes it skip the bypass branch entirely). Native
-            // used to skip the retry whenever a bypass token was configured, and
-            // to keep sending the rejected token when it wasn't, so a client that
-            // hit this once stayed broken for every later track.
-            guard case .http(let status) = error, status == 401 || status == 428 else { throw error }
-            await AmazonTurnstileAuth.shared.clearCache()
-            let fresh = try await AmazonTurnstileAuth.shared.accessToken(apiBaseURL: apiBase, forceRefresh: true)
-            return try await fetchAmazonTrack(
-                title: title,
-                artist: artist,
-                album: track.album?.title ?? "",
-                duration: track.duration,
-                quality: quality,
-                apiBase: apiBase,
-                bypass: "",
-                jwt: fresh
-            )
-        }
-    }
-
-    private func fetchAmazonTrack(
-        title: String,
-        artist: String,
-        album: String,
-        duration: Double,
-        quality: PlaybackQuality,
-        apiBase: String,
-        bypass: String,
-        jwt: String?,
-        timeout: TimeInterval = 30
-    ) async throws -> StreamResponse {
-        var components = URLComponents(string: apiBase + "/api/track/")
-        var items = [
-            URLQueryItem(name: "track", value: title),
-            URLQueryItem(name: "artist", value: artist),
-            URLQueryItem(name: "album", value: album),
-            URLQueryItem(name: "quality", value: quality.amazonQuality),
-        ]
-        if duration > 0 {
-            items.append(URLQueryItem(name: "duration", value: String(Int(duration.rounded()))))
-        }
-        if !bypass.isEmpty {
-            items.append(URLQueryItem(name: "bypass_token", value: bypass))
-        }
-        components?.queryItems = items
-        guard let url = components?.url else { throw ServiceError.invalidResponse }
-
-        // Web can afford 15s because a stalled fetch there costs nothing; here a
-        // timeout drops the track to Deezer, whose account pool is frequently
-        // dead, so the user sees "no stream" for a request Amazon would have
-        // answered a few seconds later.
-        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        applyMonochromeOrigin(to: &request)
-        if let jwt, !jwt.isEmpty {
-            request.setValue(jwt, forHTTPHeaderField: "X-Turnstile-JWT")
-        }
-        let (data, response) = try await session.data(for: request)
-        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            // Preserve retryable statuses as structured errors. Converting a 503
-            // to a message-only `.unavailable` made the retry layer treat the
-            // most common intermittent gateway failure as permanent.
-            if http.statusCode == 408 || http.statusCode == 409 || http.statusCode == 425
-                || http.statusCode == 429 || http.statusCode >= 500 {
-                throw ServiceError.http(http.statusCode)
-            }
-            // Amazon states its own failures ("Invalid Turnstile JWT",
-            // "turnstile_required"); a bare status code hid which one it was.
-            if let detail = Self.providerErrorDetail(in: data), http.statusCode != 401, http.statusCode != 428 {
-                throw ServiceError.unavailable("Amazon Music: \(detail)")
-            }
-            throw ServiceError.http(http.statusCode)
-        }
-        try validate(response)
-        let object = try JSONSerialization.jsonObject(with: data)
-        let payload = amazonTrackPayload(object)
-        guard let stream = stringValue(payload, ["stream_url", "streamUrl", "url"]),
-              let streamURL = URL(string: stream) else {
-            throw ServiceError.unavailable("Amazon Music returned no stream URL")
-        }
-
-        let key = stringValue(payload, ["decryption_key", "decryptionKey"])
-            ?? ((payload["decryption"] as? [String: Any]).flatMap { stringValue($0, ["key"]) })
-            ?? ((payload["drm"] as? [String: Any]).flatMap { stringValue($0, ["decryption_key", "decryptionKey"]) })
-
-        let playURL: URL
-        if let key, !key.isEmpty {
-            // Web routes CENC through SW decryptor; native decrypts to a local clear file.
-            playURL = try await AmazonCencDecryptor.decryptFile(
-                from: streamURL,
-                keyHex: key,
-                codec: quality.amazonTargetCodec,
-                session: session
-            )
-        } else {
-            playURL = streamURL
-        }
-
-        let selected = stringValue(payload, ["quality_selected", "quality"]) ?? quality.amazonQuality
-        return StreamResponse(
-            url: playURL,
-            provider: .amazon,
-            quality: selected,
-            replayGain: nil,
-            peak: nil,
-            isPreview: false,
-            previewReason: nil,
-            mediaDuration: duration > 0 ? duration : nil,
-            qualityDetail: Self.amazonQualityDetail(payload, selected: selected)
-        )
-    }
-
-    /// `24/96`-style detail for the tier Amazon actually served, read off the
-    /// `available_qualities` entry that matches `quality_selected` (web's
-    /// `getAmazonSelectedQualityInfo`).
-    private static func amazonQualityDetail(_ payload: [String: Any], selected: String) -> String? {
-        guard let entries = payload["available_qualities"] as? [[String: Any]] else { return nil }
-        let match = entries.first { ($0["quality"] as? String) == selected } ?? entries.first
-        guard let match,
-              let bitDepth = (match["bitDepth"] ?? match["bit_depth"]) as? NSNumber,
-              let sampleRate = (match["sampleRate"] ?? match["sample_rate"]) as? NSNumber else { return nil }
-        let kHz = sampleRate.doubleValue / 1000
-        let rate = kHz == 44.1 ? "44.1" : String(Int(kHz.rounded()))
-        return "\(bitDepth.intValue)/\(rate)"
-    }
-
-    /// Qobuz-via-Lucida (web `/qobuz-lucida/*`). Resolve is cheap; first play of an
-    /// uncached track pays the rip cost inside `/play`. Used only when Amazon
-    /// cannot resolve a stream URL. ISRC preferred; falls back to "artist title"
-    /// search when the catalog card omitted the ISRC (common on search results).
-    private func resolveLucidaStream(for track: Track, quality: PlaybackQuality) async throws -> StreamResponse {
-        guard PlaybackSourceSettings.lucidaEnabled else {
-            throw ServiceError.unavailable("Lucida fallback disabled")
-        }
-        let isrc = track.isrc?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let title = track.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let artist = track.artist.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let query: String
-        if !isrc.isEmpty {
-            query = isrc
-        } else if !title.isEmpty, !artist.isEmpty {
-            query = "\(artist) \(title)"
-        } else {
-            throw ServiceError.unavailable("Lucida lookup needs ISRC or title and artist")
-        }
-        let base = PlaybackSourceSettings.lucidaBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let downscale: String = {
-            switch quality {
-            case .low, .high: return "mp3"
-            case .lossless, .hiResLossless: return "original"
-            }
-        }()
-        var components = URLComponents(string: base + "/qobuz-lucida/resolve")
-        components?.queryItems = [
-            URLQueryItem(name: "q", value: query),
-            URLQueryItem(name: "quality", value: downscale),
-        ]
-        guard let url = components?.url else {
-            throw ServiceError.unavailable("Invalid Lucida resolve URL")
-        }
-        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
-        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-        applyMonochromeOrigin(to: &request)
-        let (data, response) = try await session.data(for: request)
-        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            let detail = Self.providerErrorDetail(in: data) ?? "HTTP \(http.statusCode)"
-            throw ServiceError.unavailable("Lucida resolve failed: \(detail)")
-        }
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              (object["success"] as? Bool) == true,
-              let playPath = object["url"] as? String, !playPath.isEmpty else {
-            throw ServiceError.unavailable("Lucida returned no stream URL")
-        }
-        let playURL: URL
-        if playPath.hasPrefix("http://") || playPath.hasPrefix("https://") {
-            guard let absolute = URL(string: playPath) else {
-                throw ServiceError.unavailable("Lucida returned an invalid stream URL")
-            }
-            playURL = absolute
-        } else {
-            guard let absolute = URL(string: playPath, relativeTo: URL(string: base + "/"))?.absoluteURL else {
-                throw ServiceError.unavailable("Lucida returned an invalid stream URL")
-            }
-            playURL = absolute
-        }
-        let qualityToken = downscale == "mp3" ? quality.rawValue : PlaybackQuality.lossless.rawValue
-        return StreamResponse(
-            url: playURL,
-            provider: .qobuz,
-            quality: qualityToken,
-            replayGain: nil,
-            peak: nil,
-            isPreview: false,
-            previewReason: nil,
-            mediaDuration: track.duration > 0 ? track.duration : nil,
-            qualityDetail: downscale == "original" ? "16/44.1" : nil
-        )
     }
 
     private func resolveDeezerStream(for track: Track, quality: PlaybackQuality) async throws -> StreamResponse {
@@ -755,36 +451,11 @@ final class MusicService {
         )
     }
 
-    private func amazonTrackPayload(_ object: Any) -> [String: Any] {
-        if let dict = object as? [String: Any] {
-            if dict["stream_url"] != nil || dict["streamUrl"] != nil { return dict }
-            for key in ["data", "track", "result"] {
-                if let nested = dict[key] as? [String: Any],
-                   nested["stream_url"] != nil || nested["streamUrl"] != nil {
-                    return nested
-                }
-            }
-            return dict
-        }
-        return [:]
-    }
-
-    /// Both providers answer failures with a JSON body that says what actually
-    /// went wrong ("All Deezer accounts are dead", "Invalid Turnstile JWT").
-    /// A bare status code hides that, so surface their wording when present.
     private static func providerErrorDetail(in body: Data) -> String? {
         guard !body.isEmpty,
               let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }
         for key in ["error", "message", "detail"] {
             if let value = object[key] as? String, !value.isEmpty { return value }
-        }
-        return nil
-    }
-
-    private func stringValue(_ dict: [String: Any], _ keys: [String]) -> String? {
-        for key in keys {
-            if let value = dict[key] as? String, !value.isEmpty { return value }
-            if let value = dict[key] as? NSNumber { return value.stringValue }
         }
         return nil
     }

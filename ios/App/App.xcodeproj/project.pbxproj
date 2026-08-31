@@ -14,7 +14,7 @@
 		A10000000000000000000018 /* AmazonCencDecryptor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000008 /* AmazonCencDecryptor.swift */; };
 		A10000000000000000000019 /* AmazonTurnstileAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000009 /* AmazonTurnstileAuth.swift */; };
 		A1000000000000000000001A /* PodcastsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000A /* PodcastsService.swift */; };
-		A1000000000000000000001C /* RythmPlaybackService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000C /* RythmPlaybackService.swift */; };
+		A1000000000000000000001C /* UnifiedPlaybackService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000C /* UnifiedPlaybackService.swift */; };
 		A1000000000000000000001D /* AudioAnalyzer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000D /* AudioAnalyzer.swift */; };
 		A10000000000000000000091 /* Recommendations.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000090 /* Recommendations.swift */; };
 		A1000000000000000000001B /* PodcastProgressStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000B /* PodcastProgressStore.swift */; };
@@ -24,7 +24,7 @@
 		A10000000000000000000017 /* Views.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000007 /* Views.swift */; };
 		A20000000000000000000011 /* AppTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* AppTests.swift */; };
 		A20000000000000000000091 /* RecommendationMathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000090 /* RecommendationMathTests.swift */; };
-		A20000000000000000000093 /* RythmPlaybackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000092 /* RythmPlaybackTests.swift */; };
+		A20000000000000000000093 /* UnifiedPlaybackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000092 /* UnifiedPlaybackTests.swift */; };
 		A20000000000000000000095 /* AudioAnalyzerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000094 /* AudioAnalyzerTests.swift */; };
 		504EC30F1FED79650016851F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 504EC30E1FED79650016851F /* Assets.xcassets */; };
 		504EC3121FED79650016851F /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 504EC3101FED79650016851F /* LaunchScreen.storyboard */; };
@@ -55,11 +55,11 @@
 		A1000000000000000000000A /* PodcastsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PodcastsService.swift; sourceTree = "<group>"; };
 		A10000000000000000000090 /* Recommendations.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Recommendations.swift; sourceTree = "<group>"; };
 		A1000000000000000000000B /* PodcastProgressStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PodcastProgressStore.swift; sourceTree = "<group>"; };
-		A1000000000000000000000C /* RythmPlaybackService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RythmPlaybackService.swift; sourceTree = "<group>"; };
+		A1000000000000000000000C /* UnifiedPlaybackService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnifiedPlaybackService.swift; sourceTree = "<group>"; };
 		A1000000000000000000000D /* AudioAnalyzer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioAnalyzer.swift; sourceTree = "<group>"; };
 		A20000000000000000000001 /* AppTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000090 /* RecommendationMathTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecommendationMathTests.swift; sourceTree = "<group>"; };
-		A20000000000000000000092 /* RythmPlaybackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RythmPlaybackTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000092 /* UnifiedPlaybackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnifiedPlaybackTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000094 /* AudioAnalyzerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioAnalyzerTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000002 /* AppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		504EC30E1FED79650016851F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -118,7 +118,7 @@
 				A10000000000000000000009 /* AmazonTurnstileAuth.swift */,
 				A1000000000000000000000A /* PodcastsService.swift */,
 				A1000000000000000000000B /* PodcastProgressStore.swift */,
-				A1000000000000000000000C /* RythmPlaybackService.swift */,
+				A1000000000000000000000C /* UnifiedPlaybackService.swift */,
 				A1000000000000000000000D /* AudioAnalyzer.swift */,
 				A10000000000000000000090 /* Recommendations.swift */,
 				504EC30E1FED79650016851F /* Assets.xcassets */,
@@ -133,7 +133,7 @@
 			children = (
 				A20000000000000000000001 /* AppTests.swift */,
 				A20000000000000000000090 /* RecommendationMathTests.swift */,
-				A20000000000000000000092 /* RythmPlaybackTests.swift */,
+				A20000000000000000000092 /* UnifiedPlaybackTests.swift */,
 				A20000000000000000000094 /* AudioAnalyzerTests.swift */,
 			);
 			path = AppTests;
@@ -248,7 +248,7 @@
 				A10000000000000000000019 /* AmazonTurnstileAuth.swift in Sources */,
 				A1000000000000000000001A /* PodcastsService.swift in Sources */,
 				A1000000000000000000001B /* PodcastProgressStore.swift in Sources */,
-				A1000000000000000000001C /* RythmPlaybackService.swift in Sources */,
+				A1000000000000000000001C /* UnifiedPlaybackService.swift in Sources */,
 				A1000000000000000000001D /* AudioAnalyzer.swift in Sources */,
 				A10000000000000000000091 /* Recommendations.swift in Sources */,
 			);
@@ -260,7 +260,7 @@
 			files = (
 				A20000000000000000000011 /* AppTests.swift in Sources */,
 				A20000000000000000000091 /* RecommendationMathTests.swift in Sources */,
-				A20000000000000000000093 /* RythmPlaybackTests.swift in Sources */,
+				A20000000000000000000093 /* UnifiedPlaybackTests.swift in Sources */,
 				A20000000000000000000095 /* AudioAnalyzerTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

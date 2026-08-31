@@ -27,23 +27,26 @@ struct TurnstileExchange: Sendable {
         expiryKey: "native.amazonTurnstileExpiry"
     )
 
-    /// Rythm answers with an opaque bearer token plus `expires_in`, not a JWT.
-    static let rythm = TurnstileExchange(
-        id: "rythm",
-        path: "/auth/turnstile",
+    /// Unified Playback exchanges the solve for a short-lived JWT it wants back
+    /// in `X-Turnstile-JWT`. Same path as Amazon's old exchange, different
+    /// request field and its own token cache.
+    static let unified = TurnstileExchange(
+        id: "unified",
+        path: "/api/auth/turnstile",
         tokenField: "turnstile_token",
-        label: "Rythm Turnstile",
-        tokenKey: "native.rythmTurnstileToken",
-        expiryKey: "native.rythmTurnstileExpiry"
+        label: "Unified Playback Turnstile",
+        tokenKey: "native.unifiedTurnstileJwt",
+        expiryKey: "native.unifiedTurnstileExpiry"
     )
 }
 
 /// Mirrors web Monochrome `getTurnstileJwt`: solve Cloudflare Turnstile on
 /// `monochrome.tf` origin, exchange the token for a provider session.
 ///
-/// Amazon and Rythm sit behind the same Cloudflare site key and the same origin
-/// check, so the solve itself is shared; only the exchange endpoint, its request
-/// field and the token cache differ (see `Exchange`).
+/// Unified Playback and the legacy Amazon exchange sit behind the same
+/// Cloudflare site key and the same origin check, so the solve itself is
+/// shared; only the exchange endpoint, its request field and the token cache
+/// differ (see `Exchange`).
 ///
 /// Invisible / interaction-only first (no UI flash). Overlay only when CF needs
 /// a click, or when the invisible attempt fails and we fall back to compact.
@@ -72,7 +75,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
     private var inFlightAllowsInteractive: [String: Bool] = [:]
     private var inFlightGeneration: [String: Int] = [:]
     /// Only one WKWebView challenge can be on screen at a time. Two exchanges
-    /// asking at once (Rythm prewarm + a tapped play falling through to Amazon)
+    /// asking at once (a launch prewarm + a tapped play re-solving after a 401)
     /// used to have the second solve cancel the first out from under it.
     private var solveQueue: Task<Void, Never>?
     private var mode: ChallengeMode = .interactionOnly
@@ -132,34 +135,31 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
     }
 
     /// Which leg the launch prewarm solves for, and the settings it must use.
-    /// Each leg publishes its own Cloudflare site key: they match today, but
-    /// `accessToken` defaults to Amazon's, so prewarming Rythm without naming
-    /// its key would solve the wrong widget the moment either side rotates or a
+    /// The exchange publishes its own Cloudflare site key and action, and
+    /// `accessToken` defaults to the legacy Amazon pair, so naming them here
+    /// keeps the prewarm solving the right widget if either side rotates or a
     /// user overrides one in Settings.
+    ///
+    /// Only a client on the shared default API token has to solve at all — one
+    /// with its own token is admitted without a JWT, so a prewarm would put a
+    /// Cloudflare challenge on screen for nothing.
     nonisolated static func prewarmTarget()
         -> (exchange: Exchange, base: String, bypass: String, siteKey: String, action: String)? {
-        if PlaybackSourceSettings.rythmEnabled {
-            return (.rythm,
-                    PlaybackSourceSettings.rythmBaseURL,
-                    PlaybackSourceSettings.rythmBypassToken,
-                    PlaybackSourceSettings.rythmTurnstileSiteKey,
-                    PlaybackSourceSettings.rythmTurnstileAction)
-        }
-        if PlaybackSourceSettings.amazonEnabled {
-            return (.amazon,
-                    PlaybackSourceSettings.amazonApiBaseURL,
-                    PlaybackSourceSettings.amazonBypassToken,
-                    PlaybackSourceSettings.amazonTurnstileSiteKey,
-                    PlaybackSourceSettings.amazonTurnstileAction)
-        }
-        return nil
+        guard PlaybackSourceSettings.unifiedEnabled,
+              PlaybackSourceSettings.unifiedApiToken == PlaybackSourceSettings.defaultUnifiedApiToken
+        else { return nil }
+        return (.unified,
+                PlaybackSourceSettings.unifiedApiBaseURL,
+                "",
+                PlaybackSourceSettings.unifiedTurnstileSiteKey,
+                PlaybackSourceSettings.unifiedTurnstileAction)
     }
 
     func accessToken(
         apiBaseURL: String,
         exchange: Exchange = .amazon,
-        siteKey: String = PlaybackSourceSettings.amazonTurnstileSiteKey,
-        action: String = PlaybackSourceSettings.amazonTurnstileAction,
+        siteKey: String = PlaybackSourceSettings.unifiedTurnstileSiteKey,
+        action: String = PlaybackSourceSettings.unifiedTurnstileAction,
         forceRefresh: Bool = false,
         allowInteractive: Bool = true,
         timeout: TimeInterval = 60
@@ -213,9 +213,9 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
             guard let jwt = object?["access_token"] as? String, !jwt.isEmpty else {
                 throw ServiceError.malformed("\(exchange.label) token")
             }
-            // Rythm hands back an opaque token, so there is no `exp` to read —
-            // it states the lifetime separately. Prefer it when present and fall
-            // back to the JWT claim for Amazon.
+            // An exchange that hands back an opaque token has no `exp` to
+            // read and states the lifetime separately. Prefer that when present
+            // and fall back to the JWT claim.
             let expiry: Double
             if let expiresIn = (object?["expires_in"] as? NSNumber)?.doubleValue, expiresIn > 0 {
                 expiry = (Date().timeIntervalSince1970 + max(expiresIn - 60, 30)) * 1000
@@ -239,8 +239,8 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         return try await task.value
     }
 
-    /// Both exchanges state failures in their body — Amazon as `{"error": …}`,
-    /// Rythm as `{"detail": {"code": "turnstile_failed", "errors": [...]}}`.
+    /// These services state failures in their body — some as `{"error": …}`,
+    /// FastAPI ones as `{"detail": {"code": "turnstile_failed", "errors": […]}}`.
     /// A bare status code hid which one it was.
     nonisolated static func exchangeErrorDetail(in body: Data) -> String? {
         guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }

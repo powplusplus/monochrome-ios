@@ -90,34 +90,35 @@ final class AppTests: XCTestCase {
     func testTurnstileSessionCachesAreIsolatedPerExchange() {
         let auth = AmazonTurnstileAuth.shared
         auth.clearCache(for: .amazon)
-        auth.clearCache(for: .rythm)
+        auth.clearCache(for: .unified)
 
         // Cloudflare tokens are single-use, so each exchange holds its own
-        // session. Sharing one slot would let an Amazon JWT be sent to Rythm.
+        // session. Sharing one slot would let one provider's JWT be sent to the
+        // other, which rejects it.
         let expiry = Date().timeIntervalSince1970 * 1000 + 60 * 60 * 1000
-        UserDefaults.standard.set("rythm-session", forKey: AmazonTurnstileAuth.Exchange.rythm.tokenKey)
-        UserDefaults.standard.set(expiry, forKey: AmazonTurnstileAuth.Exchange.rythm.expiryKey)
+        UserDefaults.standard.set("unified-session", forKey: AmazonTurnstileAuth.Exchange.unified.tokenKey)
+        UserDefaults.standard.set(expiry, forKey: AmazonTurnstileAuth.Exchange.unified.expiryKey)
 
-        XCTAssertEqual(auth.cachedJWT(for: .rythm), "rythm-session")
+        XCTAssertEqual(auth.cachedJWT(for: .unified), "unified-session")
         XCTAssertNil(auth.cachedJWT(for: .amazon))
 
-        auth.clearCache(for: .rythm)
-        XCTAssertNil(auth.cachedJWT(for: .rythm))
+        auth.clearCache(for: .unified)
+        XCTAssertNil(auth.cachedJWT(for: .unified))
     }
 
-    func testRythmExchangeMatchesResolverContract() {
-        let rythm = AmazonTurnstileAuth.Exchange.rythm
-        XCTAssertEqual(rythm.path, "/auth/turnstile")
-        XCTAssertEqual(rythm.tokenField, "turnstile_token")
-        XCTAssertNotEqual(rythm.tokenKey, AmazonTurnstileAuth.Exchange.amazon.tokenKey)
+    func testUnifiedExchangeMatchesResolverContract() {
+        let unified = AmazonTurnstileAuth.Exchange.unified
+        XCTAssertEqual(unified.path, "/api/auth/turnstile")
+        XCTAssertEqual(unified.tokenField, "turnstile_token")
+        XCTAssertNotEqual(unified.tokenKey, AmazonTurnstileAuth.Exchange.amazon.tokenKey)
         XCTAssertEqual(AmazonTurnstileAuth.Exchange.amazon.path, "/api/auth/turnstile")
         XCTAssertEqual(AmazonTurnstileAuth.Exchange.amazon.tokenField, "cf_turnstile_response")
     }
 
     func testTurnstileExchangeErrorDetailReadsBothProviderShapes() {
-        let rythm = Data(#"{"detail":{"code":"turnstile_failed","errors":["invalid-input-response"]}}"#.utf8)
+        let fastAPI = Data(#"{"detail":{"code":"turnstile_failed","errors":["invalid-input-response"]}}"#.utf8)
         XCTAssertEqual(
-            AmazonTurnstileAuth.exchangeErrorDetail(in: rythm),
+            AmazonTurnstileAuth.exchangeErrorDetail(in: fastAPI),
             "turnstile_failed (invalid-input-response)"
         )
         let session = Data(#"{"detail":{"code":"session_required"}}"#.utf8)
@@ -127,12 +128,16 @@ final class AppTests: XCTestCase {
         XCTAssertNil(AmazonTurnstileAuth.exchangeErrorDetail(in: Data("<!doctype html>".utf8)))
     }
 
-    func testRythmIsAStreamResolverNotACatalogProvider() {
+    func testStreamOnlySourcesAreNotCatalogProviders() {
+        XCTAssertFalse(Provider.musicCases.contains(.monochrome))
         XCTAssertFalse(Provider.musicCases.contains(.rythm))
         XCTAssertFalse(Provider.musicCases.contains(.podcast))
         XCTAssertTrue(Provider.musicCases.contains(.tidal))
-        // Persisted stream responses decode by raw value — keep it stable.
+        // Persisted stream responses, library rows and offline files decode by
+        // raw value — keep them stable, retired legs included.
+        XCTAssertEqual(Provider.monochrome.rawValue, "monochrome")
         XCTAssertEqual(Provider.rythm.rawValue, "rythm")
+        XCTAssertEqual(Provider.qobuz.rawValue, "qobuz")
     }
 
     func testAmazonTurnstileChallengeHTMLInteractionOnlyParity() {
