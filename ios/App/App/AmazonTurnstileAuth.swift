@@ -13,6 +13,12 @@ struct TurnstileExchange: Sendable {
     let path: String
     /// Name of the JSON field the exchange expects the Turnstile token in.
     let tokenField: String
+    /// Field names to repeat the token under. The Unified Playback edge accepts
+    /// the web client's `turnstile_token`, while the FastAPI schema behind it
+    /// documents `cf_turnstile_response` as required — sending both means the
+    /// exchange works whichever layer answers, and neither rejects the extra
+    /// key.
+    var aliasTokenFields: [String] = []
     /// Prefix for surfaced errors, so a failure names the leg that produced it.
     let label: String
     let tokenKey: String
@@ -34,6 +40,7 @@ struct TurnstileExchange: Sendable {
         id: "unified",
         path: "/api/auth/turnstile",
         tokenField: "turnstile_token",
+        aliasTokenFields: ["cf_turnstile_response"],
         label: "Unified Playback Turnstile",
         tokenKey: "native.unifiedTurnstileJwt",
         expiryKey: "native.unifiedTurnstileExpiry"
@@ -192,9 +199,9 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
             // media routes.
             request.setValue("https://monochrome.tf", forHTTPHeaderField: "Origin")
             request.setValue("https://monochrome.tf/", forHTTPHeaderField: "Referer")
-            request.httpBody = try JSONSerialization.data(withJSONObject: [
-                exchange.tokenField: turnstileToken
-            ])
+            var body: [String: Any] = [exchange.tokenField: turnstileToken]
+            for alias in exchange.aliasTokenFields { body[alias] = turnstileToken }
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
             let data: Data
             let response: URLResponse
             do {

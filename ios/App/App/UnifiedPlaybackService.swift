@@ -212,19 +212,63 @@ enum UnifiedPlaybackService {
         return object
     }
 
-    /// First resource this client can actually play. `dash` is kept in the
-    /// filter because Amazon's CENC media is delivered as a plain encrypted MP4
-    /// the native decryptor handles; a real segmented manifest is rejected in
-    /// `streamResponse`.
-    static func resource(in envelope: [String: Any]) -> [String: Any]? {
+    /// Whether a resource points at a manifest this shell cannot render.
+    ///
+    /// `delivery` alone is not the test. The API labels Amazon CENC media
+    /// `dash` even though the URL is a single encrypted MP4 the native
+    /// decryptor handles — rejecting on the label alone dropped every Amazon
+    /// track to Deezer, which is what "it still cannot play" looked like. Only
+    /// a URL (or MIME) that really is a segmented manifest is refused.
+    static func isSegmentedManifest(_ resource: [String: Any]) -> Bool {
+        let address = ((resource["url"] as? String) ?? "").lowercased()
+        let mime = ((resource["mime_type"] as? String) ?? "").lowercased()
+        if address.contains(".mpd") || mime.contains("dash+xml") || mime.contains("application/dash") {
+            return true
+        }
+        // A `data:` manifest is the API inlining an MPD rather than a media file.
+        return address.hasPrefix("data:application/dash")
+    }
+
+    static func isHLS(_ resource: [String: Any]) -> Bool {
+        let address = ((resource["url"] as? String) ?? "").lowercased()
+        let mime = ((resource["mime_type"] as? String) ?? "").lowercased()
+        let delivery = ((resource["delivery"] as? String) ?? "").lowercased()
+        return delivery == "hls" || mime.contains("mpegurl") || address.contains(".m3u8")
+    }
+
+    /// Every resource this client could play, best first.
+    ///
+    /// The envelope routinely carries more than one entry for a recording — a
+    /// manifest next to the media it wraps, or a second source. Taking the
+    /// first and failing the whole leg when it happens to be unplayable threw
+    /// away a working alternative, so rank them instead:
+    ///
+    ///   1. plain media with no encryption (nothing to unwrap),
+    ///   2. HLS (AVPlayer speaks it natively),
+    ///   3. encrypted media the CENC decryptor can turn into a local file.
+    ///
+    /// Segmented DASH and encrypted HLS are dropped: AVFoundation has no DASH
+    /// support, and the decryptor cannot rewrite an HLS playlist.
+    static func playableResources(in envelope: [String: Any]) -> [[String: Any]] {
         let playback = envelope["playback"] as? [[String: Any]] ?? []
-        return playback.first { entry in
+        let candidates = playback.filter { entry in
             guard let url = entry["url"] as? String, !url.isEmpty else { return false }
             let kind = (entry["kind"] as? String)?.lowercased() ?? ""
             let delivery = (entry["delivery"] as? String)?.lowercased() ?? ""
-            return (kind == "audio" || kind == "manifest")
-                && ["direct", "dash", "hls"].contains(delivery)
+            guard kind.isEmpty || kind == "audio" || kind == "manifest" else { return false }
+            guard delivery.isEmpty || ["direct", "dash", "hls"].contains(delivery) else { return false }
+            if isSegmentedManifest(entry) { return false }
+            if isHLS(entry), decryptionKey(in: entry) != nil { return false }
+            return true
         }
+        return candidates.sorted { lhs, rhs in rank(lhs) < rank(rhs) }
+    }
+
+    private static func rank(_ resource: [String: Any]) -> Int {
+        let encrypted = decryptionKey(in: resource) != nil
+        if !encrypted && !isHLS(resource) { return 0 }
+        if !encrypted { return 1 }
+        return 2
     }
 
     private static func streamResponse(
@@ -233,49 +277,54 @@ enum UnifiedPlaybackService {
         quality: PlaybackQuality,
         session: URLSession
     ) async throws -> StreamResponse {
-        guard let resource = Self.resource(in: envelope) else {
-            throw ServiceError.unavailable("Unified Playback returned no supported playback resource")
+        let candidates = playableResources(in: envelope)
+        guard !candidates.isEmpty else {
+            throw ServiceError.unavailable(
+                "Unified Playback returned no resource native playback can render"
+            )
         }
+        var lastError: Error = ServiceError.unavailable("Unified Playback returned no usable resource")
+        for resource in candidates {
+            do {
+                return try await streamResponse(
+                    from: envelope, resource: resource, track: track, quality: quality, session: session
+                )
+            } catch {
+                // One bad resource is not a dead track: an expired signed URL or
+                // a CENC file the decryptor chokes on still leaves the other
+                // entries in the envelope worth trying.
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+
+    private static func streamResponse(
+        from envelope: [String: Any],
+        resource: [String: Any],
+        track: Track,
+        quality: PlaybackQuality,
+        session: URLSession
+    ) async throws -> StreamResponse {
         let sourceToken = ((resource["source"] as? String) ?? (envelope["selected_source"] as? String) ?? "")
             .lowercased()
-        guard let provider = Self.provider(forSource: sourceToken) else {
-            throw ServiceError.unavailable(
-                "Unified Playback selected an unsupported source: \(sourceToken.isEmpty ? "unknown" : sourceToken)"
-            )
+        // An envelope that names no source at all is still playable — the URL is
+        // what matters — so fall back to the in-house source rather than
+        // refusing a stream over a missing label.
+        let resolved = Self.provider(forSource: sourceToken)
+            ?? (sourceToken.isEmpty ? Provider.monochrome : nil)
+        guard let provider = resolved else {
+            throw ServiceError.unavailable("Unified Playback selected an unsupported source: \(sourceToken)")
         }
         guard let mediaURL = (resource["url"] as? String).flatMap(URL.init(string:)) else {
             throw ServiceError.unavailable("Unified Playback returned no stream URL")
         }
-
-        let mime = (resource["mime_type"] as? String)?.lowercased() ?? ""
-        let delivery = (resource["delivery"] as? String)?.lowercased() ?? ""
-        let address = mediaURL.absoluteString.lowercased()
-        let isHLS = delivery == "hls" || mime.contains("mpegurl") || address.contains(".m3u8")
-        let isManifest = !isHLS && (delivery == "dash"
-            || (resource["kind"] as? String)?.lowercased() == "manifest"
-            || mime.contains("dash")
-            || address.contains(".mpd"))
 
         let key = decryptionKey(in: resource)
         let selected = (resource["quality"] as? String)
             ?? (envelope["quality_requested"] as? String)
             ?? quality.rawValue
         let codec = Self.codec(for: resource, source: sourceToken, selected: selected)
-
-        // AVPlayer speaks HLS natively but has no DASH support — web only plays
-        // those through shaka. A segmented manifest is not something this shell
-        // can render, so hand the track to Deezer rather than to a player that
-        // fails on the first read.
-        if isManifest {
-            throw ServiceError.unavailable(
-                "Unified Playback returned a DASH manifest, which native playback cannot render"
-            )
-        }
-        if key != nil, isHLS {
-            throw ServiceError.unavailable(
-                "Unified Playback returned an encrypted HLS stream, which native playback cannot decrypt"
-            )
-        }
 
         let playURL: URL
         if let key, !key.isEmpty {

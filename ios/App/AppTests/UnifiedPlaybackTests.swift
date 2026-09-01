@@ -122,6 +122,10 @@ final class UnifiedPlaybackTests: XCTestCase {
         let unified = AmazonTurnstileAuth.Exchange.unified
         XCTAssertEqual(unified.path, "/api/auth/turnstile")
         XCTAssertEqual(unified.tokenField, "turnstile_token")
+        // The published FastAPI schema requires `cf_turnstile_response`, while
+        // the edge in front of it takes the web client's `turnstile_token`.
+        // Sending both is what makes the exchange work either way.
+        XCTAssertEqual(unified.aliasTokenFields, ["cf_turnstile_response"])
         XCTAssertNotEqual(unified.tokenKey, AmazonTurnstileAuth.Exchange.amazon.tokenKey)
     }
 
@@ -277,6 +281,21 @@ final class UnifiedPlaybackTests: XCTestCase {
         await assertFails(Self.track(), matching: "unsupported source: qobuz")
     }
 
+    func testAnUnlabelledSourceStillPlays() async throws {
+        // The URL is what matters; a missing `source` is not a reason to refuse.
+        let body = """
+        {"schema_version":"2.0","playback":[
+          {"kind":"audio","delivery":"direct","quality":"LOSSLESS",
+           "url":"https://cdn.example/audio/track.flac","mime_type":"audio/flac"}
+        ]}
+        """
+        UnifiedStub.enqueue(ok: body)
+        let stream = try await resolve(Self.track())
+
+        XCTAssertEqual(stream.provider, .monochrome)
+        XCTAssertEqual(stream.url.absoluteString, "https://cdn.example/audio/track.flac")
+    }
+
     // MARK: - Envelope reading
 
     func testResolvesADirectMonochromeStream() async throws {
@@ -312,7 +331,7 @@ final class UnifiedPlaybackTests: XCTestCase {
         XCTAssertEqual(stream.url.absoluteString, "https://cdn.example/audio/master.m3u8")
     }
 
-    func testDashManifestIsRefusedSoTheTrackCanFallToDeezer() async {
+    func testSegmentedDashManifestIsRefusedSoTheTrackCanFallToDeezer() async {
         // AVPlayer has no DASH support; web only plays those through shaka.
         UnifiedStub.enqueue(ok: Self.envelope(
             url: "https://cdn.example/audio/manifest.mpd",
@@ -320,17 +339,68 @@ final class UnifiedPlaybackTests: XCTestCase {
             delivery: "dash",
             mimeType: "application/dash+xml"
         ))
-        await assertFails(Self.track(), matching: "DASH manifest")
+        await assertFails(Self.track(), matching: "no resource native playback can render")
+    }
+
+    func testAmazonCencMediaLabelledDashIsStillPlayed() async throws {
+        // The API labels a single encrypted Amazon MP4 `dash`. Refusing on that
+        // label alone sent every Amazon track to Deezer.
+        let body = """
+        {"schema_version":"2.0","track":{"id":"B00TESTASIN","duration_ms":194500},"playback":[
+          {"kind":"audio","delivery":"dash","source":"amazon","quality":"UHD_96_24",
+           "url":"https://cdn.example/audio/track.mp4","mime_type":"audio/mp4"}
+        ]}
+        """
+        UnifiedStub.enqueue(ok: body)
+        let stream = try await resolve(Self.track(), quality: .hiResLossless)
+
+        XCTAssertEqual(stream.url.absoluteString, "https://cdn.example/audio/track.mp4")
+        XCTAssertEqual(stream.provider, .amazon)
+    }
+
+    func testPrefersPlainMediaOverAnEncryptedAlternative() async throws {
+        // Ranking matters: the unencrypted entry needs no decrypt round trip.
+        let body = """
+        {"schema_version":"2.0","playback":[
+          {"kind":"audio","delivery":"dash","source":"amazon","quality":"UHD_96_24",
+           "url":"https://cdn.example/audio/encrypted.mp4","mime_type":"audio/mp4",
+           "encryption":{"key":{"value":"00112233445566778899aabbccddeeff"},"key_id":"0123456789abcdef"}},
+          {"kind":"audio","delivery":"direct","source":"mono","quality":"LOSSLESS",
+           "url":"https://cdn.example/audio/track.flac","mime_type":"audio/flac"}
+        ]}
+        """
+        UnifiedStub.enqueue(ok: body)
+        let stream = try await resolve(Self.track())
+
+        XCTAssertEqual(stream.url.absoluteString, "https://cdn.example/audio/track.flac")
+        XCTAssertEqual(stream.provider, .monochrome)
+    }
+
+    func testSkipsAManifestToReachThePlayableEntryBehindIt() async throws {
+        // A manifest ahead of the media it wraps must not fail the whole leg.
+        let body = """
+        {"schema_version":"2.0","playback":[
+          {"kind":"manifest","delivery":"dash","source":"amazon","url":"https://cdn.example/a.mpd",
+           "mime_type":"application/dash+xml"},
+          {"kind":"audio","delivery":"direct","source":"mono","quality":"LOSSLESS",
+           "url":"https://cdn.example/audio/track.flac","mime_type":"audio/flac"}
+        ]}
+        """
+        UnifiedStub.enqueue(ok: body)
+        let stream = try await resolve(Self.track())
+
+        XCTAssertEqual(stream.url.absoluteString, "https://cdn.example/audio/track.flac")
     }
 
     func testEncryptedHLSIsRefusedRatherThanHandedToTheDecryptor() async {
+        // The decryptor rewrites MP4 sample entries; it cannot touch a playlist.
         UnifiedStub.enqueue(ok: Self.envelope(
             url: "https://cdn.example/audio/master.m3u8",
             delivery: "hls",
             mimeType: "application/vnd.apple.mpegurl",
             encryptionKey: "00112233445566778899aabbccddeeff"
         ))
-        await assertFails(Self.track(), matching: "encrypted HLS")
+        await assertFails(Self.track(), matching: "no resource native playback can render")
     }
 
     func testSkipsResourcesThisClientCannotPlay() async throws {

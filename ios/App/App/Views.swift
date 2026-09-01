@@ -338,7 +338,25 @@ struct LibraryView: View {
                             Label(playlist.title, systemImage: "music.note.list")
                         }
                     }
-                    if library.playlists.isEmpty { Text("Your playlists will appear here.").foregroundColor(.secondary) }
+                    if library.playlists.isEmpty {
+                        // Say why the list is empty. "Nothing here" reads the
+                        // same whether there is nothing to show or the sync that
+                        // would have filled it failed.
+                        switch library.cloudSyncState {
+                        case .syncing:
+                            Label("Syncing your playlists…", systemImage: "arrow.triangle.2.circlepath")
+                                .foregroundColor(.secondary)
+                        case .failed(let reason):
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Could not load your cloud playlists.").foregroundColor(.secondary)
+                                Text(reason).font(.caption).foregroundColor(.secondary)
+                                Button("Try again") { Task { await library.syncWithCloud() } }
+                                    .font(.caption)
+                            }
+                        default:
+                            Text("Your playlists will appear here.").foregroundColor(.secondary)
+                        }
+                    }
                 }
             }
             .listStyle(.insetGrouped).navigationTitle("Library").padding(.bottom, 82)

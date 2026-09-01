@@ -30,7 +30,12 @@ struct MonochromeApp: App {
                     // and solve Amazon's Cloudflare gate while the user browses.
                     await InstanceDirectory.shared.refreshIfStale()
                     AmazonTurnstileAuth.shared.prewarm()
-                    if auth.isSignedIn { await library.syncWithCloud() }
+                    // `isSignedIn` only flips once the profile call comes
+                    // back, so gating the sync on it skipped the pull on every
+                    // cold launch — the playlists were on the server, the app
+                    // just never asked. `syncWithCloud` already no-ops without a
+                    // stored bearer, so let it make that call itself.
+                    await library.syncWithCloud()
                 }
         }
     }

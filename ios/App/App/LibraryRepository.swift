@@ -165,15 +165,31 @@ final class LibraryRepository: ObservableObject {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             request.setValue("application/json", forHTTPHeaderField: "Accept")
             let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                throw ServiceError.authenticationRequired
+            guard let http = response as? HTTPURLResponse else { throw ServiceError.invalidResponse }
+            // A bare "sign in required" hid which half failed. 401/403 is the
+            // stored bearer being rejected; anything else is the sync endpoint
+            // itself, and the difference decides whether signing in again helps.
+            guard (200..<300).contains(http.statusCode) else {
+                if http.statusCode == 401 || http.statusCode == 403 {
+                    throw ServiceError.authenticationRequired
+                }
+                throw ServiceError.unavailable("Playlist sync failed: HTTP \(http.statusCode)")
             }
             let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-            let remote = recordMap(root["userPlaylists"] ?? root["user_playlists"])
+            // The server has answered under three names across revisions, and a
+            // record can arrive as a map, a list, or a JSON string. Reading only
+            // one of those shapes is indistinguishable, on screen, from having
+            // no playlists at all.
+            let payload = root["userPlaylists"] ?? root["user_playlists"] ?? root["playlists"]
+                ?? (root["profile"] as? [String: Any])?["userPlaylists"]
+            let remote = recordMap(payload)
             for (key, value) in remote {
                 guard let title = ModelMapper.string(value, ["name", "title"]) else { continue }
-                let id = ModelMapper.string(value, ["id", "uuid"]) ?? key
-                let tracks = ModelMapper.array(value["tracks"] as Any, keys: ["items"]).compactMap(ModelMapper.track)
+                let id = ModelMapper.string(value, ["uuid", "id"]) ?? key
+                // Web minifies a playlist's tracks into `tracks`; older records
+                // nested them under `items`.
+                let trackPayload = value["tracks"] ?? value["items"] ?? value["trackList"] ?? []
+                let tracks = ModelMapper.array(trackPayload, keys: ["items", "tracks"]).compactMap(ModelMapper.track)
                 let playlist = Playlist(id: id, title: title, description: ModelMapper.string(value, ["description"]),
                                         cover: ModelMapper.string(value, ["cover", "image"]), creator: "You", tracks: tracks)
                 upsert(playlist, key: id, kind: "playlist")
