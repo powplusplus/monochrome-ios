@@ -135,6 +135,7 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
                 exchange: exchange,
                 siteKey: siteKey,
                 action: action,
+                authorizationToken: PlaybackSourceSettings.unifiedApiToken,
                 allowInteractive: false,
                 timeout: 15
             )
@@ -167,6 +168,13 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
         exchange: Exchange = .amazon,
         siteKey: String = PlaybackSourceSettings.unifiedTurnstileSiteKey,
         action: String = PlaybackSourceSettings.unifiedTurnstileAction,
+        /// Client API token to present on the exchange itself. Web sends the
+        /// same bearer here that it later sends on the track lookup, and the
+        /// minted JWT is bound to it — a JWT exchanged without one comes back
+        /// fine and is then rejected by `/api/v2/track/` with a 401, which is
+        /// indistinguishable from an expired session. Nil leaves the legacy
+        /// Amazon exchange unauthenticated, as it was.
+        authorizationToken: String? = nil,
         forceRefresh: Bool = false,
         allowInteractive: Bool = true,
         timeout: TimeInterval = 60
@@ -195,6 +203,10 @@ final class AmazonTurnstileAuth: NSObject, WKNavigationDelegate, WKScriptMessage
             var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            if let authorizationToken,
+               !authorizationToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                request.setValue("Bearer \(authorizationToken)", forHTTPHeaderField: "Authorization")
+            }
             // The exchange endpoint sits behind the same origin check as the
             // media routes.
             request.setValue("https://monochrome.tf", forHTTPHeaderField: "Origin")

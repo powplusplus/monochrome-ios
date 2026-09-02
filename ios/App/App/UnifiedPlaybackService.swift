@@ -28,6 +28,7 @@ enum UnifiedPlaybackService {
             exchange: .unified,
             siteKey: PlaybackSourceSettings.unifiedTurnstileSiteKey,
             action: PlaybackSourceSettings.unifiedTurnstileAction,
+            authorizationToken: PlaybackSourceSettings.unifiedApiToken,
             forceRefresh: forceRefresh
         )
     }
